@@ -21,6 +21,7 @@ struct ALSHParams {
     int num_hashes; // K (number of bits per table)
     int num_tables; // L (number of tables)
     int bucket_width; // for scalar quantization if needed (unused for SRP)
+    int seed = 42; // Random seed for reproducibility
 };
 
 /**
@@ -36,8 +37,11 @@ template <typename T, BackendType B = BackendType::CPU>
 class ALSH {
 public:
     ALSH(const ALSHParams& params) : params_(params) {
-        if (params_.num_hashes > sizeof(size_t) * 8) {
-            throw std::invalid_argument("ALSH: num_hashes cannot exceed sizeof(size_t) * 8");
+        if (params_.num_hashes > 20) {
+             throw std::invalid_argument("ALSH: num_hashes > 20 is too large for direct addressing.");
+        }
+        if (params_.num_hashes < 1) {
+             throw std::invalid_argument("ALSH: num_hashes must be >= 1.");
         }
     }
 
@@ -56,6 +60,10 @@ public:
 
         orig_dim_ = input_dim;
         item_count_ = output_dim;
+
+        // Initialize deduplication structures
+        visited_token_.assign(item_count_, 0);
+        current_token_ = 0;
 
         // 1. Calculate norms of each item (column) to find max norm M
         std::vector<T> norms(output_dim, 0);
@@ -81,9 +89,14 @@ public:
         size_t proj_dim = input_dim + 1;
         generate_projections(proj_dim);
 
-        // 3. Initialize buckets
+        // 3. Initialize buckets (Direct Addressing)
+        // buckets_[table_idx][hash_val] -> vector of item indices
+        size_t num_buckets = 1 << params_.num_hashes;
         buckets_.clear();
         buckets_.resize(params_.num_tables);
+        for(auto& table : buckets_) {
+            table.resize(num_buckets);
+        }
 
         // 4. Hash each item
         // P(x) = [x, sqrt(M^2 - ||x||^2)]
@@ -115,11 +128,6 @@ public:
     std::vector<int> query(const Tensor<T, B>& query_vec) {
         size_t q_size = query_vec.size();
         if (q_size != orig_dim_) {
-            // Check if it matches shape
-            // query_vec could be (Batch, InputDim) but here we expect single vector?
-            // "Given a query vector" -> implies single query.
-            // If passed batch, we might fail.
-            // But let's check size match.
             throw std::invalid_argument("ALSH: Query dimension mismatch.");
         }
 
@@ -131,21 +139,30 @@ public:
         }
         temp_vec[orig_dim_] = 0;
 
-        // Collect candidates
-        // Use vector + sort + unique for determinism and performance
+        // Increment generation token for deduplication
+        current_token_++;
+        // Handle wrap-around (very rare, but safe)
+        if (current_token_ == 0) {
+            std::fill(visited_token_.begin(), visited_token_.end(), 0);
+            current_token_ = 1;
+        }
+
         std::vector<int> candidates;
+        // Reserve some space to avoid reallocations (heuristic)
+        candidates.reserve(item_count_ / 100);
 
         for (int l = 0; l < params_.num_tables; ++l) {
             size_t h = compute_hash(temp_vec, l);
-            auto it = buckets_[l].find(h);
-            if (it != buckets_[l].end()) {
-                const auto& bucket_indices = it->second;
-                candidates.insert(candidates.end(), bucket_indices.begin(), bucket_indices.end());
+            // Direct access
+            const auto& bucket_indices = buckets_[l][h];
+
+            for (int idx : bucket_indices) {
+                if (visited_token_[idx] != current_token_) {
+                    visited_token_[idx] = current_token_;
+                    candidates.push_back(idx);
+                }
             }
         }
-
-        std::sort(candidates.begin(), candidates.end());
-        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
 
         return candidates;
     }
@@ -166,19 +183,24 @@ private:
     size_t item_count_ = 0;
     T max_norm_ = 0;
 
+    // Deduplication optimization
+    std::vector<int> visited_token_;
+    int current_token_ = 0;
+
     // Projections: [table][hash_index][dimension]
     // Flattened as vector of vectors
     std::vector<std::vector<T>> projections_;
 
     // Buckets: [table][hash_key] -> list of indices
-    std::vector<std::unordered_map<size_t, std::vector<int>>> buckets_;
+    // Replaced unordered_map with vector for direct addressing
+    std::vector<std::vector<std::vector<int>>> buckets_;
 
     void generate_projections(size_t dim) {
         size_t total_hashes = params_.num_tables * params_.num_hashes;
         projections_.resize(total_hashes);
 
-        std::random_device rd;
-        std::mt19937 gen(rd());
+        // Use fixed seed from params or default for reproducibility
+        std::mt19937 gen(params_.seed);
         std::normal_distribution<T> d(0.0, 1.0);
 
         for (auto& proj : projections_) {
