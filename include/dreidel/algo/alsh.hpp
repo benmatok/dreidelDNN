@@ -36,8 +36,8 @@ template <typename T, BackendType B = BackendType::CPU>
 class ALSH {
 public:
     ALSH(const ALSHParams& params) : params_(params) {
-        if (params_.num_hashes > 64) {
-            throw std::invalid_argument("ALSH: num_hashes cannot exceed 64 (limited by size_t)");
+        if (params_.num_hashes > sizeof(size_t) * 8) {
+            throw std::invalid_argument("ALSH: num_hashes cannot exceed sizeof(size_t) * 8");
         }
     }
 

@@ -94,10 +94,10 @@ This roadmap breaks down the development into verifiable, testable steps.
 - [x] **Verification**: Train a small network on XOR or MNIST (subset) using standard Dense layers.
 
 ### Phase 4: ALSH Engine (The "Brain")
-- [ ] Implement Signed Random Projections (SRP) hashing.
-- [ ] Implement Hash Tables (array of buckets).
-- [ ] Implement MIPS transformation logic.
-- [ ] **Verification**: Test retrieval accuracy. Given a query vector, does it retrieve vectors with high dot products? Compare against exact brute force.
+- [x] Implement Signed Random Projections (SRP) hashing.
+- [x] Implement Hash Tables (array of buckets).
+- [x] Implement MIPS transformation logic.
+- [x] **Verification**: Test retrieval accuracy. Given a query vector, does it retrieve vectors with high dot products? Compare against exact brute force.
 
 ### Phase 5: Sparse Training (SLIDE)
 - [ ] Implement `ALSHSparseDense` layer.
@@ -155,3 +155,23 @@ Input [1, 1] -> Prob [0]: 0.999819, [1]: 0.000181153 | Pred: 0 True: 0
 Accuracy: 4/4
 PASS
 ```
+
+### ALSH Verification (Phase 4)
+```
+Running ALSH Test...
+Index build time: 222 ms
+Brute Force Time: 8376 us
+ALSH Query Time (incl. re-rank): 8033 us
+Candidates count: 5810 / 10000
+Recall @ 10: 9 / 10 (90%)
+Test Passed: Retrieved at least some relevant items.
+```
+
+#### Benchmark (Phase 4)
+*Config: Dim=128, K=4, L=10*
+
+| Items | Build Time (ms) | BF Query (us) | ALSH Query (us) | Speedup | Recall (%) |
+|-------|-----------------|---------------|-----------------|---------|------------|
+| 1000  | 42              | 1132          | 774             | 1.46    | 70         |
+| 10000 | 410             | 11761         | 10183           | 1.15    | 70         |
+| 50000 | 2037            | 62296         | 52773           | 1.18    | 50         |
