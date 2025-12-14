@@ -4,6 +4,7 @@
 #include "../core/Tensor.hpp"
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace dreidel {
 namespace layers {
@@ -19,6 +20,12 @@ public:
     // Backward pass: Gradient of Output -> Gradient of Input
     // Also computes gradients for weights if applicable
     virtual Tensor<T, B> backward(const Tensor<T, B>& grad_output) = 0;
+
+    // Get parameters (weights, biases) for optimizer
+    virtual std::vector<Tensor<T, B>*> parameters() { return {}; }
+
+    // Get gradients for optimizer
+    virtual std::vector<Tensor<T, B>*> gradients() { return {}; }
 
     virtual std::string name() const = 0;
 };
