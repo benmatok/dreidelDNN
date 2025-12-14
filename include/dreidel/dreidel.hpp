@@ -1,9 +1,20 @@
-#pragma once
+#ifndef DREIDEL_HPP
+#define DREIDEL_HPP
 
-#include "core/tensor.hpp"
-#include "layers/layer.hpp"
-#include "layers/alsh_dense.hpp"
-#include "algo/alsh.hpp"
-#include "optim/kfac.hpp"
-#include "dist/communicator.hpp"
-#include "model.hpp"
+// Core
+#include "core/Backend.hpp"
+#include "core/Tensor.hpp"
+
+// Layers
+#include "layers/Layer.hpp"
+
+// Optimizers
+#include "optim/Optimizer.hpp"
+
+// Distributed
+#include "dist/Communicator.hpp"
+
+// IO
+#include "io/Serializer.hpp"
+
+#endif // DREIDEL_HPP
