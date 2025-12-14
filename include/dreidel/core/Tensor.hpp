@@ -8,6 +8,8 @@
 #include <cmath>
 #include <stdexcept>
 #include <numeric>
+#include <functional>
+#include <random>
 #include "Backend.hpp"
 
 // Check for OpenMP support
@@ -59,17 +61,58 @@ public:
         std::fill(data_.begin(), data_.end(), value);
     }
 
+    void random(T mean, T stddev) {
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        std::normal_distribution<T> d(mean, stddev);
+        for (auto& v : data_) v = d(gen);
+    }
+
     // Element-wise operations
     Tensor<T, B> operator+(const Tensor<T, B>& other) const {
+        // Case 1: Shapes match exactly
+        if (this->shape_ == other.shape_) {
+            Tensor<T, B> result(this->shape_);
+            size_t n = this->data_.size();
+            DREIDEL_SIMD_LOOP
+            for (size_t i = 0; i < n; ++i) {
+                result.data_[i] = this->data_[i] + other.data_[i];
+            }
+            return result;
+        }
+
+        // Case 2: Broadcasting (Vector to Matrix)
+        // Assume 'this' is (M, N) and 'other' is (N) or (1, N)
+        if (this->shape_.size() == 2) {
+            size_t M = this->shape_[0];
+            size_t N = this->shape_[1];
+            size_t other_sz = other.data_.size();
+
+            if (other_sz == N) {
+                Tensor<T, B> result(this->shape_);
+                for (size_t i = 0; i < M; ++i) {
+                    DREIDEL_SIMD_LOOP
+                    for (size_t j = 0; j < N; ++j) {
+                        result.data_[i * N + j] = this->data_[i * N + j] + other.data_[j];
+                    }
+                }
+                return result;
+            }
+        }
+
+        throw std::invalid_argument("Shapes incompatible for addition.");
+    }
+
+    Tensor<T, B> operator-(const Tensor<T, B>& other) const {
         if (this->shape_ != other.shape_) {
-             throw std::invalid_argument("Shapes must match for addition.");
+             throw std::invalid_argument("Shapes must match for subtraction.");
         }
         Tensor<T, B> result(this->shape_);
         size_t n = this->data_.size();
 
         DREIDEL_SIMD_LOOP
         for (size_t i = 0; i < n; ++i) {
-            result.data_[i] = this->data_[i] + other.data_[i];
+            result.data_[i] = this->data_[i] - other.data_[i];
         }
         return result;
     }
@@ -84,6 +127,17 @@ public:
         DREIDEL_SIMD_LOOP
         for (size_t i = 0; i < n; ++i) {
             result.data_[i] = this->data_[i] * other.data_[i];
+        }
+        return result;
+    }
+
+    // Scalar Multiplication
+    Tensor<T, B> operator*(T scalar) const {
+        Tensor<T, B> result(this->shape_);
+        size_t n = this->data_.size();
+        DREIDEL_SIMD_LOOP
+        for(size_t i=0; i<n; ++i) {
+            result.data_[i] = this->data_[i] * scalar;
         }
         return result;
     }
@@ -119,6 +173,62 @@ public:
                     result.data_[i * N + j] += a_val * other.data_[k * N + j];
                 }
             }
+        }
+        return result;
+    }
+
+    Tensor<T, B> transpose() const {
+        if (this->shape_.size() != 2) {
+             throw std::invalid_argument("Transpose only supports 2D tensors for now.");
+        }
+        size_t R = this->shape_[0];
+        size_t C = this->shape_[1];
+        Tensor<T, B> result({C, R});
+
+        for (size_t i = 0; i < R; ++i) {
+            for (size_t j = 0; j < C; ++j) {
+                result.data_[j * R + i] = this->data_[i * C + j];
+            }
+        }
+        return result;
+    }
+
+    // Sum over axis. 0 = sum cols (reduce rows), 1 = sum rows (reduce cols)
+    Tensor<T, B> sum(int axis) const {
+         if (this->shape_.size() != 2) throw std::runtime_error("Sum only 2D");
+         size_t R = this->shape_[0];
+         size_t C = this->shape_[1];
+
+         if (axis == 0) {
+             // Sum down the rows, result is (1, C)
+             Tensor<T, B> result({1, C});
+             result.fill(0);
+             for(size_t i=0; i<R; ++i) {
+                 for(size_t j=0; j<C; ++j) {
+                     result.data_[j] += this->data_[i*C + j];
+                 }
+             }
+             return result;
+         } else if (axis == 1) {
+             // Sum across columns, result is (R, 1)
+             Tensor<T, B> result({R, 1});
+             result.fill(0);
+             for(size_t i=0; i<R; ++i) {
+                 for(size_t j=0; j<C; ++j) {
+                     result.data_[i * 1 + 0] += this->data_[i*C + j];
+                 }
+             }
+             return result;
+         }
+         throw std::invalid_argument("Invalid axis");
+    }
+
+    template <typename Func>
+    Tensor<T, B> apply(Func func) const {
+        Tensor<T, B> result(this->shape_);
+        size_t n = this->data_.size();
+        for (size_t i = 0; i < n; ++i) {
+            result.data_[i] = func(this->data_[i]);
         }
         return result;
     }

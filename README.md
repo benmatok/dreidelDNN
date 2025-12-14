@@ -87,11 +87,11 @@ This roadmap breaks down the development into verifiable, testable steps.
 - [x] **Verification**: Unit tests for Tensor operations (Add, Mul, Dot).
 
 ### Phase 3: Basic DNN Flow
-- [ ] Implement `Dense` layer (forward/backward).
-- [ ] Implement `ReLU` and `Softmax`.
-- [ ] Implement `SGD` optimizer.
-- [ ] Implement `Sequential` model runner.
-- [ ] **Verification**: Train a small network on XOR or MNIST (subset) using standard Dense layers.
+- [x] Implement `Dense` layer (forward/backward).
+- [x] Implement `ReLU` and `Softmax`.
+- [x] Implement `SGD` optimizer.
+- [x] Implement `Sequential` model runner.
+- [x] **Verification**: Train a small network on XOR or MNIST (subset) using standard Dense layers.
 
 ### Phase 4: ALSH Engine (The "Brain")
 - [ ] Implement Signed Random Projections (SRP) hashing.
@@ -120,3 +120,38 @@ This roadmap breaks down the development into verifiable, testable steps.
 ### Phase 8: Mongoose (Adaptive LSH)
 - [ ] Implement scheduler for re-hashing or learning hash functions.
 - [ ] **Verification**: Long-running training test. Ensure accuracy doesn't degrade as weights shift.
+
+## Test Outputs
+
+### Tensor Tests
+```
+Testing Tensor Creation...
+PASS
+Testing Tensor Addition...
+PASS
+Testing Tensor Matmul (GEMM)...
+PASS
+All Tensor tests passed!
+```
+
+### XOR Verification (Phase 3)
+```
+Training XOR Network...
+Epoch 0, Loss: 0.716317
+Epoch 1000, Loss: 0.0152441
+Epoch 2000, Loss: 0.00573388
+Epoch 3000, Loss: 0.00346887
+Epoch 4000, Loss: 0.00246702
+Epoch 5000, Loss: 0.00190503
+Epoch 6000, Loss: 0.00154734
+Epoch 7000, Loss: 0.00130031
+Epoch 8000, Loss: 0.00111961
+Epoch 9000, Loss: 0.000982013
+Predictions:
+Input [0, 0] -> Prob [0]: 0.997368, [1]: 0.00263221 | Pred: 0 True: 0
+Input [0, 1] -> Prob [0]: 0.000322151, [1]: 0.999678 | Pred: 1 True: 1
+Input [1, 0] -> Prob [0]: 0.000356529, [1]: 0.999643 | Pred: 1 True: 1
+Input [1, 1] -> Prob [0]: 0.999819, [1]: 0.000181153 | Pred: 0 True: 0
+Accuracy: 4/4
+PASS
+```
