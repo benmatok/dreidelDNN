@@ -76,15 +76,15 @@ int main() {
 This roadmap breaks down the development into verifiable, testable steps.
 
 ### Phase 1: Foundation (Architecture & Mocks)
-- [ ] Define directory structure.
-- [ ] Create abstract interfaces for `Tensor`, `Layer`, `Optimizer`, and `Communicator`.
-- [ ] **Verification**: Compile a "Hello World" that includes the headers and instantiates a mock model.
+- [x] Define directory structure.
+- [x] Create abstract interfaces for `Tensor`, `Layer`, `Optimizer`, and `Communicator`.
+- [x] **Verification**: Compile a "Hello World" that includes the headers and instantiates a mock model.
 
 ### Phase 2: Core Tensor & Basic Math
-- [ ] Implement `Tensor<T>` class with basic storage.
-- [ ] Implement naive Matrix Multiplication (GEMM) and Element-wise ops.
-- [ ] Add Basic SIMD support (autovectorization hints).
-- [ ] **Verification**: Unit tests for Tensor operations (Add, Mul, Dot).
+- [x] Implement `Tensor<T>` class with basic storage.
+- [x] Implement naive Matrix Multiplication (GEMM) and Element-wise ops.
+- [x] Add Basic SIMD support (autovectorization hints).
+- [x] **Verification**: Unit tests for Tensor operations (Add, Mul, Dot).
 
 ### Phase 3: Basic DNN Flow
 - [ ] Implement `Dense` layer (forward/backward).
