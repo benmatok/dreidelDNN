@@ -158,23 +158,22 @@ PASS
 
 ### ALSH Verification (Phase 4)
 ```
-Running ALSH Test...
-Index build time: 48 ms
-Brute Force Time: 2351 us
-ALSH Query Time (incl. re-rank): 21 us
-Candidates count: 8 / 10000
-Recall @ 10: 1 / 10 (10%)
-Test Passed: Retrieved at least some relevant items.
+Running Comprehensive ALSH Validation...
+[TEST] Identity Retrieval... PASS
+[TEST] Structured Data Recall... (Recall: 8/10) PASS
+[TEST] High Noise Robustness... PASS
+[TEST] Orthogonal Query... PASS
+All validation tests passed.
 ```
 
 #### Benchmark (Phase 4)
-*Config: Dim=128, K=10, L=5 (Optimized for speedup > 20x)*
+*Config: Dim=128, K=10, L=5*
 
 | Items  | Build Time (ms) | BF Query (us) | ALSH Query (us) | Speedup | Recall (%) |
 |--------|-----------------|---------------|-----------------|---------|------------|
-| 1000   | 9               | 223           | 32              | 6.76    | 100        |
-| 10000  | 93              | 3285          | 68              | 47.60   | 100        |
-| 50000  | 463             | 18991         | 503             | 37.68   | 100        |
-| 100000 | 921             | 34443         | 962             | 35.76   | 100        |
+| 1000   | 9               | 232           | 14              | 15.47   | 20         |
+| 10000  | 95              | 3622          | 168             | 21.43   | 70         |
+| 50000  | 473             | 19830         | 231             | 85.47   | 40         |
+| 100000 | 925             | 36406         | 1138            | 31.96   | 80         |
 
-*Note: Benchmarks utilize clustered synthetic data to simulate realistic feature distributions.*
+*Note: Benchmarks utilize noisy clustered data (std=0.5) to test robustness. Speedups > 20x achieved for large datasets.*

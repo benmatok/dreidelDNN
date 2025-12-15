@@ -19,11 +19,6 @@ int main() {
     int K = 10;
     int L = 5;
 
-    // We stick with K=10, L=5 which gave decent speedup and recall on structured data
-    // for N=50000. For N=10000 it had 0 recall but high speedup.
-    // Given the constraints and the synthetic nature, we optimize for demonstrating
-    // the potential speedup on large datasets (50k+).
-
     std::cout << "Dim: " << input_dim << ", K: " << K << ", L: " << L << std::endl;
     std::cout << std::left << std::setw(15) << "Items"
               << std::setw(20) << "Build Time (ms)"
@@ -36,10 +31,11 @@ int main() {
 
     for (size_t output_dim : output_dims) {
         // Create structured weights (clusters) to improve recall
+        // Increase noise to 0.5 to reduce trivial 100% recall
         Tensor<float> weights({input_dim, output_dim});
         std::mt19937 gen(42);
         std::normal_distribution<float> dist(0.0f, 1.0f);
-        // More clusters for larger N to keep distribution reasonable
+
         int num_clusters = std::max(10, (int)output_dim / 100);
         std::vector<std::vector<float>> centroids(num_clusters, std::vector<float>(input_dim));
         for(auto& c : centroids) for(auto& v : c) v = dist(gen);
@@ -48,8 +44,8 @@ int main() {
         for(size_t i=0; i<output_dim; ++i) {
             int c_idx = i % num_clusters;
             for(size_t d=0; d<input_dim; ++d) {
-                // Point is centroid + noise
-                w_data[d * output_dim + i] = centroids[c_idx][d] + dist(gen) * 0.1f;
+                // Increased noise 0.1 -> 0.5
+                w_data[d * output_dim + i] = centroids[c_idx][d] + dist(gen) * 0.5f;
             }
         }
 
@@ -68,8 +64,8 @@ int main() {
         // Query near a centroid
         Tensor<float> query({input_dim});
         float* q_data = query.data();
-        // Pick centroid 0 + noise
-        for(size_t d=0; d<input_dim; ++d) q_data[d] = centroids[0][d] + dist(gen) * 0.1f;
+        // Pick centroid 0 + same noise level
+        for(size_t d=0; d<input_dim; ++d) q_data[d] = centroids[0][d] + dist(gen) * 0.5f;
 
         // 1. Exact Search (Brute Force)
         std::vector<std::pair<float, int>> exact_scores;
