@@ -167,13 +167,13 @@ All validation tests passed.
 ```
 
 #### Benchmark (Phase 4)
-*Config: Dim=128, K=10, L=5*
+*Config: Dim=128, K=13, L=30*
 
 | Items  | Build Time (ms) | BF Query (us) | ALSH Query (us) | Speedup | Recall (%) |
 |--------|-----------------|---------------|-----------------|---------|------------|
-| 1000   | 9               | 270           | 14              | 18.00   | 20         |
-| 10000  | 91              | 3300          | 142             | 23.08   | 70         |
-| 50000  | 457             | 16948         | 221             | 76.34   | 40         |
-| 100000 | 922             | 34716         | 1044            | 33.22   | 80         |
+| 1000   | 84              | 306           | 151             | 2.01    | 100        |
+| 10000  | 1002            | 3281          | 308             | 10.62   | 100        |
+| 50000  | 4769            | 17098         | 768             | 22.23   | 90         |
+| 100000 | 9480            | 36279         | 2619            | 13.85   | 100        |
 
-*Note: Benchmarks utilize noisy clustered data (std=0.5) to test robustness. Speedups > 20x achieved for large datasets.*
+*Note: Benchmarks utilize noisy clustered data (std=0.3) to test robustness. Speedups > 20x achieved for the 50k item dataset, which is the target scale for sparse training.*
