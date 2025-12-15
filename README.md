@@ -71,6 +71,56 @@ int main() {
 }
 ```
 
+## Implementation Roadmap: ALSH & SLIDE
+
+This roadmap breaks down the development of the ALSH-based sparse training path.
+
+### Phase 1: Foundation (Architecture & Mocks)
+- [x] Define directory structure.
+- [x] Create abstract interfaces for `Tensor`, `Layer`, `Optimizer`, and `Communicator`.
+- [x] **Verification**: Compile a "Hello World" that includes the headers and instantiates a mock model.
+
+### Phase 2: Core Tensor & Basic Math
+- [x] Implement `Tensor<T>` class with basic storage.
+- [x] Implement naive Matrix Multiplication (GEMM) and Element-wise ops.
+- [x] Add Basic SIMD support (autovectorization hints).
+- [x] **Verification**: Unit tests for Tensor operations (Add, Mul, Dot).
+
+### Phase 3: Basic DNN Flow
+- [x] Implement `Dense` layer (forward/backward).
+- [x] Implement `ReLU` and `Softmax`.
+- [x] Implement `SGD` optimizer.
+- [x] Implement `Sequential` model runner.
+- [x] **Verification**: Train a small network on XOR or MNIST (subset) using standard Dense layers.
+
+### Phase 4: ALSH Engine (The "Brain")
+- [x] Implement Signed Random Projections (SRP) hashing.
+- [x] Implement Hash Tables (array of buckets).
+- [x] Implement MIPS transformation logic.
+- [x] **Verification**: Test retrieval accuracy. Given a query vector, does it retrieve vectors with high dot products? Compare against exact brute force.
+
+### Phase 5: Sparse Training (SLIDE)
+- [ ] Implement `ALSHSparseDense` layer.
+    -   Connects `ALSH` engine to weight matrix.
+    -   Forward: Hash input -> Query -> Sparse Dot.
+    -   Backward: Sparse Gradient update.
+- [ ] **Verification**: Replace a Dense layer with ALSHSparseDense in the MNIST test. Verify accuracy is comparable but operations are fewer (counting FLOPs).
+
+### Phase 6: KFAC Optimization
+- [ ] Implement storage for activation covariance ($A$) and gradient covariance ($G$).
+- [ ] Implement block-diagonal inversion logic.
+- [ ] Integrate into `Optimizer` step.
+- [ ] **Verification**: Check convergence speed (epochs to reach X% accuracy) vs SGD.
+
+### Phase 7: Scalability & Distribution
+- [ ] Implement `Communicator` interface for gradient averaging.
+- [ ] Mock MPI backend.
+- [ ] **Verification**: Simulate 2 nodes in a single process (two models exchanging gradients).
+
+### Phase 8: Mongoose (Adaptive LSH)
+- [ ] Implement scheduler for re-hashing or learning hash functions.
+- [ ] **Verification**: Long-running training test. Ensure accuracy doesn't degrade as weights shift.
+
 ## Implementation Roadmap: Spectral Acceleration
 
 ### Phase 1: The Spectral Math Kernel (LibWHT Core)
