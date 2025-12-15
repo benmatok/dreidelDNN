@@ -11,6 +11,7 @@
 #include <functional>
 #include <random>
 #include "Backend.hpp"
+#include "Allocator.hpp"
 
 // Check for OpenMP support
 #if defined(_OPENMP)
@@ -37,12 +38,13 @@ public:
     }
 
     // Constructor with shape and initial data
-    Tensor(const std::vector<size_t>& shape, const std::vector<T>& data) : shape_(shape), data_(data) {
+    Tensor(const std::vector<size_t>& shape, const std::vector<T>& data) : shape_(shape) {
         size_t total_size = 1;
         for (size_t s : shape) total_size *= s;
         if (data.size() != total_size) {
              throw std::invalid_argument("Data size does not match shape dimensions.");
         }
+        data_.assign(data.begin(), data.end());
     }
 
     virtual ~Tensor() = default;
@@ -59,6 +61,18 @@ public:
 
     void fill(T value) {
         std::fill(data_.begin(), data_.end(), value);
+    }
+
+    // Helper for NHWC layout interpretation
+    // Returns true if the tensor is 4D (N, H, W, C)
+    bool is_nhwc() const {
+        return shape_.size() == 4;
+    }
+
+    // Get stride of the last dimension (C in NHWC)
+    // Should be 1 for contiguous last dimension
+    size_t last_dim_stride() const {
+        return 1;
     }
 
     void random(T mean, T stddev) {
@@ -235,7 +249,7 @@ public:
 
 private:
     std::vector<size_t> shape_;
-    std::vector<T> data_;
+    std::vector<T, core::AlignedAllocator<T>> data_;
 };
 
 } // namespace dreidel
