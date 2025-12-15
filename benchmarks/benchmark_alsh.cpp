@@ -17,6 +17,7 @@ int main() {
     size_t input_dim = 128;
     std::vector<size_t> output_dims = {1000, 10000, 50000, 100000};
 
+
     // Final Attempt: K=13, L=30.
     // Buckets 8192. N=50k -> 6 items/bucket.
     // L=30 -> 180 candidates. Speedup >100x theoretical.
@@ -51,6 +52,7 @@ int main() {
             int c_idx = i % num_clusters;
             for(size_t d=0; d<input_dim; ++d) {
                 w_data[d * output_dim + i] = centroids[c_idx][d] + dist(gen) * 0.3f;
+
             }
         }
 
@@ -71,6 +73,7 @@ int main() {
         float* q_data = query.data();
         // Pick centroid 0 + same noise level
         for(size_t d=0; d<input_dim; ++d) q_data[d] = centroids[0][d] + dist(gen) * 0.3f;
+
 
         // 1. Exact Search (Brute Force)
         std::vector<std::pair<float, int>> exact_scores;
