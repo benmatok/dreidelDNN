@@ -171,9 +171,9 @@ All validation tests passed.
 
 | Items  | Build Time (ms) | BF Query (us) | ALSH Query (us) | Speedup | Recall (%) |
 |--------|-----------------|---------------|-----------------|---------|------------|
-| 1000   | 9               | 232           | 14              | 15.47   | 20         |
-| 10000  | 95              | 3622          | 168             | 21.43   | 70         |
-| 50000  | 473             | 19830         | 231             | 85.47   | 40         |
-| 100000 | 925             | 36406         | 1138            | 31.96   | 80         |
+| 1000   | 9               | 270           | 14              | 18.00   | 20         |
+| 10000  | 91              | 3300          | 142             | 23.08   | 70         |
+| 50000  | 457             | 16948         | 221             | 76.34   | 40         |
+| 100000 | 922             | 34716         | 1044            | 33.22   | 80         |
 
 *Note: Benchmarks utilize noisy clustered data (std=0.5) to test robustness. Speedups > 20x achieved for large datasets.*
