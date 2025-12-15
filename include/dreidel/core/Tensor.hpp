@@ -24,6 +24,12 @@
 
 namespace dreidel {
 
+/**
+ * @brief N-dimensional Tensor class.
+ *
+ * Manages memory and provides basic arithmetic operations.
+ * Supports multiple backends via template parameter.
+ */
 template <typename T, BackendType B = BackendType::CPU>
 class Tensor {
 public:

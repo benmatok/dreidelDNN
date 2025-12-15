@@ -187,7 +187,6 @@ private:
     std::vector<unsigned int> visited_token_;
     unsigned int current_token_ = 0;
 
-
     // Projections: [table][hash_index][dimension]
     // Flattened as vector of vectors
     std::vector<std::vector<T>> projections_;
