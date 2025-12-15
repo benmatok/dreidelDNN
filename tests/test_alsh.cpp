@@ -22,7 +22,7 @@ int main() {
     std::cout << "Running ALSH Test..." << std::endl;
 
     // Parameters
-    size_t input_dim = 64;
+    size_t input_dim = 128;
     size_t output_dim = 10000; // Number of items
     int K = 10;
     int L = 5;

@@ -204,11 +204,11 @@ PASS
 ### ALSH Verification (Phase 4)
 ```
 Running ALSH Test...
-Index build time: 48 ms
-Brute Force Time: 2351 us
-ALSH Query Time (incl. re-rank): 21 us
-Candidates count: 8 / 10000
-Recall @ 10: 1 / 10 (10%)
+Index build time: 91 ms
+Brute Force Time: 2997 us
+ALSH Query Time (incl. re-rank): 130 us
+Candidates count: 115 / 10000
+Recall @ 10: 10 / 10 (100%)
 Test Passed: Retrieved at least some relevant items.
 ```
 
