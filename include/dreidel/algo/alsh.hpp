@@ -184,8 +184,8 @@ private:
     T max_norm_ = 0;
 
     // Deduplication optimization
-    std::vector<int> visited_token_;
-    int current_token_ = 0;
+    std::vector<unsigned int> visited_token_;
+    unsigned int current_token_ = 0;
 
     // Projections: [table][hash_index][dimension]
     // Flattened as vector of vectors
