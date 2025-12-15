@@ -71,55 +71,63 @@ int main() {
 }
 ```
 
-## Implementation Roadmap
+## Implementation Roadmap: Spectral Acceleration
 
-This roadmap breaks down the development into verifiable, testable steps.
+### Phase 1: The Spectral Math Kernel (LibWHT Core)
+**Goal:** Build the fastest possible WHT implementation on CPU.
 
-### Phase 1: Foundation (Architecture & Mocks)
-- [x] Define directory structure.
-- [x] Create abstract interfaces for `Tensor`, `Layer`, `Optimizer`, and `Communicator`.
-- [x] **Verification**: Compile a "Hello World" that includes the headers and instantiates a mock model.
+*   **Memory Manager (NHWC Layout)**
+    *   *Task:* Implement Tensor class enforcing Channel-Last layout with 64-byte alignment.
+    *   *Validation:* Verify that `reinterpret_cast<__m512*>(ptr)` does not segfault (proving alignment).
+*   **SIMD_FWHT Kernel (In-Place)**
+    *   *Task:* Implement Iterative FWHT using AVX-512 `_mm512_add_ps` / `_mm512_sub_ps`.
+    *   *Validation (Math):* "Identity Test." Assert `FWHT(FWHT(x)) / N == x` within 1e-5 tolerance.
+    *   *Validation (Speed):* "Throughput Test." Benchmark GB/s vs memcpy. Target: >80% of system RAM bandwidth.
 
-### Phase 2: Core Tensor & Basic Math
-- [x] Implement `Tensor<T>` class with basic storage.
-- [x] Implement naive Matrix Multiplication (GEMM) and Element-wise ops.
-- [x] Add Basic SIMD support (autovectorization hints).
-- [x] **Verification**: Unit tests for Tensor operations (Add, Mul, Dot).
+### Phase 2: Structured Spectral Layers
+**Goal:** Replace Heavy Layers with Spectral equivalents.
 
-### Phase 3: Basic DNN Flow
-- [x] Implement `Dense` layer (forward/backward).
-- [x] Implement `ReLU` and `Softmax`.
-- [x] Implement `SGD` optimizer.
-- [x] Implement `Sequential` model runner.
-- [x] **Verification**: Train a small network on XOR or MNIST (subset) using standard Dense layers.
+*   **LinearWHT (Dense Replacement)**
+    *   *Task:* Implement $y = \text{TopK}(\text{FWHT}(x \odot D))$.
+    *   *Validation (Params):* Assert `sizeof(layer)` equals $N \times 4$ bytes (not $N^2$).
+    *   *Validation (Gradient):* "Finite Difference Check." Compare analytic gradient of $D$ vs numerical perturbation.
+*   **Conv3D_Spectral (Hybrid Accelerator)**
+    *   *Task:* Implement DepthwiseConv3D $\to$ LinearWHT (Mixing).
+    *   *Validation (Fusion):* Profiler Check. Ensure no memory writes occur between Spatial and Mixing steps (L1 cache residency).
 
-### Phase 4: ALSH Engine (The "Brain")
-- [x] Implement Signed Random Projections (SRP) hashing.
-- [x] Implement Hash Tables (array of buckets).
-- [x] Implement MIPS transformation logic.
-- [x] **Verification**: Test retrieval accuracy. Given a query vector, does it retrieve vectors with high dot products? Compare against exact brute force.
+### Phase 3: Structure-Aware Optimizer
+**Goal:** Second-Order convergence in Linear time.
 
-### Phase 5: Sparse Training (SLIDE)
-- [ ] Implement `ALSHSparseDense` layer.
-    -   Connects `ALSH` engine to weight matrix.
-    -   Forward: Hash input -> Query -> Sparse Dot.
-    -   Backward: Sparse Gradient update.
-- [ ] **Verification**: Replace a Dense layer with ALSHSparseDense in the MNIST test. Verify accuracy is comparable but operations are fewer (counting FLOPs).
+*   **DiagonalNewton Solver**
+    *   *Task:* Implement element-wise curvature update: $D_{new} = D - \eta \frac{\nabla L}{\nabla^2 L}$.
+    *   *Validation:* "Rosenbrock Test." Minimize a high-dim diagonal quadratic function.
+        *   Pass Criteria: Converge in < 10 steps.
+        *   Fail Criteria: SGD takes > 100 steps.
+*   **BlockDiagonal Solver (Spatial)**
+    *   *Task:* Parallel inversion of $27 \times 27$ blocks.
+    *   *Validation:* Verify `BlockInv * Block == Identity`.
 
-### Phase 6: KFAC Optimization
-- [ ] Implement storage for activation covariance ($A$) and gradient covariance ($G$).
-- [ ] Implement block-diagonal inversion logic.
-- [ ] Integrate into `Optimizer` step.
-- [ ] **Verification**: Check convergence speed (epochs to reach X% accuracy) vs SGD.
+### Phase 4: Large-Scale Filter Pruning
+**Goal:** $O(1)$ Filter Selection for Wide Layers.
 
-### Phase 7: Scalability & Distribution
-- [ ] Implement `Communicator` interface for gradient averaging.
-- [ ] Mock MPI backend.
-- [ ] **Verification**: Simulate 2 nodes in a single process (two models exchanging gradients).
+*   **WHT Hasher**
+    *   *Task:* Implement `Sign(FWHT(x))` to generate binary codes.
+    *   *Validation:* "Collision Test." Verify that similar vectors (Euclidean dist < $\epsilon$) produce identical hashes > 90% of the time.
+*   **Sparse Gather Engine**
+    *   *Task:* Use `_mm512_i32gather_ps` to load weights.
+    *   *Validation (Recall/Speedup):*
+        *   Experiment: Run on 4096-channel tensor.
+        *   Metric: (Time of Dense Conv) / (Time of WHT Hash + Gather Conv). Target: > 5x speedup.
 
-### Phase 8: Mongoose (Adaptive LSH)
-- [ ] Implement scheduler for re-hashing or learning hash functions.
-- [ ] **Verification**: Long-running training test. Ensure accuracy doesn't degrade as weights shift.
+### Phase 5: Distributed Model Parallelism
+**Goal:** Training Billion-Parameter Layers across Nodes.
+
+*   **SplitWHT (MPI/Sharding)**
+    *   *Task:* Split the butterfly diagram. Node A does steps $1..k$, Node B does $k..N$.
+    *   *Validation (Correctness):* Run SplitWHT on 2 processes. Assert output exactly matches SingleNodeWHT.
+*   **Gradient All-Reduce**
+    *   *Task:* Sync only the diagonal scale vectors $D$.
+    *   *Validation (Scaling):* Measure latency vs payload size. Assert latency is negligible compared to compute time.
 
 ## Test Outputs
 
