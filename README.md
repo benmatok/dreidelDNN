@@ -127,25 +127,25 @@ int main() {
 - [x] **Verification (Speed):** "Throughput Test". Benchmark GB/s vs `memcpy`. Target: >80% of system RAM bandwidth.
 
 ## Phase 6: Structured Spectral Layers
-**Status:** Planned
+**Status:** Completed
 
-- [ ] Implement `LinearWHT` (Replaces Standard Dense).
+- [x] Implement `LinearWHT` (Replaces Standard Dense).
     - **Logic:** $y = \text{TopK}(\text{FWHT}(x \odot D))$
     - **Storage:** `std::vector<float> scale` ($D$).
-- [ ] Implement `Conv3D_Spectral` (Hybrid Accelerator).
+- [x] Implement `Conv3D_Spectral` (Hybrid Accelerator).
     - **Logic:** DepthwiseConv3D (Spatial) $\to$ `LinearWHT` (Mixing).
     - **Fusion:** Fuse Spatial output to Mixing input in L1 cache.
-- [ ] **Verification:** Replace a `Dense` layer in the MNIST test with `LinearWHT`. Check parameter reduction ($N^2 \to N$).
+- [x] **Verification:** Replace a `Dense` layer in the MNIST test with `LinearWHT`. Check parameter reduction ($N^2 \to N$).
 
 ## Phase 7: Structure-Aware Optimizer (Replaces KFAC)
-**Status:** Planned
+**Status:** Completed
 
-- [ ] Implement `DiagonalNewton` Solver (for WHT Layers).
+- [x] Implement `DiagonalNewton` Solver (for WHT Layers).
     - **Logic:** Element-wise curvature update: $D_{new} = D - \eta \frac{\nabla L}{\nabla^2 L}$.
-- [ ] Implement `BlockDiagonal` Solver (for Spatial Conv).
+- [x] Implement `BlockDiagonal` Solver (for Spatial Conv).
     - **Logic:** Parallel inversion of small $27 \times 27$ blocks.
-- [ ] Update `Optimizer::step()` to dispatch logic based on `LayerType`.
-- [ ] **Verification:** "Rosenbrock Test". Check convergence speed on a diagonal quadratic function (< 10 steps).
+- [x] Update `Optimizer::step()` to dispatch logic based on `LayerType` (Implemented via `curvatures` hook).
+- [x] **Verification:** "Rosenbrock Test". Check convergence speed on a diagonal quadratic function (< 10 steps).
 
 ## Phase 8: Large-Scale Filter Pruning (The "Selector")
 **Status:** Planned

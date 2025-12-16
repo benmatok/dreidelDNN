@@ -18,7 +18,7 @@ public:
     // k is for TopK sparsity. If k=0 or k>=dim, no sparsity is applied.
     LinearWHT(size_t dim, size_t k = 0)
         : dim_(dim), k_(k),
-          scale_({1, dim}), grad_scale_({1, dim})
+          scale_({1, dim}), grad_scale_({1, dim}), curv_scale_({1, dim})
     {
         // Check power of 2
         if (dim == 0 || (dim & (dim - 1)) != 0) {
@@ -43,6 +43,7 @@ public:
         // Let's try Normal(0, 1.0 / dim).
         scale_.random(0, 1.0 / static_cast<T>(dim));
         grad_scale_.fill(0);
+        curv_scale_.fill(0);
     }
 
     Tensor<T, B> forward(const Tensor<T, B>& input) override {
@@ -184,6 +185,36 @@ public:
             }
         }
 
+        // Compute Curvatures for DiagonalNewton (Approximation: sum(x^2))
+        // curvature ~ N * x^2 (since FWHT scales by N in energy or so, but let's stick to x^2 for now)
+        // Similar reduction logic as gradients
+        {
+            curv_scale_.fill(0);
+            T* curv_ptr = curv_scale_.data();
+            const T* input_ptr = input.data(); // Use input argument directly
+
+            #pragma omp parallel
+            {
+                std::vector<T> local_sum(last_dim, 0);
+
+                #pragma omp for
+                for (long i = 0; i < (long)outer_dims; ++i) {
+                    size_t offset = i * last_dim;
+                    for (size_t j = 0; j < last_dim; ++j) {
+                        T val = input_ptr[offset + j];
+                        local_sum[j] += val * val;
+                    }
+                }
+
+                #pragma omp critical
+                {
+                    for (size_t j = 0; j < last_dim; ++j) {
+                        curv_ptr[j] += local_sum[j];
+                    }
+                }
+            }
+        }
+
         // Compute dL/dx
         // grad_z is arbitrary shape, scale_ is (1, C)
         // operator* now supports broadcasting scale_ to grad_z
@@ -200,6 +231,10 @@ public:
         return {&grad_scale_};
     }
 
+    std::vector<Tensor<T, B>*> curvatures() override {
+        return {&curv_scale_};
+    }
+
     std::string name() const override { return "LinearWHT"; }
 
 private:
@@ -207,6 +242,7 @@ private:
     size_t k_;
     Tensor<T, B> scale_;
     Tensor<T, B> grad_scale_;
+    Tensor<T, B> curv_scale_;
 
     // Cache
     Tensor<T, B> input_;
