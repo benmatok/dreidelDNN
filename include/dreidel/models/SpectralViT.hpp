@@ -155,6 +155,11 @@ public:
             auto attn_out_layer = get_layer(prefix + "attention.output.dense");
             Tensor<T, B> attn_output = forward_linear(attn_out_layer, q, prefix + "attention.output.dense"); // Using q as proxy
 
+            // Handle residual mismatch
+            if (attn_output.shape().back() > x.shape().back()) {
+                attn_output = attn_output.slice_last_dim(x.shape().back());
+            }
+
             // Residual + Norm (Skip Norm for now)
             x = x + attn_output;
 

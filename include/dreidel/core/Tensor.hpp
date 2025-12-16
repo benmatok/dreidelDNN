@@ -241,13 +241,6 @@ public:
             }
         }
 
-        std::cerr << "Incompatible Shapes for *:" << std::endl;
-        std::cerr << "This: ";
-        for(auto s : this->shape_) std::cerr << s << " ";
-        std::cerr << std::endl;
-        std::cerr << "Other: ";
-        for(auto s : other.shape_) std::cerr << s << " ";
-        std::cerr << std::endl;
         throw std::invalid_argument("Shapes incompatible for element-wise multiplication.");
     }
 
