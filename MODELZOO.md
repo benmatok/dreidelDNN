@@ -19,65 +19,68 @@ We aim to provide reference implementations for three key architectures, optimiz
 ### B. Spectral ViT (Vision Transformer)
 *Target: Image Classification (ImageNet)*
 
-*   **Patch Embedding:** `Conv2D` projection -> `LinearWHT`.
+*   **Patch Embedding:** `Conv2D` projection -> `DeepSpectralLinear`.
 *   **Self-Attention:**
-    *   Replace dense projections ($Q, K, V$) with `LinearWHT`.
+    *   Replace dense projections ($Q, K, V$) with `DeepSpectralLinear`.
     *   Investigate replacing Softmax Attention with **Fast Walsh-Hadamard Attention** (linearized attention using WHT features).
 *   **MLP Block:**
-    *   Replace `Dense` layers with `ALSHSparseDense` for large-scale width scaling (MoE-like behavior) OR `LinearWHT` for dense efficiency.
+    *   Replace `Dense` layers with `ALSHSparseDense` for large-scale width scaling (MoE-like behavior) OR `DeepSpectralLinear` for dense efficiency.
 
 ### C. Spectral Llama (LLM)
 *Target: Text Generation*
 
 *   **Token Embeddings:** Standard lookup.
 *   **Layers:**
-    *   Replace `Linear` layers in Attention and FeedForward blocks with `LinearWHT`.
+    *   Replace `Linear` layers in Attention and FeedForward blocks with `DeepSpectralLinear`.
     *   **FFN:** Use `ALSHSparseDense` to activate only relevant neurons for a given token (Conditional Computation), effectively implementing an ultra-fast Mixture-of-Experts (MoE).
 *   **Rotary Embeddings (RoPE):** Adapt to spectral domain if applicable, or keep in spatial domain.
 
 ---
 
-## 2. Porting Strategy: Distillation & Recasting
+## 2. Theoretical Analysis & Recasting Strategy
 
-Since `dreidelDNN` uses unique layers (`LinearWHT`, `ALSHSparseDense`) that do not map 1:1 to standard matrix multiplication weights, we cannot simply load PyTorch state dicts. We use a two-stage process.
+### Analysis of `LinearWHT` Expressivity
 
-### Stage 1: Recasting (Architecture Mapping)
+The standard `LinearWHT` layer implements the transformation:
+$$ y = \text{FWHT}(x \odot D) $$
+where $D$ is a learnable diagonal vector. In matrix form, this is $y = x D H^T$ (assuming row vectors).
 
-We define a mapping from Source (Standard) layers to Target (Spectral) layers.
+*   **Parameter Count:** $O(N)$ vs $O(N^2)$ for Dense.
+*   **Constraint:** This effectively restricts the weight matrix $W$ to be diagonal in the Hadamard basis. This means $W$ must be a circulant-like convolution.
+*   **Limitation:** A single `LinearWHT` layer cannot approximate arbitrary dense matrices (e.g., random projections or specific permutations). This explains the high relative error (~1.0) observed in initial recasting attempts.
 
-| Source Layer (PyTorch) | Target Layer (dreidelDNN) | initialization Strategy |
-| :--- | :--- | :--- |
-| `nn.Linear(in, out)` | `LinearWHT(in)` | **Projected Initialization**: Train `LinearWHT` to mimic `nn.Linear` output using least squares on a calibration dataset (activations). |
-| `nn.Conv2d(in, out, k)` | `Conv3DSpectral` (adapted) | Decompose 2D conv into Spatial (Depthwise) + Mixing (WHT). Initialize Spatial with approx depthwise filters, Mixing via projection. |
-| `nn.ReLU` | `ReLU` | Direct mapping. |
+### Solution: `DeepSpectralLinear` (Cascaded Spectral Layers)
 
-### Stage 2: Distillation (Knowledge Transfer)
+To recover full expressivity while maintaining $O(N \log N)$ computational complexity (vs $O(N^2)$), we introduce the `DeepSpectralLinear` layer. This layer cascades multiple `LinearWHT` blocks interleaved with fixed random permutations.
 
-Once the student model (dreidelDNN architecture) is initialized via Recasting, we perform **Knowledge Distillation** to recover accuracy.
+$$ y = \text{Layer}_K( \dots \text{Layer}_1(x) \dots ) $$
+where $\text{Layer}_k(x) = \text{FWHT}(P_k(x) \odot D_k)$.
 
-1.  **Teacher:** Pre-trained PyTorch/HuggingFace model (frozen).
-2.  **Student:** `dreidelDNN` model (e.g., Spectral Llama).
-3.  **Data:** Unlabeled calibration dataset (subset of pre-training data).
-4.  **Loss:**
-    *   $L = \alpha L_{logits}(Teacher, Student) + \beta L_{hidden}(Teacher, Student)$
-    *   Match logits and potentially intermediate hidden states.
-5.  **Optimizer:** Use `DiagonalNewton` (Phase 7) for rapid convergence of the diagonal scale factors $D$ in `LinearWHT`.
+*   $P_k$: A fixed random permutation (shuffles the vector).
+*   $D_k$: A learnable diagonal scale.
+*   **Expressivity:** By stacking $K$ such layers (typically $K=4$ to $\log N$), the network can approximate any unitary matrix and, by extension, any dense matrix (Fastfood transform theorem).
+*   **Cost:** $K \times O(N \log N)$. For small $K$, this is still significantly faster than $O(N^2)$ for large $N$.
 
-### Workflow Tooling (Planned)
+### Improved Recasting Strategy
 
-*   `tools/recast_pytorch.py`: Python script to load a PyTorch model, probe its activations, solve for initial `LinearWHT` scale factors, and export weights to `dreidelDNN` binary format.
-*   `tools/distill_cpp`: C++ binary that loads the exported weights and fine-tunes them against the Teacher model's outputs (served via ONNX Runtime or LibTorch).
+Since `DeepSpectralLinear` has a non-convex structure involving multiple layers, simple least-squares recasting is no longer feasible.
+
+1.  **Initialization:**
+    *   Initialize $D_k$ to preserve variance (e.g., Identity flow or slightly noisy).
+    *   Initialize $P_k$ as random fixed permutations.
+2.  **Distillation (Mandatory):**
+    *   We cannot analytically solve for weights. We must proceed directly to Stage 2 (Distillation).
+    *   Use the "Teacher-Student" loop to train the `DeepSpectralLinear` parameters ($D_1 \dots D_K$) to match the output of the source `nn.Linear` layer using `DiagonalNewton` optimizer.
+
+---
 
 ## 3. Implementation Status
 
 ### Spectral ViT (ViT-Base-Patch16-224)
 
-*   **Status:** Initial Recasting & Inference Implemented.
-*   **Performance (CPU):** ~254 ms per image (Batch Size 1, Single Threaded Warmup + Bench) on standard x86 instance.
-*   **Accuracy (Initialization):**
-    *   Layer-wise Relative Error (Projection): ~0.996 (High).
-    *   End-to-End Relative Error: ~1.002 (High).
-*   **Validation:**
-    *   Recasted network architecture verified via `examples/test_spectral_vit.cpp`.
-    *   Functional verification confirms correct execution of `LinearWHT` padding/slicing, residual connections, and bias handling.
-    *   **Finding:** Simple Least-Squares Recasting (`Projected Initialization`) is insufficient for replacing Dense layers with Diagonal Spectral layers without significant accuracy loss. **Stage 2 Distillation is mandatory.**
+*   **Status:** Updating to use `DeepSpectralLinear`.
+*   **Previous Finding:** Simple `LinearWHT` recasting failed (Error ~1.0).
+*   **New Roadmap:**
+    1.  Replace `LinearWHT` with `DeepSpectralLinear` (K=4).
+    2.  Update recasting tool to export "Uninitialized" or "Identity" weights.
+    3.  Run C++ Distillation (Training) to converge weights.
