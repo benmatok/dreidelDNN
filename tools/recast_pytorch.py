@@ -2,64 +2,11 @@
 import torch
 import torch.nn as nn
 from transformers import ViTModel, ViTConfig
-import scipy.linalg
 import numpy as np
-import pickle
 import os
 import argparse
 import struct
-
-def solve_diagonal_for_linear(model_layer, input_dim, output_dim, target_dim=1024, batch_size=128):
-    """
-    Solve for diagonal D such that LinearWHT approximates model_layer.
-    Returns D and the relative error.
-    """
-
-    # 1. Generate calibration data
-    X = torch.randn(batch_size, input_dim)
-
-    # 2. Get target output
-    with torch.no_grad():
-        Y_target = model_layer(X) # (B, output_dim)
-
-    # 3. Pad to target_dim
-    X_padded = torch.zeros(batch_size, target_dim)
-    X_padded[:, :input_dim] = X
-
-    Y_padded = torch.zeros(batch_size, target_dim)
-    Y_padded[:, :output_dim] = Y_target
-
-    # 4. Solve
-    X_np = X_padded.numpy()
-    Y_np = Y_padded.numpy()
-
-    # Hadamard matrix
-    H = scipy.linalg.hadamard(target_dim).astype(np.float32)
-
-    # IFWHT(y) = H * y / N
-    Y_transformed = np.dot(Y_np, H) / target_dim
-
-    # Solve D[j] = sum(X[b,j] * Y'[b,j]) / sum(X[b,j]^2)
-    numerator = np.sum(X_np * Y_transformed, axis=0)
-    denominator = np.sum(X_np**2, axis=0)
-
-    D = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
-
-    # 5. Verify approximation on this batch
-    # Z = X * D
-    Z = X_np * D
-    # Y_pred = FWHT(Z)
-    Y_pred_full = np.dot(Z, H.T) # FWHT is same as H for Hadamard? Yes symmetric.
-    # Y_pred is the first 'output_dim' elements
-    Y_pred = Y_pred_full[:, :output_dim]
-    Y_true = Y_target.numpy()
-
-    # Error
-    diff = Y_pred - Y_true
-    mse = np.mean(diff**2)
-    rel_error = np.linalg.norm(diff) / np.linalg.norm(Y_true)
-
-    return D, rel_error
+import random
 
 def write_string(f, s):
     encoded = s.encode('utf-8')
@@ -75,6 +22,23 @@ def write_tensor(f, t):
     # Write data
     f.write(t.astype(np.float32).tobytes())
 
+def write_perm(f, p):
+    # p is list/array of integers
+    # Write size (which is also dim)
+    # DeepSpectralLinear reader expects size, then data (uint64)
+    size = len(p)
+    f.write(struct.pack('I', size))
+    # Write data as uint64
+    # struct pack 'Q' is unsigned long long (64 bit)
+    # We can write one by one or pack all
+    # Packing all might be faster but string might be too long?
+    # Python struct format string limits?
+    # Let's write array directly if possible or loop
+
+    # Convert to array of uint64
+    arr = np.array(p, dtype=np.uint64)
+    f.write(arr.tobytes())
+
 def recast_vit(model_name="google/vit-base-patch16-224"):
     print(f"Loading {model_name}...")
     model = ViTModel.from_pretrained(model_name)
@@ -82,9 +46,10 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
 
     weights_list = []
 
-    print("Recasting layers...")
-    total_rel_error = 0
-    count = 0
+    print("Recasting layers to DeepSpectralLinear (Uninitialized for Distillation)...")
+
+    # Roadmap says: "Replace LinearWHT with DeepSpectralLinear (K=4)."
+    DEPTH = 4
 
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
@@ -100,18 +65,31 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
             target_size = max(in_target, out_target)
             if target_size < 1024: target_size = 1024
 
-            # Solve
-            D, rel_err = solve_diagonal_for_linear(module, in_features, out_features, target_size)
+            print(f"Converting {name}: {in_features}->{out_features} to DeepSpectralLinear({target_size}, K={DEPTH})")
 
-            print(f"Recasting {name}: {in_features}->{out_features} to LinearWHT({target_size}) | RelError: {rel_err:.4f}")
-            total_rel_error += rel_err
-            count += 1
+            # Generate Parameters for DeepSpectralLinear
+            scales = []
+            perms = []
+
+            for k in range(DEPTH):
+                # Scale: Random initialization as per roadmap/cpp
+                # C++ uses: mean 0, stddev 1/sqrt(dim)
+                stddev = 1.0 / np.sqrt(target_size)
+                scale = np.random.normal(0, stddev, target_size).astype(np.float32)
+                scales.append(scale)
+
+                # Permutation: Random
+                perm = np.arange(target_size)
+                np.random.shuffle(perm)
+                perms.append(perm)
 
             layer_info = {
                 "name": name,
-                "type": "LinearWHT",
+                "type": "DeepSpectralLinear",
                 "dim": target_size,
-                "scale": D,
+                "depth": DEPTH,
+                "scales": scales,
+                "perms": perms,
                 "bias": None
             }
 
@@ -121,8 +99,6 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
                 layer_info["bias"] = bias_padded
 
             weights_list.append(layer_info)
-
-    print(f"Average Layer Relative Error: {total_rel_error/count:.4f}")
 
     # Save weights to binary file
     output_path = "vit_spectral_weights.bin"
@@ -139,8 +115,15 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
             write_string(f, layer["type"])
             f.write(struct.pack('I', layer["dim"]))
 
-            # Write scale
-            write_tensor(f, layer["scale"])
+            if layer["type"] == "DeepSpectralLinear":
+                # Write Depth
+                f.write(struct.pack('I', layer["depth"]))
+
+                for k in range(layer["depth"]):
+                    # Write Scale
+                    write_tensor(f, layer["scales"][k])
+                    # Write Perm
+                    write_perm(f, layer["perms"][k])
 
             # Write bias
             if layer["bias"] is not None:
@@ -153,33 +136,11 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
 
     # Generate Validation Data
     print("Generating validation data...")
-    # Sample Input: (1, 197, 768) - but wait, the C++ model expects input to be padded to 1024?
-    # Actually C++ auto-pads.
-    # But for verification, let's provide the original input dimension (1024 in Recasting context? No, original ViT is 768).
-    # Wait, the recasting code assumes input to the network is also transformed?
-    # The first layer `query`, `key`, `value` are recasted from 768->768 to 1024->1024.
-    # So the input to C++ `forward` should be the input to these layers.
-    # If the input is embedding output, it is 768.
-    # C++ `LinearWHT` will pad 768 -> 1024.
-    # So we should save input as 768.
-
-    # We need to run the FULL PyTorch model to get the target output.
-    # But wait, our C++ implementation only implements the Encoder blocks and Pooler?
-    # It doesn't implement Patch Embeddings.
-    # So we should feed the output of Patch Embeddings + Positional Embeddings to the C++ model.
-    # i.e., the input to the first encoder block.
 
     dummy_input = torch.randn(1, 3, 224, 224)
     with torch.no_grad():
         embeddings = model.embeddings(dummy_input) # (1, 197, 768)
-        # Run through encoder
-        # We need the output of the encoder.
-        # But wait, we replaced layers inside the encoder.
-        # We want to verify that Recasted Encoder approximates Original Encoder.
-
-        # Original Output
         original_output = model.encoder(embeddings).last_hidden_state # (1, 197, 768)
-        # Pooler
         original_pooled = model.pooler(original_output) # (1, 768)
 
     # Save validation data
