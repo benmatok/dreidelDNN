@@ -132,17 +132,43 @@ public:
     }
 
     Tensor<T, B> operator*(const Tensor<T, B>& other) const {
-        if (this->shape_ != other.shape_) {
-             throw std::invalid_argument("Shapes must match for element-wise multiplication.");
+        // Case 1: Shapes match exactly
+        if (this->shape_ == other.shape_) {
+            Tensor<T, B> result(this->shape_);
+            size_t n = this->data_.size();
+            DREIDEL_SIMD_LOOP
+            for (size_t i = 0; i < n; ++i) {
+                result.data_[i] = this->data_[i] * other.data_[i];
+            }
+            return result;
         }
-        Tensor<T, B> result(this->shape_);
-        size_t n = this->data_.size();
 
-        DREIDEL_SIMD_LOOP
-        for (size_t i = 0; i < n; ++i) {
-            result.data_[i] = this->data_[i] * other.data_[i];
+        // Case 2: Generalized Broadcasting (Last dimension match)
+        // If 'other' matches the last dimension of 'this', and 'other' is effectively 1D (or 1xN)
+        if (!this->shape_.empty() && !other.shape_.empty()) {
+            size_t last_dim = this->shape_.back();
+            size_t other_sz = other.data_.size();
+
+            // Check if other is broadcastable (size equals last_dim)
+            if (other_sz == last_dim) {
+                 Tensor<T, B> result(this->shape_);
+                 size_t total_elements = this->data_.size();
+                 size_t outer_dims = total_elements / last_dim;
+
+                 // Parallelize over outer dimensions
+                 DREIDEL_PARALLEL_LOOP
+                 for (long i = 0; i < (long)outer_dims; ++i) {
+                     size_t offset = i * last_dim;
+                     DREIDEL_SIMD_LOOP
+                     for (size_t j = 0; j < last_dim; ++j) {
+                         result.data_[offset + j] = this->data_[offset + j] * other.data_[j];
+                     }
+                 }
+                 return result;
+            }
         }
-        return result;
+
+        throw std::invalid_argument("Shapes incompatible for element-wise multiplication.");
     }
 
     // Scalar Multiplication
