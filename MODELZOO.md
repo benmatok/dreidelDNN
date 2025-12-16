@@ -67,3 +67,17 @@ Once the student model (dreidelDNN architecture) is initialized via Recasting, w
 
 *   `tools/recast_pytorch.py`: Python script to load a PyTorch model, probe its activations, solve for initial `LinearWHT` scale factors, and export weights to `dreidelDNN` binary format.
 *   `tools/distill_cpp`: C++ binary that loads the exported weights and fine-tunes them against the Teacher model's outputs (served via ONNX Runtime or LibTorch).
+
+## 3. Implementation Status
+
+### Spectral ViT (ViT-Base-Patch16-224)
+
+*   **Status:** Initial Recasting & Inference Implemented.
+*   **Performance (CPU):** ~254 ms per image (Batch Size 1, Single Threaded Warmup + Bench) on standard x86 instance.
+*   **Accuracy (Initialization):**
+    *   Layer-wise Relative Error (Projection): ~0.996 (High).
+    *   End-to-End Relative Error: ~1.002 (High).
+*   **Validation:**
+    *   Recasted network architecture verified via `examples/test_spectral_vit.cpp`.
+    *   Functional verification confirms correct execution of `LinearWHT` padding/slicing, residual connections, and bias handling.
+    *   **Finding:** Simple Least-Squares Recasting (`Projected Initialization`) is insufficient for replacing Dense layers with Diagonal Spectral layers without significant accuracy loss. **Stage 2 Distillation is mandatory.**
