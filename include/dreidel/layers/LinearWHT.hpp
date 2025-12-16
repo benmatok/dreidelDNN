@@ -48,12 +48,18 @@ public:
 
     Tensor<T, B> forward(const Tensor<T, B>& input) override {
         // Input: (Batch, N)
-        // Store input for backward
-        input_ = input;
-
-        // 1. Element-wise multiply by D (Broadcasting)
-        // z = x * scale
-        Tensor<T, B> z = input * scale_;
+        // Check input dimension
+        Tensor<T, B> z;
+        if (input.shape().back() < dim_) {
+             // Pad input
+             input_ = input.pad_last_dim(dim_);
+             z = input_ * scale_;
+        } else if (input.shape().back() > dim_) {
+             throw std::runtime_error("Input dimension larger than LinearWHT dimension. Slicing not auto-supported in forward.");
+        } else {
+             input_ = input;
+             z = input_ * scale_;
+        }
 
         // 2. FWHT in-place
         algo::WHT::FWHT(z);

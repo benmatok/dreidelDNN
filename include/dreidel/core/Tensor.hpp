@@ -114,6 +114,56 @@ public:
             }
         }
 
+        // Case 3: Generalized Broadcasting (Last dimension match)
+        if (!this->shape_.empty() && !other.shape_.empty()) {
+            size_t last_dim = this->shape_.back();
+            size_t other_sz = other.data_.size();
+
+            // Check if other is broadcastable (size equals last_dim)
+            if (other_sz == last_dim) {
+                 Tensor<T, B> result(this->shape_);
+                 size_t total_elements = this->data_.size();
+                 size_t outer_dims = total_elements / last_dim;
+
+                 // Parallelize over outer dimensions
+                 DREIDEL_PARALLEL_LOOP
+                 for (long i = 0; i < (long)outer_dims; ++i) {
+                     size_t offset = i * last_dim;
+                     DREIDEL_SIMD_LOOP
+                     for (size_t j = 0; j < last_dim; ++j) {
+                         result.data_[offset + j] = this->data_[offset + j] + other.data_[j];
+                     }
+                 }
+                 return result;
+            }
+        }
+
+        // Case 4: Reverse Broadcasting for + (Input + Bias where Bias is 1D)
+        // If 'this' is larger and 'other' matches last dim
+        // Wait, Case 3 handles (Large + Small).
+        // What if we have (Small + Large)? e.g. Bias + Input?
+        // Bias (1D) + Input (ND).
+        if (!this->shape_.empty() && !other.shape_.empty()) {
+            size_t last_dim = other.shape_.back();
+            size_t this_sz = this->data_.size();
+
+            if (this_sz == last_dim) {
+                 Tensor<T, B> result(other.shape_);
+                 size_t total_elements = other.data_.size();
+                 size_t outer_dims = total_elements / last_dim;
+
+                 DREIDEL_PARALLEL_LOOP
+                 for (long i = 0; i < (long)outer_dims; ++i) {
+                     size_t offset = i * last_dim;
+                     DREIDEL_SIMD_LOOP
+                     for (size_t j = 0; j < last_dim; ++j) {
+                         result.data_[offset + j] = this->data_[j] + other.data_[offset + j];
+                     }
+                 }
+                 return result;
+            }
+        }
+
         throw std::invalid_argument("Shapes incompatible for addition.");
     }
 
@@ -168,6 +218,36 @@ public:
             }
         }
 
+        // Case 3: Reverse Broadcasting (this is scale, other is input)
+        // If 'this' is 1D and matches last dim of 'other'
+        if (!this->shape_.empty() && !other.shape_.empty()) {
+            size_t last_dim = other.shape_.back();
+            size_t this_sz = this->data_.size();
+
+            if (this_sz == last_dim) {
+                 Tensor<T, B> result(other.shape_);
+                 size_t total_elements = other.data_.size();
+                 size_t outer_dims = total_elements / last_dim;
+
+                 DREIDEL_PARALLEL_LOOP
+                 for (long i = 0; i < (long)outer_dims; ++i) {
+                     size_t offset = i * last_dim;
+                     DREIDEL_SIMD_LOOP
+                     for (size_t j = 0; j < last_dim; ++j) {
+                         result.data_[offset + j] = other.data_[offset + j] * this->data_[j];
+                     }
+                 }
+                 return result;
+            }
+        }
+
+        std::cerr << "Incompatible Shapes for *:" << std::endl;
+        std::cerr << "This: ";
+        for(auto s : this->shape_) std::cerr << s << " ";
+        std::cerr << std::endl;
+        std::cerr << "Other: ";
+        for(auto s : other.shape_) std::cerr << s << " ";
+        std::cerr << std::endl;
         throw std::invalid_argument("Shapes incompatible for element-wise multiplication.");
     }
 
@@ -269,6 +349,57 @@ public:
         size_t n = this->data_.size();
         for (size_t i = 0; i < n; ++i) {
             result.data_[i] = func(this->data_[i]);
+        }
+        return result;
+    }
+
+    Tensor<T, B> pad_last_dim(size_t new_dim) const {
+        if (shape_.empty()) throw std::invalid_argument("Cannot pad scalar");
+        size_t last_dim = shape_.back();
+        if (new_dim < last_dim) throw std::invalid_argument("New dimension must be >= current dimension");
+        if (new_dim == last_dim) return *this;
+
+        std::vector<size_t> new_shape = shape_;
+        new_shape.back() = new_dim;
+
+        Tensor<T, B> result(new_shape);
+        result.fill(0); // Initialize with zeros
+
+        size_t total_elements = this->data_.size();
+        size_t outer_dims = total_elements / last_dim;
+
+        DREIDEL_PARALLEL_LOOP
+        for (long i = 0; i < (long)outer_dims; ++i) {
+            size_t src_offset = i * last_dim;
+            size_t dst_offset = i * new_dim;
+            for (size_t j = 0; j < last_dim; ++j) {
+                result.data_[dst_offset + j] = this->data_[src_offset + j];
+            }
+        }
+        return result;
+    }
+
+    Tensor<T, B> slice_last_dim(size_t new_dim) const {
+        if (shape_.empty()) throw std::invalid_argument("Cannot slice scalar");
+        size_t last_dim = shape_.back();
+        if (new_dim > last_dim) throw std::invalid_argument("New dimension must be <= current dimension");
+        if (new_dim == last_dim) return *this;
+
+        std::vector<size_t> new_shape = shape_;
+        new_shape.back() = new_dim;
+
+        Tensor<T, B> result(new_shape);
+
+        size_t total_elements = result.size(); // Use result size
+        size_t outer_dims = total_elements / new_dim;
+
+        DREIDEL_PARALLEL_LOOP
+        for (long i = 0; i < (long)outer_dims; ++i) {
+            size_t src_offset = i * last_dim;
+            size_t dst_offset = i * new_dim;
+            for (size_t j = 0; j < new_dim; ++j) {
+                result.data_[dst_offset + j] = this->data_[src_offset + j];
+            }
         }
         return result;
     }
