@@ -191,7 +191,7 @@ public:
         {
             curv_scale_.fill(0);
             T* curv_ptr = curv_scale_.data();
-            const T* input_ptr = input.data(); // Use input argument directly
+            const T* input_ptr = input_.data(); // Use input_ (cached)
 
             #pragma omp parallel
             {

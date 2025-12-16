@@ -38,6 +38,12 @@ struct Ops {
         a = _mm512_add_ps(u, v);
         b = _mm512_sub_ps(u, v);
     }
+
+    // Gather 16 floats from base + indices * 4
+    static inline __m512 gather(const float* base_addr, __m512i vindex) {
+        // scale=4 because floats are 4 bytes
+        return _mm512_i32gather_ps(vindex, (void*)base_addr, 4);
+    }
 };
 
 #elif defined(DREIDEL_ARCH_AVX2)
@@ -66,6 +72,11 @@ struct Ops {
         __m256 v = b;
         a = _mm256_add_ps(u, v);
         b = _mm256_sub_ps(u, v);
+    }
+
+    // Gather 8 floats
+    static inline __m256 gather(const float* base_addr, __m256i vindex) {
+        return _mm256_i32gather_ps(base_addr, vindex, 4);
     }
 };
 

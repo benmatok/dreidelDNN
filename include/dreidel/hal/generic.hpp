@@ -38,6 +38,15 @@ struct Ops {
         a = u + v;
         b = u - v;
     }
+
+    // Gather operation
+    // For generic/scalar, we just loop manually.
+    // This is not called directly in SIMD loop usually, but exposed for consistency.
+    // However, gather is usually Vector <- Base[Indices]
+    // Here we define a scalar version for completeness or helper
+    static inline float gather_scalar(const float* base, int index) {
+        return base[index];
+    }
 };
 
 } // namespace generic
