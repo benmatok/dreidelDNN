@@ -181,6 +181,22 @@ public:
 
     std::string name() const override { return "DeepSpectralLinear"; }
 
+    // Manually set permutation for a specific layer index
+    void set_permutation(size_t index, const std::vector<size_t>& p) {
+        if (index >= depth_) {
+            throw std::out_of_range("Layer index out of range in DeepSpectralLinear");
+        }
+        if (p.size() != dim_) {
+            throw std::invalid_argument("Permutation size mismatch");
+        }
+        perms_[index] = p;
+
+        // Recompute inverse permutation
+        for (size_t i = 0; i < dim_; ++i) {
+            inv_perms_[index][p[i]] = i;
+        }
+    }
+
 private:
     void permute_forward(const Tensor<T, B>& input, Tensor<T, B>& output, const std::vector<size_t>& p) {
         // Output shape matches input

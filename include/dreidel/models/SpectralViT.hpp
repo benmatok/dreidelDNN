@@ -2,6 +2,7 @@
 #define DREIDEL_MODELS_SPECTRAL_VIT_HPP
 
 #include "../layers/LinearWHT.hpp"
+#include "../layers/DeepSpectralLinear.hpp"
 #include "../layers/Bias.hpp"
 #include "../layers/ReLU.hpp"
 #include "../layers/Softmax.hpp"
@@ -82,11 +83,51 @@ public:
 
                     layers_[name + ".bias"] = bias_layer;
                 }
+            } else if (type == "DeepSpectralLinear") {
+                // Read Depth
+                uint32_t depth;
+                f.read(reinterpret_cast<char*>(&depth), 4);
+
+                auto layer = std::make_shared<layers::DeepSpectralLinear<T, B>>(dim, depth);
+                auto params = layer->parameters(); // scales
+
+                for (size_t k = 0; k < depth; ++k) {
+                    // Read Scale k
+                    read_tensor(f, params[k]);
+
+                    // Read Permutation k
+                    uint32_t perm_size;
+                    f.read(reinterpret_cast<char*>(&perm_size), 4);
+
+                    if (perm_size != dim) {
+                        throw std::runtime_error("Permutation size mismatch in file.");
+                    }
+
+                    std::vector<uint64_t> p_data(perm_size); // Using uint64 for size_t
+                    f.read(reinterpret_cast<char*>(p_data.data()), perm_size * 8);
+
+                    std::vector<size_t> p(perm_size);
+                    for(size_t j=0; j<perm_size; ++j) p[j] = static_cast<size_t>(p_data[j]);
+
+                    layer->set_permutation(k, p);
+                }
+
+                layers_[name] = layer;
+
+                // Check Bias (DeepSpectralLinear doesn't have built-in bias, but recasting might add separate Bias layer)
+                bool has_bias;
+                f.read(reinterpret_cast<char*>(&has_bias), 1);
+
+                if (has_bias) {
+                    // Create Bias layer
+                    auto bias_layer = std::make_shared<layers::Bias<T, B>>(dim);
+                    read_tensor(f, bias_layer->parameters()[0]);
+
+                    layers_[name + ".bias"] = bias_layer;
+                }
             } else {
                 std::cerr << "Unknown layer type: " << type << ". Skipping." << std::endl;
                 // Skip logic would be hard without knowing size.
-                // Currently format assumes we know how to read based on Type.
-                // But my writer only writes LinearWHT.
                 throw std::runtime_error("Unknown layer type encountered.");
             }
         }
