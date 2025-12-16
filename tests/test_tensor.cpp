@@ -50,10 +50,32 @@ void test_matmul() {
     std::cout << "PASS" << std::endl;
 }
 
+void test_broadcasting() {
+    std::cout << "Testing Tensor Broadcasting..." << std::endl;
+    // A: (2, 3)
+    // B: (3) -> Broadcast to (2, 3)
+    Tensor<float> a({2, 3}, {1, 2, 3, 4, 5, 6});
+    Tensor<float> b({3}, {10, 20, 30});
+
+    // a * b should be:
+    // [1*10, 2*20, 3*30]
+    // [4*10, 5*20, 6*30]
+    auto c = a * b;
+
+    assert(c[0] == 10);
+    assert(c[1] == 40);
+    assert(c[2] == 90);
+    assert(c[3] == 40);
+    assert(c[4] == 100);
+    assert(c[5] == 180);
+    std::cout << "PASS" << std::endl;
+}
+
 int main() {
     test_creation();
     test_addition();
     test_matmul();
+    test_broadcasting();
     std::cout << "All Tensor tests passed!" << std::endl;
     return 0;
 }
