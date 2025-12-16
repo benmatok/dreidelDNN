@@ -29,16 +29,38 @@ namespace activation {
 namespace loss {
     struct CrossEntropy {
         static float compute(const Tensor<float>& pred, const Tensor<float>& target) {
-            // Simple CE: -sum(t * log(p))
-            // numerical stability omitted for brevity
-            const float* p = pred.data();
+            // Pred are logits. Compute softmax first.
+            Tensor<float> prob = pred;
+            size_t batch = pred.shape()[0];
+            size_t dim = pred.shape()[1];
+            float* p_ptr = prob.data();
+
+            for(size_t i=0; i<batch; ++i) {
+                float max_val = -1e9;
+                for(size_t j=0; j<dim; ++j) {
+                    if (p_ptr[i*dim + j] > max_val) max_val = p_ptr[i*dim + j];
+                }
+
+                float sum = 0;
+                for(size_t j=0; j<dim; ++j) {
+                    p_ptr[i*dim + j] = std::exp(p_ptr[i*dim + j] - max_val);
+                    sum += p_ptr[i*dim + j];
+                }
+
+                for(size_t j=0; j<dim; ++j) {
+                    p_ptr[i*dim + j] /= sum;
+                }
+            }
+
+            // CE
+            const float* p = prob.data();
             const float* t = target.data();
-            float sum = 0;
+            float sum_loss = 0;
             size_t n = pred.size();
             for(size_t i=0; i<n; ++i) {
-                if(t[i] > 0) sum -= t[i] * std::log(p[i] + 1e-7f);
+                if(t[i] > 0) sum_loss -= t[i] * std::log(p[i] + 1e-7f);
             }
-            return sum / pred.shape()[0]; // mean over batch
+            return sum_loss / batch; // mean over batch
         }
         static Tensor<float> gradient(const Tensor<float>& pred, const Tensor<float>& target) {
             // Gradient of CE + Softmax is (softmax(logits) - t)
