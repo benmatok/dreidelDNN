@@ -27,6 +27,9 @@ public:
     // Get gradients for optimizer
     virtual std::vector<Tensor<T, B>*> gradients() { return {}; }
 
+    // Get curvatures (diagonal hessian approximation) for optimizer (optional)
+    virtual std::vector<Tensor<T, B>*> curvatures() { return {}; }
+
     virtual std::string name() const = 0;
 };
 
