@@ -154,25 +154,64 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
         h = random.randint(20, 50)
         synthetic_input[i, :, y:y+h, x:x+w] = random.random() * 5.0 # High intensity block
 
+    # Capture layer-wise data
+    layer_inputs = {}
+    layer_outputs = {}
+
+    def get_hook(layer_idx, is_input=False):
+        if is_input:
+            # Pre-hook signature: hook(module, input)
+            def hook(module, input):
+                layer_inputs[layer_idx] = input[0].detach()
+            return hook
+        else:
+            # Forward hook signature: hook(module, input, output)
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    layer_outputs[layer_idx] = output[0].detach()
+                else:
+                    layer_outputs[layer_idx] = output.detach()
+            return hook
+
+    # Register hooks
+    handles = []
+    for i, layer_module in enumerate(model.encoder.layer):
+        h1 = layer_module.register_forward_hook(get_hook(i, is_input=False))
+        h2 = layer_module.register_forward_pre_hook(get_hook(i, is_input=True))
+        handles.append(h1)
+        handles.append(h2)
+
+    # Run model
     with torch.no_grad():
-        # Get Teacher Targets
-        # Input to our C++ model is the embeddings output
-        embeddings = model.embeddings(synthetic_input) # (B, 197, 768)
-
-        # Teacher output
-        # We need the output of the encoder + pooler
+        embeddings = model.embeddings(synthetic_input)
+        # We also need to capture Pooler input/output
+        # Pooler input is Encoder output
         encoder_output = model.encoder(embeddings).last_hidden_state
-        teacher_output = model.pooler(encoder_output) # (B, 768)
+        pooler_output = model.pooler(encoder_output)
 
-    # Save distillation data
-    distill_path = "vit_distillation_data.bin"
+    # Cleanup hooks
+    for h in handles: h.remove()
+
+    # Save layer-wise data
+    distill_path = "vit_layer_data.bin"
     with open(distill_path, "wb") as f:
-        # Input (Embeddings)
-        write_tensor(f, embeddings.numpy())
-        # Target (Teacher Output)
-        write_tensor(f, teacher_output.numpy())
+        # Write number of blocks (12 encoder + 1 pooler)
+        f.write(struct.pack('I', 13))
 
-    print(f"Saved distillation data to {distill_path}")
+        # Encoder Blocks 0-11
+        for i in range(12):
+            # Input
+            write_tensor(f, layer_inputs[i].numpy())
+            # Target
+            write_tensor(f, layer_outputs[i].numpy())
+
+        # Pooler
+        # Input (Encoder Output)
+        write_tensor(f, encoder_output.numpy())
+        # Target (Pooler Output)
+        write_tensor(f, pooler_output.numpy())
+
+    print(f"Saved layer-wise distillation data to {distill_path}")
 
 if __name__ == "__main__":
     recast_vit()

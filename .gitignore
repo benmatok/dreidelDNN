@@ -1,3 +1,5 @@
 train_spectral_vit
 vit_distillation_data.bin
 vit_spectral_weights.bin
+vit_layer_data.bin
+vit_layer_data.bin

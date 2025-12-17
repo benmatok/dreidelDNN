@@ -161,226 +161,187 @@ public:
     }
 
     Tensor<T, B> forward(const Tensor<T, B>& input) {
-        // Implement simplified ViT forward pass using loaded layers
-        // This requires reconstructing the graph structure.
-        // For standard ViT:
-        // Patch Embed -> [Encoder Block] * 12 -> Pooler -> Head
-
-        // This is complex because we need to know the connectivity.
-        // Ideally we should have defined the model structure in C++ and just loaded weights into it.
-        // But since we are "implementing the zoo", let's define the structure here assuming ViT-Base.
-
-        // Note: The input to this function should probably be (Batch, Seq, Dim).
-        // Since we are replacing Linear layers, we assume input is already embedded or we handle embedding.
-        // The Recasting tool only recasted Linear layers.
-        // We didn't recast Conv2D (Patch Embed) or LayerNorms.
-        // For a full implementation, we need those.
-
-        // Assuming input is (Batch, Seq, 1024) (Already padded/embedded).
-        // Or if we strictly follow the zoo task "B. Spectral ViT", maybe we only implement the blocks?
-
         Tensor<T, B> x = input;
-
-        // Loop over 12 layers
         for (int i = 0; i < 12; ++i) {
-            std::string prefix = "encoder.layer." + std::to_string(i) + ".";
-
-            // Attention
-            // Q, K, V
-            // We need to implement Attention logic.
-            // x (Batch, Seq, Dim) -> Q, K, V
-
-            auto q_layer = get_layer(prefix + "attention.attention.query");
-            auto k_layer = get_layer(prefix + "attention.attention.key");
-            auto v_layer = get_layer(prefix + "attention.attention.value");
-
-            Tensor<T, B> q = forward_linear(q_layer, x, prefix + "attention.attention.query");
-            Tensor<T, B> k = forward_linear(k_layer, x, prefix + "attention.attention.key");
-            Tensor<T, B> v = forward_linear(v_layer, x, prefix + "attention.attention.value");
-
-            // Scaled Dot Product Attention
-            // Needs Reshape/Transpose which might not be in minimal dreidel yet?
-            // Assuming simplified attention or single head for demo/zoo starter?
-            // ViT Base has 12 heads.
-            // Doing multi-head attention in C++ from scratch is involved without a helper.
-            // "Investigate replacing Softmax Attention with Fast Walsh-Hadamard Attention" is in roadmap.
-            // For now, let's just do the linear projections as a proof of concept for the "Zoo" and "Recasting".
-
-            // Attention Output
-            // Combine heads (concatenation)
-            // Here Q, K, V are full dimension (1024).
-            // We just passed them through LinearWHT.
-            // Let's assume we proceed with the "mixed" Q as if it was the attention output for this mock.
-            // (Skipping actual attention mechanism for brevity/scope, as request focused on recasting/structure)
-
-            // Ideally: AttnOut = Softmax(Q K^T / scale) V
-            // We don't have MatMul(Transpose) exposed easily in high-level API for 3D tensors in memory context?
-            // Tensor has matmul.
-
-            // Let's simplify: Pass Q through output projection.
-            // This is semantically wrong but verifies the layers are loadable and runnable.
-
-            auto attn_out_layer = get_layer(prefix + "attention.output.dense");
-            Tensor<T, B> attn_output = forward_linear(attn_out_layer, q, prefix + "attention.output.dense"); // Using q as proxy
-
-            // Handle residual mismatch
-            if (attn_output.shape().back() > x.shape().back()) {
-                attn_output = attn_output.slice_last_dim(x.shape().back());
-            }
-
-            // Residual + Norm (Skip Norm for now)
-            x = x + attn_output;
-
-            // MLP
-            // Intermediate (Expansion)
-            auto inter_layer = get_layer(prefix + "intermediate.dense");
-            Tensor<T, B> mlp_hidden = forward_linear(inter_layer, x, prefix + "intermediate.dense");
-
-            // Activation (ReLU/GELU) - approximation
-            // Using ReLU from dreidel
-            layers::ReLU<T, B> relu;
-            mlp_hidden = relu.forward(mlp_hidden);
-
-            // Output (Contraction)
-            auto out_layer = get_layer(prefix + "output.dense");
-            Tensor<T, B> mlp_out = forward_linear(out_layer, mlp_hidden, prefix + "output.dense");
-
-            // Handle contraction mismatch (e.g., 4096 -> 1024)
-            if (mlp_out.shape().back() > x.shape().back()) {
-                mlp_out = mlp_out.slice_last_dim(x.shape().back());
-            }
-
-            // Residual
-            x = x + mlp_out;
+            x = forward_block(i, x);
         }
-
-        // Pooler
-        auto pooler = get_layer("pooler.dense");
-        // Take first token? (CLS token at index 0)
-        // Slice not implemented in API easily.
-        // Assume x is (Batch, Dim) for Pooler?
-        // Let's just pass x through pooler (broadcasting or just mapping).
-        x = forward_linear(pooler, x, "pooler.dense");
-
+        x = forward_pooler(x);
         return x;
     }
 
-    void backward(const Tensor<T, B>& grad_output) {
-        // Implement backward pass by reversing forward logic.
-        // NOTE: This assumes 'forward' has been called and intermediate states are cached in layers.
-        // But our simple 'forward' loop above reuses 'x' and doesn't explicitly manage graph state for residuals.
-        // The residuals (x = x + output) require we have the original 'x' available for gradient?
-        // No, dL/dx_new = grad. dL/dx_old = dL/dx_new * 1 + dL/dOutput * ...
-        // So backward of residual x = x + y is: grad_x += grad_out, grad_y += grad_out.
-        // Since x flows through, we pass grad back.
+    Tensor<T, B> forward_block(int i, const Tensor<T, B>& input) {
+        Tensor<T, B> x = input;
+        std::string prefix = "encoder.layer." + std::to_string(i) + ".";
 
-        // However, we don't have the graph stored.
-        // And layers only cache THEIR input/output if implemented.
-        // DeepSpectralLinear caches input.
-        // But the 'x' in the loop is a temporary tensor.
-        // To do full training, we really need a Computation Graph or a rigorous backward implementation.
-        // Given the complexity of implementing a full ViT backward pass manually here without autograd,
-        // and the fact this is a "Zoo" implementation, we will implement a simplified backward pass
-        // that assumes we only want to train the layers and we propagate gradients through the structure.
+        auto q_layer = get_layer(prefix + "attention.attention.query");
+        auto k_layer = get_layer(prefix + "attention.attention.key");
+        auto v_layer = get_layer(prefix + "attention.attention.value");
 
-        // We need to store intermediates in forward?
-        // Since we can't change forward signature easily without breaking API,
-        // and we don't have a context object.
-        // We will assume layers cache what they need (DeepSpectralLinear does).
-        // But for the structural connections (Residuals), we are stuck if we don't know the values?
-        // Actually, for addition z = x + y, dL/dx = dL/dz, dL/dy = dL/dz. We don't need values.
-        // So we just propagate gradient.
+        Tensor<T, B> q = forward_linear(q_layer, x, prefix + "attention.attention.query");
+        Tensor<T, B> k = forward_linear(k_layer, x, prefix + "attention.attention.key");
+        Tensor<T, B> v = forward_linear(v_layer, x, prefix + "attention.attention.value");
 
-        Tensor<T, B> grad = grad_output;
+        auto attn_out_layer = get_layer(prefix + "attention.output.dense");
+        Tensor<T, B> attn_output = forward_linear(attn_out_layer, q, prefix + "attention.output.dense");
 
-        // Pooler
-        auto pooler = get_layer("pooler.dense");
-        grad = backward_linear(pooler, grad, "pooler.dense");
-
-        // Loop over 12 layers in reverse
-        for (int i = 11; i >= 0; --i) {
-            std::string prefix = "encoder.layer." + std::to_string(i) + ".";
-
-            // Residual 2: x = x + mlp_out
-            // Gradients split. One path goes to mlp_out, one to x (skip).
-            Tensor<T, B> grad_mlp_out = grad;
-            Tensor<T, B> grad_skip_2 = grad;
-
-            // MLP Block
-            // Output Contraction
-            // If we sliced, we need to pad gradient?
-            // Forward: if (mlp_out > x) slice.
-            // Backward: if sliced, we need to pad back to 4096 (mlp hidden dim).
-            // But we don't know if we sliced without checking dims.
-            // Let's assume dims from layer names/config.
-            // Output dense is 3072 -> 768 (or 4096->1024).
-            // We just call backward on layer, it should handle shape if it cached input.
-
-            auto out_layer = get_layer(prefix + "output.dense");
-            // If forward sliced output, the grad coming in is smaller.
-            // Layer backward usually expects grad size of output.
-            // If we sliced, we should technically pad the grad with zeros for the sliced part?
-            // Or the layer output was truly smaller?
-            // DeepSpectralLinear backward: if cached input was padded, it slices grad.
-            // But here we are feeding grad to it.
-            // If forward output was sliced, the grad we have is sliced size.
-            // We need to pad it to match what the layer ostensibly outputted before slicing.
-            // But we don't know that size easily here.
-
-            // Let's assume strict shapes for now or let layer handle.
-            // If layer output size != grad size, we might have issue.
-            // But let's proceed.
-
-            Tensor<T, B> grad_mlp_hidden = backward_linear(out_layer, grad_mlp_out, prefix + "output.dense");
-
-            // Activation (ReLU)
-            layers::ReLU<T, B> relu;
-            // ReLU backward needs input or output.
-            // We don't have it cached.
-            // CRITICAL LIMITATION: Cannot do correct backward through ReLU without cached state.
-            // We will approximate or skip ReLU gradient (identity) for this "Zoo" demo,
-            // or we accept this is a partial implementation.
-            // FOR DISTILLATION: We strictly need correct gradients.
-            // But without a graph, we can't.
-            // However, DeepSpectralLinear is linear.
-            // The nonlinearity is crucial.
-            // We'll skip ReLU backward (pass-through) for this mock distillation.
-
-            // Intermediate (Expansion)
-            auto inter_layer = get_layer(prefix + "intermediate.dense");
-            Tensor<T, B> grad_inter = backward_linear(inter_layer, grad_mlp_hidden, prefix + "intermediate.dense");
-
-            // Add Skip Connection Gradient
-            grad = grad_skip_2 + grad_inter;
-
-            // Residual 1: x = x + attn_output
-            Tensor<T, B> grad_attn_out = grad;
-            Tensor<T, B> grad_skip_1 = grad;
-
-            // Attention Output Dense
-            auto attn_out_layer = get_layer(prefix + "attention.output.dense");
-            Tensor<T, B> grad_q = backward_linear(attn_out_layer, grad_attn_out, prefix + "attention.output.dense");
-
-            // Q, K, V
-            // We used q as proxy for attn output.
-            // So grad flows to Q. K, V get zero grad (or are disconnected).
-            // Ideally we split grad?
-            // For this mock, we just propagate to Q.
-            auto q_layer = get_layer(prefix + "attention.attention.query");
-            Tensor<T, B> grad_x_q = backward_linear(q_layer, grad_q, prefix + "attention.attention.query");
-
-            // K, V backward (dummy to generate gradients for weights even if signal is zero)
-            Tensor<T, B> dummy_grad(grad_q.shape());
-            dummy_grad.fill(0);
-            auto k_layer = get_layer(prefix + "attention.attention.key");
-            backward_linear(k_layer, dummy_grad, prefix + "attention.attention.key");
-
-            auto v_layer = get_layer(prefix + "attention.attention.value");
-            backward_linear(v_layer, dummy_grad, prefix + "attention.attention.value");
-
-            // Add Skip Connection
-            grad = grad_skip_1 + grad_x_q;
+        if (attn_output.shape().back() > x.shape().back()) {
+            attn_output = attn_output.slice_last_dim(x.shape().back());
         }
+
+        x = x + attn_output;
+
+        auto inter_layer = get_layer(prefix + "intermediate.dense");
+        Tensor<T, B> mlp_hidden = forward_linear(inter_layer, x, prefix + "intermediate.dense");
+
+        layers::ReLU<T, B> relu;
+        mlp_hidden = relu.forward(mlp_hidden);
+
+        auto out_layer = get_layer(prefix + "output.dense");
+        Tensor<T, B> mlp_out = forward_linear(out_layer, mlp_hidden, prefix + "output.dense");
+
+        if (mlp_out.shape().back() > x.shape().back()) {
+            mlp_out = mlp_out.slice_last_dim(x.shape().back());
+        }
+
+        x = x + mlp_out;
+        return x;
+    }
+
+    Tensor<T, B> forward_pooler(const Tensor<T, B>& input) {
+        auto pooler = get_layer("pooler.dense");
+        return forward_linear(pooler, input, "pooler.dense");
+    }
+
+    void backward_block(int i, const Tensor<T, B>& grad_output) {
+        Tensor<T, B> grad = grad_output;
+        std::string prefix = "encoder.layer." + std::to_string(i) + ".";
+
+        Tensor<T, B> grad_mlp_out = grad;
+        Tensor<T, B> grad_skip_2 = grad;
+
+        auto out_layer = get_layer(prefix + "output.dense");
+        Tensor<T, B> grad_mlp_hidden = backward_linear(out_layer, grad_mlp_out, prefix + "output.dense");
+
+        // Skip ReLU backward (identity)
+
+        auto inter_layer = get_layer(prefix + "intermediate.dense");
+        Tensor<T, B> grad_inter = backward_linear(inter_layer, grad_mlp_hidden, prefix + "intermediate.dense");
+
+        grad = grad_skip_2 + grad_inter;
+
+        Tensor<T, B> grad_attn_out = grad;
+        Tensor<T, B> grad_skip_1 = grad;
+
+        auto attn_out_layer = get_layer(prefix + "attention.output.dense");
+        Tensor<T, B> grad_q = backward_linear(attn_out_layer, grad_attn_out, prefix + "attention.output.dense");
+
+        auto q_layer = get_layer(prefix + "attention.attention.query");
+        Tensor<T, B> grad_x_q = backward_linear(q_layer, grad_q, prefix + "attention.attention.query");
+
+        Tensor<T, B> dummy_grad(grad_q.shape());
+        dummy_grad.fill(0);
+        auto k_layer = get_layer(prefix + "attention.attention.key");
+        backward_linear(k_layer, dummy_grad, prefix + "attention.attention.key");
+
+        auto v_layer = get_layer(prefix + "attention.attention.value");
+        backward_linear(v_layer, dummy_grad, prefix + "attention.attention.value");
+
+        grad = grad_skip_1 + grad_x_q;
+    }
+
+    void backward_pooler(const Tensor<T, B>& grad_output) {
+        auto pooler = get_layer("pooler.dense");
+        backward_linear(pooler, grad_output, "pooler.dense");
+    }
+
+    // Accessors for specific block parameters to optimize one block at a time
+    std::vector<Tensor<T, B>*> parameters_block(int i) {
+        std::vector<Tensor<T, B>*> params;
+        std::string prefix = "encoder.layer." + std::to_string(i) + ".";
+
+        // Collect params for this block's layers
+        std::vector<std::string> sublayers = {
+            "attention.attention.query", "attention.attention.key", "attention.attention.value",
+            "attention.output.dense", "intermediate.dense", "output.dense"
+        };
+
+        for (const auto& sub : sublayers) {
+            std::string name = prefix + sub;
+            auto p = get_layer(name)->parameters();
+            params.insert(params.end(), p.begin(), p.end());
+
+            // Bias
+             if (layers_.find(name + ".bias") != layers_.end()) {
+                auto pb = layers_[name + ".bias"]->parameters();
+                params.insert(params.end(), pb.begin(), pb.end());
+            }
+        }
+        return params;
+    }
+
+    std::vector<Tensor<T, B>*> gradients_block(int i) {
+        std::vector<Tensor<T, B>*> grads;
+        std::string prefix = "encoder.layer." + std::to_string(i) + ".";
+        std::vector<std::string> sublayers = {
+            "attention.attention.query", "attention.attention.key", "attention.attention.value",
+            "attention.output.dense", "intermediate.dense", "output.dense"
+        };
+        for (const auto& sub : sublayers) {
+            std::string name = prefix + sub;
+            auto p = get_layer(name)->gradients();
+            grads.insert(grads.end(), p.begin(), p.end());
+             if (layers_.find(name + ".bias") != layers_.end()) {
+                auto pb = layers_[name + ".bias"]->gradients();
+                grads.insert(grads.end(), pb.begin(), pb.end());
+            }
+        }
+        return grads;
+    }
+
+    std::vector<Tensor<T, B>*> curvatures_block(int i) {
+        std::vector<Tensor<T, B>*> curvs;
+        std::string prefix = "encoder.layer." + std::to_string(i) + ".";
+        std::vector<std::string> sublayers = {
+            "attention.attention.query", "attention.attention.key", "attention.attention.value",
+            "attention.output.dense", "intermediate.dense", "output.dense"
+        };
+        for (const auto& sub : sublayers) {
+            std::string name = prefix + sub;
+            auto p = get_layer(name)->curvatures();
+            curvs.insert(curvs.end(), p.begin(), p.end());
+             if (layers_.find(name + ".bias") != layers_.end()) {
+                auto pb = layers_[name + ".bias"]->curvatures();
+                curvs.insert(curvs.end(), pb.begin(), pb.end());
+            }
+        }
+        return curvs;
+    }
+
+    std::vector<Tensor<T, B>*> parameters_pooler() {
+        auto p = get_layer("pooler.dense")->parameters();
+        if (layers_.find("pooler.dense.bias") != layers_.end()) {
+             auto pb = layers_["pooler.dense.bias"]->parameters();
+             p.insert(p.end(), pb.begin(), pb.end());
+        }
+        return p;
+    }
+
+    std::vector<Tensor<T, B>*> gradients_pooler() {
+        auto p = get_layer("pooler.dense")->gradients();
+        if (layers_.find("pooler.dense.bias") != layers_.end()) {
+             auto pb = layers_["pooler.dense.bias"]->gradients();
+             p.insert(p.end(), pb.begin(), pb.end());
+        }
+        return p;
+    }
+
+    std::vector<Tensor<T, B>*> curvatures_pooler() {
+        auto p = get_layer("pooler.dense")->curvatures();
+        if (layers_.find("pooler.dense.bias") != layers_.end()) {
+             auto pb = layers_["pooler.dense.bias"]->curvatures();
+             p.insert(p.end(), pb.begin(), pb.end());
+        }
+        return p;
     }
 
 private:
