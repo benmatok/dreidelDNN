@@ -134,24 +134,45 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
 
     print(f"Saved recasted weights to {output_path}")
 
-    # Generate Validation Data
-    print("Generating validation data...")
+    # Generate Distillation Data (Synthetic)
+    print("Generating distillation data (synthetic)...")
 
-    dummy_input = torch.randn(1, 3, 224, 224)
+    # Generate a batch of synthetic data
+    # We use random noise as requested/implied for "synthetic images dataset, shapes noise etc"
+    # In a real scenario, we might use fractal noise or geometric shapes.
+    # For this proof of concept, high-variance random noise is sufficient to excite the network.
+
+    BATCH_SIZE = 32
+    synthetic_input = torch.randn(BATCH_SIZE, 3, 224, 224)
+
+    # We also add some "shapes" - e.g., blocks of constant value to simulate structure
+    for i in range(BATCH_SIZE):
+        # Random block
+        x = random.randint(0, 150)
+        y = random.randint(0, 150)
+        w = random.randint(20, 50)
+        h = random.randint(20, 50)
+        synthetic_input[i, :, y:y+h, x:x+w] = random.random() * 5.0 # High intensity block
+
     with torch.no_grad():
-        embeddings = model.embeddings(dummy_input) # (1, 197, 768)
-        original_output = model.encoder(embeddings).last_hidden_state # (1, 197, 768)
-        original_pooled = model.pooler(original_output) # (1, 768)
+        # Get Teacher Targets
+        # Input to our C++ model is the embeddings output
+        embeddings = model.embeddings(synthetic_input) # (B, 197, 768)
 
-    # Save validation data
-    val_path = "vit_validation_data.bin"
-    with open(val_path, "wb") as f:
+        # Teacher output
+        # We need the output of the encoder + pooler
+        encoder_output = model.encoder(embeddings).last_hidden_state
+        teacher_output = model.pooler(encoder_output) # (B, 768)
+
+    # Save distillation data
+    distill_path = "vit_distillation_data.bin"
+    with open(distill_path, "wb") as f:
         # Input (Embeddings)
         write_tensor(f, embeddings.numpy())
-        # Output (Pooled)
-        write_tensor(f, original_pooled.numpy())
+        # Target (Teacher Output)
+        write_tensor(f, teacher_output.numpy())
 
-    print(f"Saved validation data to {val_path}")
+    print(f"Saved distillation data to {distill_path}")
 
 if __name__ == "__main__":
     recast_vit()

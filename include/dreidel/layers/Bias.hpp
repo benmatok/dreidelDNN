@@ -19,42 +19,12 @@ public:
 
     Tensor<T, B> forward(const Tensor<T, B>& input) override {
         // Broadcast add
-        // Input: (..., dim)
-        // Bias: (1, dim)
         return input + bias_;
     }
 
     Tensor<T, B> backward(const Tensor<T, B>& grad_output) override {
-        // dL/db = sum(dL/dy, axis=0...N-1)
-        // grad_output: (..., dim)
-
-        // Sum over all dimensions except last
-        // Assuming Tensor.sum(axis) reduces one axis.
-        // If Tensor doesn't support reducing multiple axes at once easily, we rely on implementation.
-        // Usually HAL ops reduce.
-
-        // Let's implement manual reduction similar to LinearWHT if needed,
-        // but Tensor might have `sum(axis)` or `reduce_sum`.
-        // The Memory says `ops.hpp` defines `load`, `store`, `add`, `sub`, `butterfly`.
-        // It doesn't explicitly mention `sum` or `reduce`.
-        // But `Dense.hpp` uses `grad_output.sum(0)`.
-
-        // If grad_output has >2 dimensions, `sum(0)` only reduces batch.
-        // We need to reduce all except last.
-        // For now, assume Flatten->Sum(0) or similar logic if supported.
-        // Actually, if input is (Batch, Dim), sum(0) works.
-        // If (Batch, Seq, Dim), sum(0).sum(0)?
-
-        // Let's assume standard (Batch, Dim) usage for now as per Dense.
-        // If more dims, we need to iterate.
-
-        // For ViT, input is (Batch, Seq, Dim).
-        // So we need to sum over Batch AND Seq.
-
-        // Implementation:
         grad_bias_.fill(0);
 
-        // Manual reduction
         size_t last_dim = dim_;
         size_t total_elements = grad_output.size();
         size_t outer_dims = total_elements / last_dim;
@@ -82,7 +52,6 @@ public:
             }
         }
 
-        // dL/dx = dL/dy (Identity for bias add)
         return grad_output;
     }
 
@@ -92,6 +61,10 @@ public:
 
     std::vector<Tensor<T, B>*> gradients() override {
         return {&grad_bias_};
+    }
+
+    std::vector<Tensor<T, B>*> curvatures() override {
+        return {nullptr};
     }
 
     std::string name() const override { return "Bias"; }
