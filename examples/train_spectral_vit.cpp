@@ -36,94 +36,109 @@ int main(int argc, char** argv) {
     std::string data_path = argv[2];
 
     try {
-        std::cout << "--- Spectral ViT Distillation Training ---" << std::endl;
+        std::cout << "--- Spectral ViT Block-wise Distillation ---" << std::endl;
 
         models::SpectralViT<float> model;
         std::cout << "Loading Student Weights from " << weights_path << "..." << std::endl;
         model.load_weights(weights_path);
 
-        Tensor<float> inputs;
-        Tensor<float> targets;
-
-        std::cout << "Loading Distillation Data from " << data_path << "..." << std::endl;
+        std::cout << "Loading Layer-wise Data from " << data_path << "..." << std::endl;
         std::ifstream f(data_path, std::ios::binary);
         if (!f.is_open()) throw std::runtime_error("Cannot open data file");
 
-        read_tensor_util(f, inputs);
-        read_tensor_util(f, targets);
+        uint32_t num_blocks;
+        f.read(reinterpret_cast<char*>(&num_blocks), 4);
 
-        std::cout << "Data Loaded. Input: ";
-        for(auto d : inputs.shape()) std::cout << d << " ";
-        std::cout << "Target: ";
-        for(auto d : targets.shape()) std::cout << d << " ";
-        std::cout << std::endl;
+        // Loop over blocks
+        for (int i = 0; i < 12; ++i) {
+            Tensor<float> inputs;
+            Tensor<float> targets;
 
-        // Optimizer
-        // Low learning rate because FWHT scales energy
-        float lr = 1e-5;
-        optim::DiagonalNewton<float> optimizer(lr);
+            read_tensor_util(f, inputs);
+            read_tensor_util(f, targets);
 
-        optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
+            std::cout << "--- Training Block " << i << " ---" << std::endl;
+            std::cout << "Input: "; for(auto d : inputs.shape()) std::cout << d << " ";
+            std::cout << " Target: "; for(auto d : targets.shape()) std::cout << d << " ";
+            std::cout << std::endl;
 
-        int epochs = 5;
-        // In a real scenario we would batch. Here we treat the whole file as one batch (if memory allows).
-        // Or loop over batch dimension manually if implemented.
-        // Assuming data is (Batch, Seq, Dim).
-        // We will run forward on the whole tensor.
+            float lr = 1e-5;
+            optim::DiagonalNewton<float> optimizer(lr);
+            optimizer.add_parameters(model.parameters_block(i), model.gradients_block(i), model.curvatures_block(i));
 
-        std::cout << "Starting Distillation Loop (" << epochs << " epochs)..." << std::endl;
+            for(int epoch=0; epoch<3; ++epoch) {
+                 auto start = std::chrono::high_resolution_clock::now();
+                 optimizer.zero_grad();
 
-        for (int epoch = 0; epoch < epochs; ++epoch) {
-            auto start = std::chrono::high_resolution_clock::now();
+                 // Forward Block
+                 // We use teacher input 'inputs' as input (Teacher Forcing)
+                 Tensor<float> output = model.forward_block(i, inputs);
 
-            optimizer.zero_grad();
+                 // Compute Loss & Gradient
+                 size_t total = output.size();
+                 Tensor<float> grad_output(output.shape());
+                 float loss = 0;
 
-            // Forward
-            Tensor<float> output = model.forward(inputs);
+                 float* out_ptr = output.data();
+                 float* tgt_ptr = targets.data();
+                 float* grad_ptr = grad_output.data();
 
-            // Post-process output to match target for loss computation
-            // Output: (Batch, Seq, 1024). Target: (Batch, 768).
-            // We need to extract CLS token (seq 0) and slice to 768.
+                 #pragma omp parallel for reduction(+:loss)
+                 for(size_t k=0; k<total; ++k) {
+                     float diff = out_ptr[k] - tgt_ptr[k];
+                     loss += diff * diff;
+                     grad_ptr[k] = 2.0f * diff / total;
+                 }
+                 loss /= total;
 
-            size_t batch = output.shape()[0];
-            size_t seq = output.shape()[1];
-            size_t dim = output.shape()[2];
-            size_t target_dim = targets.shape()[1];
+                 // Backward Block
+                 model.backward_block(i, grad_output);
 
-            Tensor<float> final_output({batch, target_dim});
+                 optimizer.step();
 
-            // Extract and compute loss gradient
-            Tensor<float> grad_output(output.shape()); // Gradient w.r.t raw output
-            grad_output.fill(0);
-
-            float loss = 0;
-
-            #pragma omp parallel for reduction(+:loss)
-            for (long b = 0; b < (long)batch; ++b) {
-                for (size_t d = 0; d < target_dim; ++d) {
-                    float y_pred = output.data()[b*seq*dim + d]; // CLS token at index 0 (offset 0)
-                    float y_true = targets.data()[b*target_dim + d];
-                    float diff = y_pred - y_true;
-                    loss += diff * diff;
-
-                    // dLoss/dOutput
-                    // L = sum(diff^2) -> dL = 2*diff
-                    // Store in the correct place in grad_output
-                    grad_output.data()[b*seq*dim + d] = 2.0f * diff / (batch * target_dim); // Mean reduction
-                }
+                 auto end = std::chrono::high_resolution_clock::now();
+                 double ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+                 std::cout << "  Epoch " << epoch+1 << ": Loss " << loss << " (" << ms << " ms)" << std::endl;
             }
-            loss /= (batch * target_dim);
+        }
 
-            // Backward
-            model.backward(grad_output);
+        // Pooler
+        {
+            Tensor<float> inputs;
+            Tensor<float> targets;
+            read_tensor_util(f, inputs);
+            read_tensor_util(f, targets);
 
-            // Optimize
-            optimizer.step();
+            std::cout << "--- Training Pooler ---" << std::endl;
 
-            auto end = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+            float lr = 1e-5;
+            optim::DiagonalNewton<float> optimizer(lr);
+            optimizer.add_parameters(model.parameters_pooler(), model.gradients_pooler(), model.curvatures_pooler());
 
-            std::cout << "Epoch " << epoch+1 << "/" << epochs << " - Loss: " << loss << " (" << ms << " ms)" << std::endl;
+            for(int epoch=0; epoch<3; ++epoch) {
+                 optimizer.zero_grad();
+                 Tensor<float> output = model.forward_pooler(inputs);
+
+                 size_t total = output.size();
+                 Tensor<float> grad_output(output.shape());
+                 float loss = 0;
+
+                 float* out_ptr = output.data();
+                 float* tgt_ptr = targets.data();
+                 float* grad_ptr = grad_output.data();
+
+                 #pragma omp parallel for reduction(+:loss)
+                 for(size_t k=0; k<total; ++k) {
+                     float diff = out_ptr[k] - tgt_ptr[k];
+                     loss += diff * diff;
+                     grad_ptr[k] = 2.0f * diff / total;
+                 }
+                 loss /= total;
+
+                 model.backward_pooler(grad_output);
+                 optimizer.step();
+                 std::cout << "  Epoch " << epoch+1 << ": Loss " << loss << std::endl;
+            }
         }
 
         std::cout << "Distillation Complete." << std::endl;
