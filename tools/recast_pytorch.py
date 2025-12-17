@@ -25,23 +25,20 @@ def write_tensor(f, t):
 def write_perm(f, p):
     # p is list/array of integers
     # Write size (which is also dim)
-    # DeepSpectralLinear reader expects size, then data (uint64)
     size = len(p)
     f.write(struct.pack('I', size))
-    # Write data as uint64
-    # struct pack 'Q' is unsigned long long (64 bit)
-    # We can write one by one or pack all
-    # Packing all might be faster but string might be too long?
-    # Python struct format string limits?
-    # Let's write array directly if possible or loop
-
     # Convert to array of uint64
     arr = np.array(p, dtype=np.uint64)
     f.write(arr.tobytes())
 
-def recast_vit(model_name="google/vit-base-patch16-224"):
+def recast_vit(model_name="google/vit-base-patch16-224", min_dim=256, batch_size=32):
     print(f"Loading {model_name}...")
-    model = ViTModel.from_pretrained(model_name)
+    try:
+        model = ViTModel.from_pretrained(model_name)
+    except Exception as e:
+        print(f"Failed to load {model_name}: {e}")
+        return
+
     model.eval()
 
     weights_list = []
@@ -63,7 +60,7 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
             if out_target < out_features: out_target *= 2
 
             target_size = max(in_target, out_target)
-            if target_size < 1024: target_size = 1024
+            if target_size < min_dim: target_size = min_dim
 
             print(f"Converting {name}: {in_features}->{out_features} to DeepSpectralLinear({target_size}, K={DEPTH})")
 
@@ -137,16 +134,10 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
     # Generate Distillation Data (Synthetic)
     print("Generating distillation data (synthetic)...")
 
-    # Generate a batch of synthetic data
-    # We use random noise as requested/implied for "synthetic images dataset, shapes noise etc"
-    # In a real scenario, we might use fractal noise or geometric shapes.
-    # For this proof of concept, high-variance random noise is sufficient to excite the network.
-
-    BATCH_SIZE = 32
-    synthetic_input = torch.randn(BATCH_SIZE, 3, 224, 224)
+    synthetic_input = torch.randn(batch_size, 3, 224, 224)
 
     # We also add some "shapes" - e.g., blocks of constant value to simulate structure
-    for i in range(BATCH_SIZE):
+    for i in range(batch_size):
         # Random block
         x = random.randint(0, 150)
         y = random.randint(0, 150)
@@ -175,6 +166,7 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
 
     # Register hooks
     handles = []
+    num_encoder_layers = len(model.encoder.layer)
     for i, layer_module in enumerate(model.encoder.layer):
         h1 = layer_module.register_forward_hook(get_hook(i, is_input=False))
         h2 = layer_module.register_forward_pre_hook(get_hook(i, is_input=True))
@@ -195,11 +187,11 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
     # Save layer-wise data
     distill_path = "vit_layer_data.bin"
     with open(distill_path, "wb") as f:
-        # Write number of blocks (12 encoder + 1 pooler)
-        f.write(struct.pack('I', 13))
+        # Write number of blocks (encoder + 1 pooler)
+        f.write(struct.pack('I', num_encoder_layers + 1))
 
-        # Encoder Blocks 0-11
-        for i in range(12):
+        # Encoder Blocks
+        for i in range(num_encoder_layers):
             # Input
             write_tensor(f, layer_inputs[i].numpy())
             # Target
@@ -214,4 +206,10 @@ def recast_vit(model_name="google/vit-base-patch16-224"):
     print(f"Saved layer-wise distillation data to {distill_path}")
 
 if __name__ == "__main__":
-    recast_vit()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="google/vit-base-patch16-224", help="HuggingFace model name")
+    parser.add_argument("--min-dim", type=int, default=256, help="Minimum spectral dimension")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for synthetic data")
+    args = parser.parse_args()
+
+    recast_vit(args.model, args.min_dim, args.batch_size)

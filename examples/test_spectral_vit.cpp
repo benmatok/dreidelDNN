@@ -29,12 +29,13 @@ void read_tensor_util(std::ifstream& f, Tensor<T>& t) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <weights_path> [validation_data_path]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <weights_path> [validation_data_path] [dim]" << std::endl;
         return 1;
     }
 
     std::string weights_path = argv[1];
     std::string val_path = (argc > 2) ? argv[2] : "";
+    int dim = (argc > 3) ? std::atoi(argv[3]) : 768;
 
     try {
         std::cout << "--- Spectral ViT Inference Test ---" << std::endl;
@@ -68,7 +69,7 @@ int main(int argc, char** argv) {
 
         if (!has_validation) {
             std::cout << "No validation data provided. Using random input." << std::endl;
-            input = Tensor<float>({1, 197, 768});
+            input = Tensor<float>({1, 197, (size_t)dim});
             input.random(0, 1);
         }
 
