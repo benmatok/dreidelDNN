@@ -273,3 +273,38 @@ Dense Compute Time (Full Dot): 0.0627827 s
 Speedup: 3.17666x
 PASS: Speedup observed.
 ```
+# Spectral ViT Recasting Status
+
+This section documents the current state of porting Vision Transformers to the `dreidelDNN` Spectral Engine.
+
+### 1. Recasting Pipeline
+The pipeline successfully converts a pretrained PyTorch ViT (e.g., `vit-base-patch16-224`) into a `SpectralViT` model using `DeepSpectralLinear` layers.
+
+*   **Tool:** `tools/recast_pytorch.py`
+*   **Method:**
+    *   Loads HuggingFace model.
+    *   Exports initialization parameters (random scales/permutations) for `DeepSpectralLinear` layers (K=4).
+    *   Captures layer-wise inputs and outputs using hooks to generate "Teacher" distillation data.
+    *   Generates synthetic training data (noise + geometric shapes) to excite the network structure.
+
+### 2. Training (Distillation)
+A C++ training loop `examples/train_spectral_vit.cpp` implements **Block-Wise Distillation** to train the student Spectral model against the captured Teacher activations.
+
+*   **Optimizer:** `DiagonalNewton` (2nd order) handles the varying scales of spectral domains.
+*   **Strategy:** Sequential Block Training (Layer 0 -> Layer 1 ... -> Pooler) to minimize memory footprint.
+*   **Status:** The pipeline runs end-to-end. Training minimizes loss on synthetic data, validating the gradient flow and architecture.
+
+### 3. Limitations & Future Work
+While the infrastructure is functional, the following limitations exist for production deployment:
+
+*   **Memory Usage:** Even with block-wise training, the activation cache for `DeepSpectralLinear` (Depth=4) is significant. Batch sizes are limited on standard CPUs.
+*   **Simplified Backward Pass:** The current C++ implementation uses an approximate backward pass for the ViT structure (skipping ReLU derivatives and internal Softmax gradients) to enable training without a full Autograd graph.
+*   **Pooler Mismatch:** The pooler training requires careful dimension handling (1024 spectral output vs 768 teacher target), currently managed by padding/slicing in the backward loop.
+*   **Next Steps:**
+    1.  Implement **Activation Checkpointing** to reduce memory.
+    2.  Port the full computation graph to support exact Automatic Differentiation.
+    3.  Tune learning rates and initialization for convergence on real ImageNet data.
+
+### Sandbox Notes
+*   **Workloads:** Large-scale training (ImageNet) requires more RAM/Compute than available in the standard sandbox.
+*   **Environment:** For full training, export the code and run on a dedicated high-memory machine or cluster.
