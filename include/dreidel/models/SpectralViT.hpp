@@ -220,12 +220,14 @@ public:
         Tensor<T, B> grad_skip_2 = grad;
 
         auto out_layer = get_layer(prefix + "output.dense");
-        Tensor<T, B> grad_mlp_hidden = backward_linear(out_layer, grad_mlp_out, prefix + "output.dense");
+        // Output dense maps 4096->4096 (internal), sliced to 768. We pad 768->4096.
+        Tensor<T, B> grad_mlp_hidden = backward_linear(out_layer, grad_mlp_out, prefix + "output.dense", 4096);
 
         // Skip ReLU backward (identity)
 
         auto inter_layer = get_layer(prefix + "intermediate.dense");
-        Tensor<T, B> grad_inter = backward_linear(inter_layer, grad_mlp_hidden, prefix + "intermediate.dense");
+        // Intermediate maps 768->4096. Grad input is 4096. No pad needed.
+        Tensor<T, B> grad_inter = backward_linear(inter_layer, grad_mlp_hidden, prefix + "intermediate.dense", 4096);
 
         grad = grad_skip_2 + grad_inter;
 
@@ -233,25 +235,42 @@ public:
         Tensor<T, B> grad_skip_1 = grad;
 
         auto attn_out_layer = get_layer(prefix + "attention.output.dense");
-        Tensor<T, B> grad_q = backward_linear(attn_out_layer, grad_attn_out, prefix + "attention.output.dense");
+        // Attn Out maps 1024->1024, sliced to 768. Pad 768->1024.
+        Tensor<T, B> grad_q = backward_linear(attn_out_layer, grad_attn_out, prefix + "attention.output.dense", 1024);
 
         auto q_layer = get_layer(prefix + "attention.attention.query");
-        Tensor<T, B> grad_x_q = backward_linear(q_layer, grad_q, prefix + "attention.attention.query");
+        // Q maps 768->1024. Grad input is 1024.
+        Tensor<T, B> grad_x_q = backward_linear(q_layer, grad_q, prefix + "attention.attention.query", 1024);
 
         Tensor<T, B> dummy_grad(grad_q.shape());
         dummy_grad.fill(0);
         auto k_layer = get_layer(prefix + "attention.attention.key");
-        backward_linear(k_layer, dummy_grad, prefix + "attention.attention.key");
+        backward_linear(k_layer, dummy_grad, prefix + "attention.attention.key", 1024);
 
         auto v_layer = get_layer(prefix + "attention.attention.value");
-        backward_linear(v_layer, dummy_grad, prefix + "attention.attention.value");
+        backward_linear(v_layer, dummy_grad, prefix + "attention.attention.value", 1024);
 
         grad = grad_skip_1 + grad_x_q;
     }
 
     void backward_pooler(const Tensor<T, B>& grad_output) {
         auto pooler = get_layer("pooler.dense");
-        backward_linear(pooler, grad_output, "pooler.dense");
+        // Pooler maps 768->1024. Output is 1024?
+        // Wait, Pooler is Dense 768->768. Recast to 1024->1024.
+        // Forward pooler result is 1024.
+        // But target (teacher) is 768.
+        // In train loop we compute loss on 768? No, training loop slices pooler output to 768 implicitly?
+        // Let's check train loop.
+        // "grad_ptr[k] = 2.0f * diff / total;"
+        // The grad vector is initialized with size of OUTPUT.
+        // Forward pooler: `x = forward_linear(pooler, input, ...)` -> 1024 (no slicing in forward_pooler).
+        // So output is 1024.
+        // But target is 768.
+        // In train loop: `for(k=0; k<total; ++k) { diff = out[k] - tgt[k]; }`
+        // If output is 1024 and target is 768, we have access violation!
+        // We need to fix forward_pooler or train loop!
+        // Forward pooler should probably slice.
+        backward_linear(pooler, grad_output, "pooler.dense", 1024);
     }
 
     // Accessors for specific block parameters to optimize one block at a time
@@ -366,7 +385,7 @@ private:
         return out;
     }
 
-    Tensor<T, B> backward_linear(std::shared_ptr<layers::Layer<T, B>> layer, const Tensor<T, B>& grad_output, const std::string& name) {
+    Tensor<T, B> backward_linear(std::shared_ptr<layers::Layer<T, B>> layer, const Tensor<T, B>& grad_output, const std::string& name, size_t expected_dim = 0) {
         Tensor<T, B> grad = grad_output;
 
         // Backward bias if exists
@@ -375,39 +394,9 @@ private:
             grad = layers_[bias_name]->backward(grad);
         }
 
-        // Backward layer
-        // We might need to handle shape mismatch if forward sliced?
-        // DeepSpectralLinear handles slice in backward?
-        // It slices the result. It expects input grad to match output shape.
-        // If forward output was sliced (externally in SpectralViT), the grad is sliced.
-        // But DeepSpectralLinear output (internal) was full size.
-        // So we need to pad grad to full size before passing to DeepSpectralLinear.backward?
-        // DeepSpectralLinear::backward takes `grad_output`.
-        // If we padded in forward, we slice in backward.
-        // But if we sliced in forward (outside layer), we must pad in backward (outside layer).
-
-        // Let's check dimensions.
-        // We don't have access to layer dim easily here unless we cast.
-        // We will assume no slicing for now or that sizes match.
-        // (DeepSpectralLinear throws if input > dim, pads if input < dim).
-        // It doesn't slice output.
-        // The slicing happened in SpectralViT::forward:
-        // if (attn_output.shape().back() > x.shape().back()) ... slice ...
-
-        // So if we sliced, we must pad grad.
-        // How to know? We don't have the original shape.
-        // But we know standard ViT dims (768).
-        // And we know Spectral dims (1024).
-        // If grad is 768 and layer is 1024, pad.
-
-        if (grad.shape().back() == 768) {
-            // Check if layer is 1024?
-            // Hardcoded check for likely scenario
-            // Ideally we query layer output shape.
-            // But we just pad to 1024 if it looks like a spectral layer context.
-            // Or we try/catch?
-            // Let's pad to 1024 if 768.
-            grad = grad.pad_last_dim(1024);
+        // Pad gradient if needed
+        if (expected_dim > 0 && grad.shape().back() < expected_dim) {
+            grad = grad.pad_last_dim(expected_dim);
         }
 
         return layer->backward(grad);
