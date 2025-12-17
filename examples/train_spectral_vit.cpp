@@ -46,11 +46,22 @@ int main(int argc, char** argv) {
         std::ifstream f(data_path, std::ios::binary);
         if (!f.is_open()) throw std::runtime_error("Cannot open data file");
 
-        uint32_t num_blocks;
-        f.read(reinterpret_cast<char*>(&num_blocks), 4);
+        uint32_t num_blocks_in_data;
+        f.read(reinterpret_cast<char*>(&num_blocks_in_data), 4);
 
-        // Loop over blocks
-        for (int i = 0; i < 12; ++i) {
+        // num_blocks_in_data should include Encoder blocks + 1 Pooler block
+        int num_encoder_blocks = num_blocks_in_data - 1;
+
+        std::cout << "Data file contains " << num_blocks_in_data << " blocks (Expected " << num_encoder_blocks << " encoder + 1 pooler)." << std::endl;
+
+        if (num_encoder_blocks != model.get_num_blocks()) {
+             std::cerr << "Warning: Model has " << model.get_num_blocks() << " blocks but data has " << num_encoder_blocks << ". Using minimum." << std::endl;
+        }
+
+        int loop_count = std::min(num_encoder_blocks, model.get_num_blocks());
+
+        // Loop over encoder blocks
+        for (int i = 0; i < loop_count; ++i) {
             Tensor<float> inputs;
             Tensor<float> targets;
 

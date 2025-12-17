@@ -19,7 +19,7 @@ namespace models {
 template <typename T, BackendType B = BackendType::CPU>
 class SpectralViT {
 public:
-    SpectralViT() {}
+    SpectralViT() : num_blocks_(0) {}
 
     void load_weights(const std::string& filepath) {
         std::ifstream f(filepath, std::ios::binary);
@@ -66,72 +66,71 @@ public:
 
             if (type == "LinearWHT") {
                 auto layer = std::make_shared<layers::LinearWHT<T, B>>(dim);
-
-                // Read Scale
                 read_tensor(f, layer->parameters()[0]);
-
                 layers_[name] = layer;
 
-                // Check Bias
                 bool has_bias;
                 f.read(reinterpret_cast<char*>(&has_bias), 1);
-
                 if (has_bias) {
-                    // Create Bias layer
                     auto bias_layer = std::make_shared<layers::Bias<T, B>>(dim);
                     read_tensor(f, bias_layer->parameters()[0]);
-
                     layers_[name + ".bias"] = bias_layer;
                 }
             } else if (type == "DeepSpectralLinear") {
-                // Read Depth
                 uint32_t depth;
                 f.read(reinterpret_cast<char*>(&depth), 4);
 
                 auto layer = std::make_shared<layers::DeepSpectralLinear<T, B>>(dim, depth);
-                auto params = layer->parameters(); // scales
+                auto params = layer->parameters();
 
                 for (size_t k = 0; k < depth; ++k) {
-                    // Read Scale k
                     read_tensor(f, params[k]);
-
-                    // Read Permutation k
                     uint32_t perm_size;
                     f.read(reinterpret_cast<char*>(&perm_size), 4);
+                    if (perm_size != dim) throw std::runtime_error("Permutation size mismatch.");
 
-                    if (perm_size != dim) {
-                        throw std::runtime_error("Permutation size mismatch in file.");
-                    }
-
-                    std::vector<uint64_t> p_data(perm_size); // Using uint64 for size_t
+                    std::vector<uint64_t> p_data(perm_size);
                     f.read(reinterpret_cast<char*>(p_data.data()), perm_size * 8);
 
                     std::vector<size_t> p(perm_size);
                     for(size_t j=0; j<perm_size; ++j) p[j] = static_cast<size_t>(p_data[j]);
-
                     layer->set_permutation(k, p);
                 }
-
                 layers_[name] = layer;
 
-                // Check Bias (DeepSpectralLinear doesn't have built-in bias, but recasting might add separate Bias layer)
                 bool has_bias;
                 f.read(reinterpret_cast<char*>(&has_bias), 1);
-
                 if (has_bias) {
-                    // Create Bias layer
                     auto bias_layer = std::make_shared<layers::Bias<T, B>>(dim);
                     read_tensor(f, bias_layer->parameters()[0]);
-
                     layers_[name + ".bias"] = bias_layer;
                 }
             } else {
                 std::cerr << "Unknown layer type: " << type << ". Skipping." << std::endl;
-                // Skip logic would be hard without knowing size.
                 throw std::runtime_error("Unknown layer type encountered.");
             }
         }
+
+        // Detect num blocks
+        int max_layer = -1;
+        for (auto const& [key, val] : layers_) {
+            if (key.find("encoder.layer.") == 0) {
+                 size_t first_dot = 14;
+                 size_t second_dot = key.find('.', first_dot);
+                 if (second_dot != std::string::npos) {
+                     std::string num_str = key.substr(first_dot, second_dot - first_dot);
+                     try {
+                         int num = std::stoi(num_str);
+                         if (num > max_layer) max_layer = num;
+                     } catch(...) {}
+                 }
+            }
+        }
+        num_blocks_ = max_layer + 1;
+        std::cout << "Detected " << num_blocks_ << " encoder blocks." << std::endl;
     }
+
+    int get_num_blocks() const { return num_blocks_; }
 
     std::vector<Tensor<T, B>*> parameters() {
         std::vector<Tensor<T, B>*> params;
@@ -162,7 +161,7 @@ public:
 
     Tensor<T, B> forward(const Tensor<T, B>& input) {
         Tensor<T, B> x = input;
-        for (int i = 0; i < 12; ++i) {
+        for (int i = 0; i < num_blocks_; ++i) {
             x = forward_block(i, x);
         }
         x = forward_pooler(x);
@@ -208,77 +207,92 @@ public:
     }
 
     Tensor<T, B> forward_pooler(const Tensor<T, B>& input) {
+        // Input is (Batch, Seq, Dim)
+        // We need to extract the CLS token (index 0 along Seq dim)
+        // Result should be (Batch, Dim)
+
+        size_t Batch = input.shape()[0];
+        size_t Seq = input.shape()[1];
+        size_t Dim = input.shape()[2];
+
+        Tensor<T, B> cls_token({Batch, Dim});
+
+        const T* in_data = input.data();
+        T* cls_data = cls_token.data();
+
+        for (size_t b = 0; b < Batch; ++b) {
+            // Copy Dim elements from start of each sequence
+            const T* src = in_data + b * Seq * Dim;
+            T* dst = cls_data + b * Dim;
+            std::copy(src, src + Dim, dst);
+        }
+
         auto pooler = get_layer("pooler.dense");
-        return forward_linear(pooler, input, "pooler.dense");
+        Tensor<T, B> out = forward_linear(pooler, cls_token, "pooler.dense");
+        // Slice if needed to match input dim (which corresponds to embedding dim)
+        if (out.shape().back() > Dim) {
+            out = out.slice_last_dim(Dim);
+        }
+        return out;
     }
 
     void backward_block(int i, const Tensor<T, B>& grad_output) {
         Tensor<T, B> grad = grad_output;
         std::string prefix = "encoder.layer." + std::to_string(i) + ".";
 
+        // We need to know the spectral dimensions to pad gradients correctly.
+        // We can inspect the layers to find their spectral dimensions.
+        auto out_layer = get_layer(prefix + "output.dense");
+        size_t spectral_dim_out = out_layer->parameters()[0]->size(); // scale is size dim
+
+        auto inter_layer = get_layer(prefix + "intermediate.dense");
+        size_t spectral_dim_inter = inter_layer->parameters()[0]->size();
+
+        auto attn_out_layer = get_layer(prefix + "attention.output.dense");
+        size_t spectral_dim_attn = attn_out_layer->parameters()[0]->size();
+
+        auto q_layer = get_layer(prefix + "attention.attention.query");
+        size_t spectral_dim_q = q_layer->parameters()[0]->size();
+
         Tensor<T, B> grad_mlp_out = grad;
         Tensor<T, B> grad_skip_2 = grad;
 
-        auto out_layer = get_layer(prefix + "output.dense");
-        // Output dense maps 4096->4096 (internal), sliced to 768. We pad 768->4096.
-        Tensor<T, B> grad_mlp_hidden = backward_linear(out_layer, grad_mlp_out, prefix + "output.dense", 4096);
+        Tensor<T, B> grad_mlp_hidden = backward_linear(out_layer, grad_mlp_out, prefix + "output.dense", spectral_dim_out);
 
         // Skip ReLU backward (identity)
 
-        auto inter_layer = get_layer(prefix + "intermediate.dense");
-        // Intermediate maps 768->4096. Grad input is 4096. No pad needed.
-        Tensor<T, B> grad_inter = backward_linear(inter_layer, grad_mlp_hidden, prefix + "intermediate.dense", 4096);
+        Tensor<T, B> grad_inter = backward_linear(inter_layer, grad_mlp_hidden, prefix + "intermediate.dense", spectral_dim_inter);
 
         grad = grad_skip_2 + grad_inter;
 
         Tensor<T, B> grad_attn_out = grad;
         Tensor<T, B> grad_skip_1 = grad;
 
-        auto attn_out_layer = get_layer(prefix + "attention.output.dense");
-        // Attn Out maps 1024->1024, sliced to 768. Pad 768->1024.
-        Tensor<T, B> grad_q = backward_linear(attn_out_layer, grad_attn_out, prefix + "attention.output.dense", 1024);
+        Tensor<T, B> grad_q = backward_linear(attn_out_layer, grad_attn_out, prefix + "attention.output.dense", spectral_dim_attn);
 
-        auto q_layer = get_layer(prefix + "attention.attention.query");
-        // Q maps 768->1024. Grad input is 1024.
-        Tensor<T, B> grad_x_q = backward_linear(q_layer, grad_q, prefix + "attention.attention.query", 1024);
+        Tensor<T, B> grad_x_q = backward_linear(q_layer, grad_q, prefix + "attention.attention.query", spectral_dim_q);
 
         Tensor<T, B> dummy_grad(grad_q.shape());
         dummy_grad.fill(0);
         auto k_layer = get_layer(prefix + "attention.attention.key");
-        backward_linear(k_layer, dummy_grad, prefix + "attention.attention.key", 1024);
+        backward_linear(k_layer, dummy_grad, prefix + "attention.attention.key", spectral_dim_q);
 
         auto v_layer = get_layer(prefix + "attention.attention.value");
-        backward_linear(v_layer, dummy_grad, prefix + "attention.attention.value", 1024);
+        backward_linear(v_layer, dummy_grad, prefix + "attention.attention.value", spectral_dim_q);
 
         grad = grad_skip_1 + grad_x_q;
     }
 
     void backward_pooler(const Tensor<T, B>& grad_output) {
         auto pooler = get_layer("pooler.dense");
-        // Pooler maps 768->1024. Output is 1024?
-        // Wait, Pooler is Dense 768->768. Recast to 1024->1024.
-        // Forward pooler result is 1024.
-        // But target (teacher) is 768.
-        // In train loop we compute loss on 768? No, training loop slices pooler output to 768 implicitly?
-        // Let's check train loop.
-        // "grad_ptr[k] = 2.0f * diff / total;"
-        // The grad vector is initialized with size of OUTPUT.
-        // Forward pooler: `x = forward_linear(pooler, input, ...)` -> 1024 (no slicing in forward_pooler).
-        // So output is 1024.
-        // But target is 768.
-        // In train loop: `for(k=0; k<total; ++k) { diff = out[k] - tgt[k]; }`
-        // If output is 1024 and target is 768, we have access violation!
-        // We need to fix forward_pooler or train loop!
-        // Forward pooler should probably slice.
-        backward_linear(pooler, grad_output, "pooler.dense", 1024);
+        size_t spectral_dim = pooler->parameters()[0]->size();
+        backward_linear(pooler, grad_output, "pooler.dense", spectral_dim);
     }
 
-    // Accessors for specific block parameters to optimize one block at a time
     std::vector<Tensor<T, B>*> parameters_block(int i) {
         std::vector<Tensor<T, B>*> params;
         std::string prefix = "encoder.layer." + std::to_string(i) + ".";
 
-        // Collect params for this block's layers
         std::vector<std::string> sublayers = {
             "attention.attention.query", "attention.attention.key", "attention.attention.value",
             "attention.output.dense", "intermediate.dense", "output.dense"
@@ -289,7 +303,6 @@ public:
             auto p = get_layer(name)->parameters();
             params.insert(params.end(), p.begin(), p.end());
 
-            // Bias
              if (layers_.find(name + ".bias") != layers_.end()) {
                 auto pb = layers_[name + ".bias"]->parameters();
                 params.insert(params.end(), pb.begin(), pb.end());
@@ -365,6 +378,7 @@ public:
 
 private:
     std::map<std::string, std::shared_ptr<layers::Layer<T, B>>> layers_;
+    int num_blocks_;
 
     std::shared_ptr<layers::Layer<T, B>> get_layer(const std::string& name) {
         if (layers_.find(name) == layers_.end()) {
@@ -413,29 +427,15 @@ private:
             shape[i] = d;
         }
 
-        // Resize tensor if needed (though we allocated it with Dim)
-        // LinearWHT parameter is size dim. Shape should be (1, dim).
-        // Recast tool saves (dim). (rank 1).
-        // Tensor random init makes it (1, dim) in LinearWHT constructor?
-        // No, LinearWHT constructor: scale_({1, dim}).
-        // If file has (dim), it's rank 1.
-        // We should reshape to match file or reshape file to match tensor.
-        // Let's read data into a buffer and copy to tensor.
-
         size_t num_elements = 1;
         for (auto s : shape) num_elements *= s;
 
         std::vector<float> data(num_elements);
         f.read(reinterpret_cast<char*>(data.data()), num_elements * sizeof(float));
 
-        // Copy to Tensor (assuming T=float)
         T* t_data = t->data();
         if (t->size() != num_elements) {
-             // Mismatch? LinearWHT scale is (1, Dim). File might say (Dim).
-             // Size is same.
-             if (t->size() != num_elements) {
-                 throw std::runtime_error("Tensor size mismatch loading weights.");
-             }
+             throw std::runtime_error("Tensor size mismatch loading weights.");
         }
 
         for(size_t i=0; i<num_elements; ++i) {
