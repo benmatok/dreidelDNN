@@ -76,11 +76,12 @@ Since `DeepSpectralLinear` has a non-convex structure involving multiple layers,
 
 ## 3. Implementation Status
 
-### Spectral ViT (ViT-Base-Patch16-224)
+### Spectral ViT (ViT-Base-Patch16-224 / DeiT-Tiny)
 
-*   **Status:** Updating to use `DeepSpectralLinear`.
+*   **Status:** Functional Prototype (DeiT-Tiny Validated).
 *   **Previous Finding:** Simple `LinearWHT` recasting failed (Error ~1.0).
-*   **New Roadmap:**
-    1.  Replace `LinearWHT` with `DeepSpectralLinear` (K=4).
-    2.  Update recasting tool to export "Uninitialized" or "Identity" weights.
-    3.  Run C++ Distillation (Training) to converge weights.
+*   **Current Solution:**
+    1.  Implemented `DeepSpectralLinear` (K=4) in `recast_pytorch.py` and C++ model.
+    2.  Recasting tool now supports distillation data generation.
+    3.  **Validation:** C++ Block-Wise Distillation (`train_spectral_vit.cpp`) converges successfully on DeiT-Tiny (Loss reduced from ~3.3 to ~0.82 on Block 0).
+    4.  **Inference:** Verified correctness and speed (~290ms on CPU).

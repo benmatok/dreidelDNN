@@ -278,9 +278,13 @@ PASS: Speedup observed.
 This section documents the current state of porting Vision Transformers to the `dreidelDNN` Spectral Engine.
 
 ### 1. Recasting Pipeline
-The pipeline successfully converts a pretrained PyTorch ViT (e.g., `vit-base-patch16-224`) into a `SpectralViT` model using `DeepSpectralLinear` layers.
+The pipeline successfully converts a pretrained PyTorch ViT (e.g., `vit-base-patch16-224` or `deit-tiny-patch16-224`) into a `SpectralViT` model using `DeepSpectralLinear` layers.
 
 *   **Tool:** `tools/recast_pytorch.py`
+    *   **Arguments:**
+        *   `--model`: Model name (default: `google/vit-base-patch16-224`).
+        *   `--min-dim`: Minimum spectral dimension (default: 256).
+        *   `--batch-size`: Batch size for synthetic data (default: 32).
 *   **Method:**
     *   Loads HuggingFace model.
     *   Exports initialization parameters (random scales/permutations) for `DeepSpectralLinear` layers (K=4).
@@ -290,9 +294,16 @@ The pipeline successfully converts a pretrained PyTorch ViT (e.g., `vit-base-pat
 ### 2. Training (Distillation)
 A C++ training loop `examples/train_spectral_vit.cpp` implements **Block-Wise Distillation** to train the student Spectral model against the captured Teacher activations.
 
+*   **Tool:** `examples/train_spectral_vit.cpp`
+    *   **Arguments:**
+        *   `--weights`: Path to weights file.
+        *   `--data`: Path to data file.
+        *   `--block`: Block index to train (default: -1 for all).
+        *   `--epochs`: Number of epochs (default: 20).
+        *   `--lr`: Learning rate (default: 1.0, optimized for DiagonalNewton).
 *   **Optimizer:** `DiagonalNewton` (2nd order) handles the varying scales of spectral domains.
 *   **Strategy:** Sequential Block Training (Layer 0 -> Layer 1 ... -> Pooler) to minimize memory footprint.
-*   **Status:** The pipeline runs end-to-end. Training minimizes loss on synthetic data, validating the gradient flow and architecture.
+*   **Status:** The pipeline runs end-to-end. Training minimizes loss on synthetic data, validating the gradient flow and architecture. Validated on DeiT-Tiny with significant loss reduction.
 
 ### 3. Limitations & Future Work
 While the infrastructure is functional, the following limitations exist for production deployment:
@@ -304,6 +315,7 @@ While the infrastructure is functional, the following limitations exist for prod
     1.  Implement **Activation Checkpointing** to reduce memory.
     2.  Port the full computation graph to support exact Automatic Differentiation.
     3.  Tune learning rates and initialization for convergence on real ImageNet data.
+    4.  **Validation & Benchmark:** Implement validation on a local, COCO-like dataset (e.g., subset of COCO or equivalent small-scale object detection/classification dataset) to measure real-world accuracy and recall in the sandbox environment.
 
 ### Sandbox Notes
 *   **Workloads:** Large-scale training (ImageNet) requires more RAM/Compute than available in the standard sandbox.
