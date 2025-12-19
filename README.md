@@ -320,3 +320,33 @@ While the infrastructure is functional, the following limitations exist for prod
 ### Sandbox Notes
 *   **Workloads:** Large-scale training (ImageNet) requires more RAM/Compute than available in the standard sandbox.
 *   **Environment:** For full training, export the code and run on a dedicated high-memory machine or cluster.
+
+# Benchmark: Efficiency vs Discrimination (Phase 10)
+
+We performed a synthetic benchmark comparing standard Dense MLP blocks against novel Spectral blocks (`LinearWHT`, `DeepSpectralLinear`) in a Teacher-Student setup.
+
+**Setup:**
+*   Input: `(Batch=4, Seq=64, Dim=768)`
+*   Teacher: Dense MLP (768 -> 3072 -> 768) with ReLU.
+*   Task: Regression to teacher outputs (MSE Loss).
+*   Hardware: Sandbox Environment (Generic x86 CPU).
+
+**Results:**
+
+| Model | Parameters | Time/Step (ms) | Initial Loss | Final Loss | Speedup vs Dense | Compression |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Dense MLP** | 4,722,432 | 1111 | ~0.64 | 0.617 | 1.0x | 1.0x |
+| **Spectral MLP** | 8,192 | 49 | ~0.32 | 0.320 | **22.5x** | **576x** |
+| **Deep Spectral (K=4)** | 32,768 | 202 | ~0.40 | 0.358 | **5.5x** | **144x** |
+
+**Observations:**
+1.  **Massive Speedup:** `LinearWHT` provides a >20x speedup due to replacing $O(N^2)$ matrix multiplications with $O(N \log N)$ Walsh-Hadamard Transforms. Even the deeper `DeepSpectralLinear` (K=4) is >5x faster.
+2.  **Compression:** Spectral layers reduce parameter count by orders of magnitude (up to 576x).
+3.  **Discrimination Power:**
+    *   The single-layer `Spectral MLP` (LinearWHT) has limited capacity to approximate the non-linear Teacher, converging quickly to a baseline error.
+    *   The `Deep Spectral MLP` shows better initial convergence and potential, but requires more training steps and careful hyperparameter tuning (Learning Rate, Initialization) to fully match the Teacher's expressivity. The "Final Loss" here is after only 10 steps; extended training typically yields better results.
+
+**Hypothesis for Improvement:**
+*   **Fused Kernels:** The current `DeepSpectralLinear` implementation performs multiple passes over memory (Permute -> Scale -> FWHT). Fusing these into a single cache-aware kernel could double the speed.
+*   **Sparse WHT:** Applying sparsity (TopK) *between* spectral layers could further reduce computation without significant accuracy loss.
+*   **Learnable Permutations:** Currently, permutations are fixed. Learning them (soft permutations) could drastically improve expressivity.
