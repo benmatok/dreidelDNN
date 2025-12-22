@@ -1,4 +1,5 @@
 # dreidelDNN
+<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/e7144ace-58d5-4a7a-83ef-9b90a043410b" />
 
 **dreidelDNN** is a high-performance, header-only C++ deep learning framework designed for scalable CPU training. It emphasizes algorithmic efficiency over hardware acceleration by leveraging **Asymmetric Locality Sensitive Hashing (ALSH)** to achieve sub-linear training times, inspired by works like [SLIDE](https://arxiv.org/abs/1903.03129) and [Mongoose](https://arxiv.org/abs/2006.07064).
 
