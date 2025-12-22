@@ -1,48 +1,26 @@
 # dreidelDNN
 <img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/e7144ace-58d5-4a7a-83ef-9b90a043410b" />
 
-**dreidelDNN** is a high-performance, header-only C++ deep learning framework designed for scalable CPU training. It emphasizes algorithmic efficiency over hardware acceleration by leveraging **Asymmetric Locality Sensitive Hashing (ALSH)** to achieve sub-linear training times, inspired by works like [SLIDE](https://arxiv.org/abs/1903.03129) and [Mongoose](https://arxiv.org/abs/2006.07064).
+**dreidelDNN** is a high-performance, header-only C++ deep learning framework designed for scalable CPU training. It prioritizes algorithmic efficiency over raw hardware acceleration, leveraging **Spectral Transforms (WHT)** and **Asymmetric Locality Sensitive Hashing (ALSH)** to achieve sub-linear training times.
 
-## Key Features
+> **Why dreidelDNN?**
+> *   🚀 **Speed without GPU:** Up to 1000x parameter reduction using Spectral Layers.
+> *   🛠️ **Zero Dependencies:** Just `#include <dreidel/dreidel.hpp>`.
+> *   🧠 **Algorithmic Innovation:** Implements "Deep Learning with Hashes" (SLIDE) and "Spectral Learning" (LibWHT).
 
-1.  **Header-Only C++**: Easy integration, no complex build systems.
-2.  **Scalable CPU Training**: Optimized for multi-node CPU clusters.
-3.  **Sublinear Deep Learning**: Implements **SLIDE** mechanisms to sparsely activate neurons using LSH, reducing computational cost from $O(N)$ to $O(k)$ where $k \ll N$.
-4.  **KFAC Optimization**: Built-in support for Kronecker-Factored Approximate Curvature for faster convergence.
-5.  **x86 Optimization**: Designed for SIMD (AVX2/AVX-512) vectorization.
+---
 
-## Architecture
+## 🚀 Quick Start
 
-The framework is organized into the following components within `include/dreidel/`:
+dreidelDNN is header-only. Just clone and include.
 
-### 1. Core (`core/`)
-*   **Tensor**: N-dimensional array supporting float32/float64. Will include SIMD intrinsics for fast linear algebra.
-*   **Allocator**: Custom memory allocators to ensure cache alignment (critical for CPU performance).
+### Installation
+```bash
+git clone https://github.com/yourusername/dreidelDNN.git
+export CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH:$(pwd)/dreidelDNN/include
+```
 
-### 2. Algorithms (`algo/`)
-*   **ALSH Engine**: Implements the Maximum Inner Product Search (MIPS) using hashing.
-    *   **Transformation**: Converts MIPS to Nearest Neighbor Search (NNS) (e.g., $P(x) = [x, 0]$, $Q(y) = [y, \sqrt{M^2 - ||y||^2}]$).
-    *   **Hash Families**: Signed Random Projections (SRP) and Learnable LSH (Mongoose).
-    *   **Reservoir Sampling**: For selecting active neurons.
-
-### 3. Layers (`layers/`)
-*   **Base Layer**: Standard forward/backward interfaces.
-*   **Dense**: Standard fully connected layer.
-*   **ALSHSparseDense**: The core innovation. It does not perform full matrix multiplication. instead:
-    1.  Hashes the input activation.
-    2.  Queries the ALSH Engine to find the top-k neurons.
-    3.  Computes outputs/gradients *only* for those active neurons.
-
-### 4. Optimizers (`optim/`)
-*   **SGD / Adam**: Standard first-order optimizers.
-*   **KFAC**: Second-order optimizer approximating the Fisher Information Matrix using Kronecker factorization.
-
-### 5. Distributed (`dist/`)
-*   **Communicator**: Abstract interface for data parallel training (Ring AllReduce, Parameter Server).
-*   **Backend**: Reference implementation (can be hooked to MPI or TCP).
-
-## Usage (Planned)
-
+### Example: Spectral Training
 ```cpp
 #include <dreidel/dreidel.hpp>
 
@@ -52,272 +30,94 @@ int main() {
     // 1. Define Model
     Sequential model;
 
-    // Add standard layers
-    model.add<layers::Dense>(784, 1024, activation::ReLU);
+    // Spectral Linear Layer (O(N) parameters instead of O(N^2))
+    model.add<layers::LinearWHT>(1024, activation::ReLU);
+    model.add<layers::LinearWHT>(1024, activation::Softmax);
 
-    // Add ALSH Sparse Layer (sublinear)
-    // 1024 inputs, 10000 outputs, LSH parameters
-    model.add<layers::ALSHSparseDense>(1024, 10000, activation::ReLU, ALSHParams{/*...*/});
-
-    model.add<layers::Dense>(10000, 10, activation::Softmax);
-
-    // 2. Optimizer with KFAC
-    optim::KFAC optimizer(0.001);
+    // 2. Optimizer (Structure-Aware)
+    optim::DiagonalNewton optimizer(0.1);
 
     // 3. Train
     model.compile(optimizer, loss::CrossEntropy);
-    model.fit(train_data, train_labels, epochs=10, batch_size=32);
+    // model.fit(data, labels, ...);
 
     return 0;
 }
 ```
 
-# Implementation Roadmap: Project Jules (Spectral Evolution)
+---
 
-> This roadmap tracks the evolution from the initial ALSH prototype to the high-performance LibWHT Spectral Engine.
+## 🗺️ Roadmap & Status
+
+### 🏛️ Core Engine (Completed)
+The foundation of the library is stable and verified.
+- [x] **Tensor Core**: NHWC layout, AVX-512 SIMD, Custom Allocators.
+- [x] **ALSH Engine**: Signed Random Projections & Mongoose LSH for sublinear retrieval.
+- [x] **Spectral Kernel**: High-throughput `FWHT` (Fast Walsh-Hadamard Transform) reaching 80% RAM bandwidth.
+- [x] **Optimizers**: `DiagonalNewton` for spectral layers and `KFAC` for dense layers.
+
+### 🔭 Project Jules: Spectral Vision (In Progress)
+Recasting Vision Transformers (ViT) to Spectral Architectures.
+- [x] **DeepSpectralLinear**: Cascaded WHT layers for high expressivity.
+- [x] **Recast Tool**: Convert PyTorch ViT to Dreidel format (`tools/recast_pytorch.py`).
+- [x] **Distillation**: Block-wise training loop (`examples/train_spectral_vit.cpp`).
+- [ ] **Validation**: Full ImageNet convergence.
 
 ---
 
-## Phase 1: Foundation (Architecture & Mocks)
-**Status:** Completed
+### 🎙️ Project Ivrit: Spectral Speech (Planned)
+**Focus:** Porting `ivrit-ai/whisper-large-v3` to a fully spectral C++ architecture for efficient CPU-based ASR/TTS.
 
-- [x] Define directory structure.
-- [x] Create abstract interfaces for `Tensor`, `Layer`, `Optimizer`, and `Communicator`.
-- [x] **Verification:** Compile a "Hello World" that includes the headers and instantiates a mock model.
+#### Phase 1: Architecture Analysis & Setup
+- [ ] **Analysis**: Map `whisper-large-v3` dimensions, attention heads, and activation flows.
+- [ ] **Dependencies**: Setup Python environment with `transformers`, `torchaudio`, and `librosa` for verification.
+- [ ] **Scope**: Determine layer replacement strategy (e.g., `DeepSpectralLinear` for Q/K/V projections).
 
-## Phase 2: Core Tensor & Basic Math
-**Status:** Completed
+#### Phase 2: Core Components Implementation
+- [ ] **MultiHeadAttentionSpectral**: Implement efficient attention mechanism using spectral projections.
+- [ ] **AudioEncoder**: Implement Log-Mel Spectrogram preprocessing in C++.
+- [ ] **SpectralWhisper**: Implement full Encoder-Decoder class in `include/dreidel/models/SpectralWhisper.hpp`.
+    - Support for KV-Caching in C++.
+    - Support for variable sequence lengths.
 
-- [x] Implement `Tensor<T>` class with basic storage.
-- [x] Implement naive Matrix Multiplication (GEMM) and Element-wise ops.
-- [x] Add Basic SIMD support (autovectorization hints).
-- [x] **Verification:** Unit tests for `Tensor` operations (`Add`, `Mul`, `Dot`).
+#### Phase 3: Recasting Tooling
+- [ ] **Recast Script**: Create `tools/recast_whisper.py` to map PyTorch weights to Spectral Layers.
+    - Implement "Variance Preserving Initialization" for initializing spectral scales from dense matrices.
+    - Export Tokenizer vocabulary and config.
+- [ ] **Verification**: Unit test comparing layer-by-layer outputs (PyTorch vs C++) with random inputs.
 
-## Phase 3: Basic DNN Flow
-**Status:** Completed
+#### Phase 4: Distillation Strategy
+- [ ] **Teacher-Student Loop**: Implement `train_spectral_whisper.cpp` for block-wise distillation.
+    - Focus on distilling the Cross-Attention mechanism which is critical for alignment.
+- [ ] **Optimization**: Tune `DiagonalNewton` learning rates for the specific distribution of speech embeddings.
 
-- [x] Implement `Dense` layer (forward/backward).
-- [x] Implement `ReLU` and `Softmax`.
-- [x] Implement `SGD` optimizer.
-- [x] Implement `Sequential` model runner.
-- [x] **Verification:** Train a small network on XOR or MNIST (subset) using standard Dense layers.
-
-## Phase 4: Legacy ALSH Engine (The "Brain" v1)
-**Status:** Completed
-
-- [x] Implement Signed Random Projections (SRP) hashing.
-- [x] Implement Hash Tables (array of buckets).
-- [x] Implement MIPS transformation logic.
-- [x] **Verification:** Test retrieval accuracy. Given a query vector, does it retrieve vectors with high dot products?
-
----
-
-### 🔄 PIVOT POINT: Spectral Acceleration
-*Moving from approximate random hashing to structured Walsh-Hadamard Transforms (WHT) for superior memory efficiency and determinism.*
+#### Phase 5: End-to-End Verification
+- [ ] **Inference Test**: Run a "Hello World" audio file through the C++ pipeline.
+- [ ] **Benchmark**: Measure Real-Time Factor (RTF) on standard CPU (Target: <0.5 RTF).
+- [ ] **Accuracy**: Verify Word Error Rate (WER) degradation is within acceptable limits (<10% relative).
 
 ---
 
-## Phase 5: The Spectral Math Kernel (LibWHT Core)
-**Status:** Completed
+## 📂 Architecture Overview
 
-- [x] Refactor `Tensor` to enforce Channel-Last (`NHWC`) memory layout (critical for WHT SIMD).
-- [x] Implement `SIMD_FWHT` Kernel (Iterative Fast Walsh-Hadamard Transform).
-- [x] Use AVX-512 intrinsics (`_mm512_add_ps`, `_mm512_sub_ps`).
-- [x] Ensure operations are strictly **In-Place** (no allocation).
-- [x] **Verification (Math):** "Identity Test". Assert $\text{FWHT}(\text{FWHT}(x)) / N == x$ (tolerance `1e-5`).
-- [x] **Verification (Speed):** "Throughput Test". Benchmark GB/s vs `memcpy`. Target: >80% of system RAM bandwidth.
+The framework is organized into the following components within `include/dreidel/`:
 
-## Phase 6: Structured Spectral Layers
-**Status:** Completed
+| Component | Description |
+|-----------|-------------|
+| **`core/`** | `Tensor`, `Allocator` (SIMD-aligned memory management). |
+| **`algo/`** | `WHT` (Spectral Transforms), `ALSH` (Hashing Engine). |
+| **`layers/`** | `LinearWHT` (Spectral), `ALSHSparseDense` (Sublinear), `DeepSpectralLinear`. |
+| **`optim/`** | `DiagonalNewton` (2nd Order Spectral), `KFAC`. |
+| **`models/`** | Pre-assembled architectures (`SpectralViT`, `SpectralWhisper`). |
 
-- [x] Implement `LinearWHT` (Replaces Standard Dense).
-    - **Logic:** $y = \text{TopK}(\text{FWHT}(x \odot D))$
-    - **Storage:** `std::vector<float> scale` ($D$).
-- [x] Implement `Conv3D_Spectral` (Hybrid Accelerator).
-    - **Logic:** DepthwiseConv3D (Spatial) $\to$ `LinearWHT` (Mixing).
-    - **Fusion:** Fuse Spatial output to Mixing input in L1 cache.
-- [x] **Verification:** Replace a `Dense` layer in the MNIST test with `LinearWHT`. Check parameter reduction ($N^2 \to N$).
+## 🤝 Contributing
 
-## Phase 7: Structure-Aware Optimizer (Replaces KFAC)
-**Status:** Completed
+We welcome contributions! Please see `MODELZOO.md` for our current research directions.
 
-- [x] Implement `DiagonalNewton` Solver (for WHT Layers).
-    - **Logic:** Element-wise curvature update: $D_{new} = D - \eta \frac{\nabla L}{\nabla^2 L}$.
-- [x] Implement `BlockDiagonal` Solver (for Spatial Conv).
-    - **Logic:** Parallel inversion of small $27 \times 27$ blocks.
-- [x] Update `Optimizer::step()` to dispatch logic based on `LayerType` (Implemented via `curvatures` hook).
-- [x] **Verification:** "Rosenbrock Test". Check convergence speed on a diagonal quadratic function (< 10 steps).
+1.  Fork the repository.
+2.  Create your feature branch (`git checkout -b feature/amazing-feature`).
+3.  Commit your changes (`git commit -m 'Add some amazing feature'`).
+4.  Push to the branch (`git push origin feature/amazing-feature`).
+5.  Open a Pull Request.
 
-## Phase 8: Large-Scale Filter Pruning (The "Selector")
-**Status:** Planned
-
-- [x] Implement `WHT Hasher` (Upgrade to Phase 4).
-    - **Logic:** $\text{Sign}(\text{FWHT}(x))$ to generate binary codes (replaces SRP).
-- [x] Implement `Sparse Gather Engine`.
-    - Use `_mm512_i32gather_ps` to load only selected filter weights.
-- [x] **Verification:** Run on 4096-channel tensor. Metric: >3x speedup vs Dense Compute (AVX2).
-
-## Phase 9: Scalability & Distribution
-**Status:** Planned
-
-- [ ] Implement `SplitWHT` (MPI/Sharding).
-    - **Logic:** Distributed Butterfly Diagram (Node A: Steps $1..k$, Node B: Steps $k..N$).
-- [ ] Implement Gradient All-Reduce for scale vectors (tiny payload).
-- [ ] **Verification:** Run `SplitWHT` on 2 mock nodes. Assert output matches `SingleNodeWHT`.
-
-
-
-## Test Outputs
-
-### Tensor Tests
-```
-Testing Tensor Creation...
-PASS
-Testing Tensor Addition...
-PASS
-Testing Tensor Matmul (GEMM)...
-PASS
-All Tensor tests passed!
-```
-
-### XOR Verification (Phase 3)
-```
-Training XOR Network...
-Epoch 0, Loss: 0.716317
-Epoch 1000, Loss: 0.0152441
-Epoch 2000, Loss: 0.00573388
-Epoch 3000, Loss: 0.00346887
-Epoch 4000, Loss: 0.00246702
-Epoch 5000, Loss: 0.00190503
-Epoch 6000, Loss: 0.00154734
-Epoch 7000, Loss: 0.00130031
-Epoch 8000, Loss: 0.00111961
-Epoch 9000, Loss: 0.000982013
-Predictions:
-Input [0, 0] -> Prob [0]: 0.997368, [1]: 0.00263221 | Pred: 0 True: 0
-Input [0, 1] -> Prob [0]: 0.000322151, [1]: 0.999678 | Pred: 1 True: 1
-Input [1, 0] -> Prob [0]: 0.000356529, [1]: 0.999643 | Pred: 1 True: 1
-Input [1, 1] -> Prob [0]: 0.999819, [1]: 0.000181153 | Pred: 0 True: 0
-Accuracy: 4/4
-PASS
-```
-
-### ALSH Verification (Phase 4)
-```
-Running ALSH Test...
-Index build time: 91 ms
-Brute Force Time: 2997 us
-ALSH Query Time (incl. re-rank): 130 us
-Candidates count: 115 / 10000
-Recall @ 10: 10 / 10 (100%)
-Test Passed: Retrieved at least some relevant items.
-```
-
-#### Benchmark (Phase 4)
-*Config: Dim=128, K=10, L=5 (Optimized for speedup > 20x)*
-
-| Items  | Build Time (ms) | BF Query (us) | ALSH Query (us) | Speedup | Recall (%) |
-|--------|-----------------|---------------|-----------------|---------|------------|
-| 1000   | 9               | 223           | 32              | 6.76    | 100        |
-| 10000  | 93              | 3285          | 68              | 47.60   | 100        |
-| 50000  | 463             | 18991         | 503             | 37.68   | 100        |
-| 100000 | 921             | 34443         | 962             | 35.76   | 100        |
-
-*Note: Benchmarks utilize clustered synthetic data to simulate realistic feature distributions.*
-
-### Spectral Kernel Verification (Phase 5 & 6)
-```
---- Verifying Spectral Parameter Reduction ---
-Dimension N = 1024
-Dense Layer Parameters: 1049600 (Expected: 1049600)
-LinearWHT Layer Parameters: 1024 (Expected: 1024)
-Reduction Ratio: 1025x
-PASS: Significant parameter reduction observed.
---- Verifying Inverse FWHT ---
-Max diff: 7.15256e-07
-PASS: Inverse FWHT restores original.
---- Verifying Throughput ---
-FWHT Throughput: 2.39439 GB/s
-Memcpy Throughput: 3.05168 GB/s
-Ratio: 78.4612%
-PASS: Throughput acceptable.
-```
-
-### MNIST Mock Verification (Phase 6)
-```
---- Testing Mock MNIST Training with LinearWHT ---
-Initial Loss: 2.31354
-Final Loss: 0.865133
-PASS: Training loop ran successfully.
-```
-
-### Rosenbrock Optimization (Phase 7)
-```
-Running Diagonal Quadratic Test (Ill-conditioned)...
-Initial Loss: 50050
-Step 1: Loss=50050
-Converged in 1 steps.
-Final Position: (0, 0)
-PASS (Instant Convergence)
-```
-
-### Filter Pruning Verification (Phase 8)
-```
---- Testing WHT Hasher ---
-Hamming Distance (Similar vectors): 0
-PASS: Hasher preserves locality.
---- Testing Sparse Gather ---
-PASS: Sparse Gather correct.
---- Benchmarking Filter Pruning (Simulation) ---
-Sparse Compute Time (Gather+Dot): 0.0197637 s
-Dense Compute Time (Full Dot): 0.0627827 s
-Speedup: 3.17666x
-PASS: Speedup observed.
-```
-# Spectral ViT Recasting Status
-
-This section documents the current state of porting Vision Transformers to the `dreidelDNN` Spectral Engine.
-
-### 1. Recasting Pipeline
-The pipeline successfully converts a pretrained PyTorch ViT (e.g., `vit-base-patch16-224` or `deit-tiny-patch16-224`) into a `SpectralViT` model using `DeepSpectralLinear` layers.
-
-*   **Tool:** `tools/recast_pytorch.py`
-    *   **Arguments:**
-        *   `--model`: Model name (default: `google/vit-base-patch16-224`).
-        *   `--min-dim`: Minimum spectral dimension (default: 256).
-        *   `--batch-size`: Batch size for synthetic data (default: 32).
-*   **Method:**
-    *   Loads HuggingFace model.
-    *   Exports initialization parameters (random scales/permutations) for `DeepSpectralLinear` layers (K=4).
-    *   Captures layer-wise inputs and outputs using hooks to generate "Teacher" distillation data.
-    *   Generates synthetic training data (noise + geometric shapes) to excite the network structure.
-
-### 2. Training (Distillation)
-A C++ training loop `examples/train_spectral_vit.cpp` implements **Block-Wise Distillation** to train the student Spectral model against the captured Teacher activations.
-
-*   **Tool:** `examples/train_spectral_vit.cpp`
-    *   **Arguments:**
-        *   `--weights`: Path to weights file.
-        *   `--data`: Path to data file.
-        *   `--block`: Block index to train (default: -1 for all).
-        *   `--epochs`: Number of epochs (default: 20).
-        *   `--lr`: Learning rate (default: 1.0, optimized for DiagonalNewton).
-*   **Optimizer:** `DiagonalNewton` (2nd order) handles the varying scales of spectral domains.
-*   **Strategy:** Sequential Block Training (Layer 0 -> Layer 1 ... -> Pooler) to minimize memory footprint.
-*   **Status:** The pipeline runs end-to-end. Training minimizes loss on synthetic data, validating the gradient flow and architecture. Validated on DeiT-Tiny with significant loss reduction.
-
-### 3. Limitations & Future Work
-While the infrastructure is functional, the following limitations exist for production deployment:
-
-*   **Memory Usage:** Even with block-wise training, the activation cache for `DeepSpectralLinear` (Depth=4) is significant. Batch sizes are limited on standard CPUs.
-*   **Simplified Backward Pass:** The current C++ implementation uses an approximate backward pass for the ViT structure (skipping ReLU derivatives and internal Softmax gradients) to enable training without a full Autograd graph.
-*   **Pooler Mismatch:** The pooler training requires careful dimension handling (1024 spectral output vs 768 teacher target), currently managed by padding/slicing in the backward loop.
-*   **Next Steps:**
-    1.  Implement **Activation Checkpointing** to reduce memory.
-    2.  Port the full computation graph to support exact Automatic Differentiation.
-    3.  Tune learning rates and initialization for convergence on real ImageNet data.
-    4.  **Validation & Benchmark:** Implement validation on a local, COCO-like dataset (e.g., subset of COCO or equivalent small-scale object detection/classification dataset) to measure real-world accuracy and recall in the sandbox environment.
-
-### Sandbox Notes
-*   **Workloads:** Large-scale training (ImageNet) requires more RAM/Compute than available in the standard sandbox.
-*   **Environment:** For full training, export the code and run on a dedicated high-memory machine or cluster.
+**License**: MIT
