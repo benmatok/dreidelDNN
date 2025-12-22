@@ -4,6 +4,7 @@
 #include "Layer.hpp"
 #include <cmath>
 #include <limits>
+#include <numeric>
 
 namespace dreidel {
 namespace layers {
@@ -12,39 +13,41 @@ template <typename T, BackendType B = BackendType::CPU>
 class Softmax : public Layer<T, B> {
 public:
     Tensor<T, B> forward(const Tensor<T, B>& input) override {
-        // Softmax is usually applied along the last dimension (axis 1 for 2D)
-        // y_i = exp(x_i) / sum(exp(x_j))
+        // Softmax is applied along the last dimension.
+        // We treat the tensor as a collection of 1D vectors along the last dim.
 
-        if (input.shape().size() != 2) {
-             throw std::runtime_error("Softmax only supports 2D tensors");
-        }
-
-        size_t rows = input.shape()[0];
-        size_t cols = input.shape()[1];
+        size_t total_elements = input.size();
+        size_t last_dim = input.shape().back();
+        size_t num_vectors = total_elements / last_dim;
 
         Tensor<T, B> output(input.shape());
+        const T* in_ptr = input.data();
+        T* out_ptr = output.data();
 
-        // Loop over rows (samples in batch)
-        for (size_t i = 0; i < rows; ++i) {
+        #pragma omp parallel for
+        for (long i = 0; i < (long)num_vectors; ++i) {
+            size_t offset = i * last_dim;
+
             // Find max for numerical stability
             T max_val = std::numeric_limits<T>::lowest();
-            for (size_t j = 0; j < cols; ++j) {
-                if (input.data()[i * cols + j] > max_val) {
-                    max_val = input.data()[i * cols + j];
+            for (size_t j = 0; j < last_dim; ++j) {
+                if (in_ptr[offset + j] > max_val) {
+                    max_val = in_ptr[offset + j];
                 }
             }
 
             // Compute exp and sum
             T sum_exp = 0;
-            for (size_t j = 0; j < cols; ++j) {
-                T val = std::exp(input.data()[i * cols + j] - max_val);
-                output.data()[i * cols + j] = val;
+            for (size_t j = 0; j < last_dim; ++j) {
+                T val = std::exp(in_ptr[offset + j] - max_val);
+                out_ptr[offset + j] = val;
                 sum_exp += val;
             }
 
             // Normalize
-            for (size_t j = 0; j < cols; ++j) {
-                output.data()[i * cols + j] /= sum_exp;
+            T inv_sum = 1.0 / sum_exp;
+            for (size_t j = 0; j < last_dim; ++j) {
+                out_ptr[offset + j] *= inv_sum;
             }
         }
 
@@ -53,28 +56,29 @@ public:
     }
 
     Tensor<T, B> backward(const Tensor<T, B>& grad_output) override {
-        // The backward pass for Softmax is often combined with CrossEntropyLoss for simplicity: y_pred - y_true.
-        // If we treat it as a standalone layer:
-        // dL/dx_i = sum_j (dL/dy_j * dy_j/dx_i)
-        // dy_j/dx_i = y_i * (delta_ij - y_j)
-        // So dL/dx_i = y_i * (dL/dy_i - sum_k(dL/dy_k * y_k))
-
-        size_t rows = grad_output.shape()[0];
-        size_t cols = grad_output.shape()[1];
+        size_t total_elements = grad_output.size();
+        size_t last_dim = grad_output.shape().back();
+        size_t num_vectors = total_elements / last_dim;
 
         Tensor<T, B> grad_input(grad_output.shape());
+        const T* g_out_ptr = grad_output.data();
+        const T* y_ptr = output_.data();
+        T* g_in_ptr = grad_input.data();
 
-        for (size_t i = 0; i < rows; ++i) {
+        #pragma omp parallel for
+        for (long i = 0; i < (long)num_vectors; ++i) {
+            size_t offset = i * last_dim;
+
             // Compute dot product of grad_output[i] and output[i]
             T sum_grad_y = 0;
-            for (size_t j = 0; j < cols; ++j) {
-                sum_grad_y += grad_output.data()[i * cols + j] * output_.data()[i * cols + j];
+            for (size_t j = 0; j < last_dim; ++j) {
+                sum_grad_y += g_out_ptr[offset + j] * y_ptr[offset + j];
             }
 
-            for (size_t j = 0; j < cols; ++j) {
-                T y = output_.data()[i * cols + j];
-                T g = grad_output.data()[i * cols + j];
-                grad_input.data()[i * cols + j] = y * (g - sum_grad_y);
+            for (size_t j = 0; j < last_dim; ++j) {
+                T y = y_ptr[offset + j];
+                T g = g_out_ptr[offset + j];
+                g_in_ptr[offset + j] = y * (g - sum_grad_y);
             }
         }
 
