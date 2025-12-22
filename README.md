@@ -68,10 +68,10 @@ Recasting Vision Transformers (ViT) to Spectral Architectures.
 ### 🎙️ Project Ivrit: Spectral Speech (Planned)
 **Focus:** Porting `ivrit-ai/whisper-large-v3` to a fully spectral C++ architecture for efficient CPU-based ASR/TTS.
 
-#### Phase 1: Architecture Analysis & Setup
-- [ ] **Analysis**: Map `whisper-large-v3` dimensions, attention heads, and activation flows.
-- [ ] **Dependencies**: Setup Python environment with `transformers`, `torchaudio`, and `librosa` for verification.
-- [ ] **Scope**: Determine layer replacement strategy (e.g., `DeepSpectralLinear` for Q/K/V projections).
+#### Phase 1: Architecture Analysis & Setup (Completed)
+- [x] **Analysis**: Map `whisper-large-v3` dimensions, attention heads, and activation flows.
+- [x] **Dependencies**: Setup Python environment with `transformers`, `torchaudio`, and `librosa` for verification.
+- [x] **Scope**: Determine layer replacement strategy (e.g., `DeepSpectralLinear` for Q/K/V projections).
 
 #### Phase 2: Core Components Implementation
 - [ ] **MultiHeadAttentionSpectral**: Implement efficient attention mechanism using spectral projections.
