@@ -14,6 +14,19 @@ namespace layers {
 template <typename T, BackendType B = BackendType::CPU>
 class MultiHeadAttentionSpectral : public Layer<T, B> {
 public:
+    // Helper for Po2
+    static size_t next_power_of_2(size_t n) {
+        if (n == 0) return 1;
+        n--;
+        n |= n >> 1;
+        n |= n >> 2;
+        n |= n >> 4;
+        n |= n >> 8;
+        n |= n >> 16;
+        n++;
+        return n;
+    }
+
     MultiHeadAttentionSpectral(size_t dim, size_t num_heads, bool use_deep_spectral = true)
         : dim_(dim), num_heads_(num_heads), head_dim_(dim / num_heads), use_deep_spectral_(use_deep_spectral)
     {
@@ -24,10 +37,11 @@ public:
         // Q, K, V, O projections
         // For simplicity, we use the same type for all
         if (use_deep_spectral) {
-            q_proj_ = std::make_shared<DeepSpectralLinear<T, B>>(dim);
-            k_proj_ = std::make_shared<DeepSpectralLinear<T, B>>(dim);
-            v_proj_ = std::make_shared<DeepSpectralLinear<T, B>>(dim);
-            o_proj_ = std::make_shared<DeepSpectralLinear<T, B>>(dim);
+            size_t s_dim = next_power_of_2(dim);
+            q_proj_ = std::make_shared<DeepSpectralLinear<T, B>>(s_dim);
+            k_proj_ = std::make_shared<DeepSpectralLinear<T, B>>(s_dim);
+            v_proj_ = std::make_shared<DeepSpectralLinear<T, B>>(s_dim);
+            o_proj_ = std::make_shared<DeepSpectralLinear<T, B>>(s_dim);
         } else {
             q_proj_ = std::make_shared<LinearWHT<T, B>>(dim);
             k_proj_ = std::make_shared<LinearWHT<T, B>>(dim);
@@ -53,6 +67,13 @@ public:
         Tensor<T, B> Q = q_proj_->forward(query);
         Tensor<T, B> K = k_proj_->forward(key);
         Tensor<T, B> V = v_proj_->forward(value);
+
+        // Slice back if padded by DeepSpectralLinear
+        if (use_deep_spectral_ && Q.shape().back() > dim_) {
+            Q = Q.slice_last_dim(dim_);
+            K = K.slice_last_dim(dim_);
+            V = V.slice_last_dim(dim_);
+        }
 
         // 2. Reshape and Transpose for Multi-Head
         // (Batch, Seq, Dim) -> (Batch, Seq, NumHeads, HeadDim) -> (Batch, NumHeads, Seq, HeadDim)
@@ -164,7 +185,11 @@ public:
         Tensor<T, B> output_merged = merge_heads(context, batch, seq_q);
 
         // Output Projection
-        return o_proj_->forward(output_merged);
+        Tensor<T, B> out = o_proj_->forward(output_merged);
+        if (use_deep_spectral_ && out.shape().back() > dim_) {
+            out = out.slice_last_dim(dim_);
+        }
+        return out;
     }
 
     Tensor<T, B> backward(const Tensor<T, B>& grad_output) override {

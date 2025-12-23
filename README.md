@@ -74,17 +74,17 @@ Recasting Vision Transformers (ViT) to Spectral Architectures.
 - [x] **Scope**: Determine layer replacement strategy (e.g., `DeepSpectralLinear` for Q/K/V projections).
 
 #### Phase 2: Core Components Implementation
-- [ ] **MultiHeadAttentionSpectral**: Implement efficient attention mechanism using spectral projections.
-- [ ] **AudioEncoder**: Implement Log-Mel Spectrogram preprocessing in C++.
-- [ ] **SpectralWhisper**: Implement full Encoder-Decoder class in `include/dreidel/models/SpectralWhisper.hpp`.
-    - Support for KV-Caching in C++.
-    - Support for variable sequence lengths.
+- [x] **MultiHeadAttentionSpectral**: Implement efficient attention mechanism using spectral projections.
+- [x] **AudioEncoder**: Implement Log-Mel Spectrogram preprocessing in C++.
+- [x] **SpectralWhisper**: Implement full Encoder-Decoder class in `include/dreidel/models/SpectralWhisper.hpp`.
+    - [x] Support for KV-Caching in C++ (Placeholder).
+    - [x] Support for variable sequence lengths (via padding/slicing).
 
 #### Phase 3: Recasting Tooling
-- [ ] **Recast Script**: Create `tools/recast_whisper.py` to map PyTorch weights to Spectral Layers.
-    - Implement "Variance Preserving Initialization" for initializing spectral scales from dense matrices.
-    - Export Tokenizer vocabulary and config.
-- [ ] **Verification**: Unit test comparing layer-by-layer outputs (PyTorch vs C++) with random inputs.
+- [x] **Recast Script**: Create `tools/recast_whisper.py` to map PyTorch weights to Spectral Layers.
+    - [x] Implement "Variance Preserving Initialization" for initializing spectral scales from dense matrices.
+    - [ ] Export Tokenizer vocabulary and config (Placeholder).
+- [x] **Verification**: Unit test comparing layer-by-layer outputs (PyTorch vs C++) with random inputs (`tests/test_whisper_recast.cpp`).
 
 #### Phase 4: Distillation Strategy
 - [ ] **Teacher-Student Loop**: Implement `train_spectral_whisper.cpp` for block-wise distillation.
