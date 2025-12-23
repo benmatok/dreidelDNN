@@ -41,7 +41,7 @@ def get_spectral_params(target_size, depth=4):
         perms.append(perm)
     return scales, perms
 
-def recast_whisper(model_name="openai/whisper-tiny", min_dim=256, batch_size=4, output_weights="whisper_spectral_weights.bin", output_data="whisper_layer_data.bin"):
+def recast_whisper(model_name="openai/whisper-tiny", min_dim=256, batch_size=4, seq_len=3000, output_weights="whisper_spectral_weights.bin", output_data="whisper_layer_data.bin"):
     print(f"Loading {model_name}...")
     try:
         model = WhisperModel.from_pretrained(model_name)
@@ -70,13 +70,6 @@ def recast_whisper(model_name="openai/whisper-tiny", min_dim=256, batch_size=4, 
         if out_target < out_features: out_target *= 2
         if out_target < min_dim: out_target = min_dim
 
-        # Spectral layers usually handle square transforms or we pad input/output.
-        # DeepSpectralLinear in C++ (based on earlier memory) usually works on a fixed dim per block?
-        # Or it takes input dim -> output dim.
-        # But WHT requires power of 2.
-        # Usually we pad to max(in, out) and treat as square spectral transform + slicing?
-        # Let's assume max(in, out) power of 2 for the spectral dimension.
-
         target_size = max(in_target, out_target)
 
         print(f"  Converting {name}: {in_features}->{out_features} to DeepSpectralLinear({target_size}, K={DEPTH})")
@@ -101,46 +94,33 @@ def recast_whisper(model_name="openai/whisper-tiny", min_dim=256, batch_size=4, 
         return layer_info
 
     # 1. Input Projection (Simplification: We use the first conv/linear equivalent)
-    # Whisper has Conv1d layers. We might model them or just a linear projection for now.
-    # The C++ code had `input_proj_`. We will map the FIRST conv layer's effect or just create a dummy projection
-    # that maps n_mels -> d_model.
-    # Whisper Conv1: (80, d_model, k=3, s=1).
-    # We will just export a spectral layer for n_mels -> d_model.
     print("Processing Input Projection...")
-    # Mocking a linear module for the projection
     mock_proj = nn.Linear(config.num_mel_bins, config.d_model)
     weights_list.append(process_linear("input_proj", mock_proj))
 
     # 2. Encoder Layers
     print("Processing Encoder Layers...")
     for i, layer in enumerate(model.encoder.layers):
-        # Self Attention Projections
-        # usually q, k, v, out
         weights_list.append(process_linear(f"encoder.{i}.attn.q_proj", layer.self_attn.q_proj))
         weights_list.append(process_linear(f"encoder.{i}.attn.k_proj", layer.self_attn.k_proj))
         weights_list.append(process_linear(f"encoder.{i}.attn.v_proj", layer.self_attn.v_proj))
         weights_list.append(process_linear(f"encoder.{i}.attn.out_proj", layer.self_attn.out_proj))
-
-        # MLP
         weights_list.append(process_linear(f"encoder.{i}.mlp.fc1", layer.fc1))
         weights_list.append(process_linear(f"encoder.{i}.mlp.fc2", layer.fc2))
 
     # 3. Decoder Layers
     print("Processing Decoder Layers...")
     for i, layer in enumerate(model.decoder.layers):
-        # Self Attention
         weights_list.append(process_linear(f"decoder.{i}.self_attn.q_proj", layer.self_attn.q_proj))
         weights_list.append(process_linear(f"decoder.{i}.self_attn.k_proj", layer.self_attn.k_proj))
         weights_list.append(process_linear(f"decoder.{i}.self_attn.v_proj", layer.self_attn.v_proj))
         weights_list.append(process_linear(f"decoder.{i}.self_attn.out_proj", layer.self_attn.out_proj))
 
-        # Cross Attention (Encoder-Decoder)
         weights_list.append(process_linear(f"decoder.{i}.cross_attn.q_proj", layer.encoder_attn.q_proj))
         weights_list.append(process_linear(f"decoder.{i}.cross_attn.k_proj", layer.encoder_attn.k_proj))
         weights_list.append(process_linear(f"decoder.{i}.cross_attn.v_proj", layer.encoder_attn.v_proj))
         weights_list.append(process_linear(f"decoder.{i}.cross_attn.out_proj", layer.encoder_attn.out_proj))
 
-        # MLP
         weights_list.append(process_linear(f"decoder.{i}.mlp.fc1", layer.fc1))
         weights_list.append(process_linear(f"decoder.{i}.mlp.fc2", layer.fc2))
 
@@ -155,13 +135,11 @@ def recast_whisper(model_name="openai/whisper-tiny", min_dim=256, batch_size=4, 
             write_string(f, layer["type"])
             f.write(struct.pack('I', layer["dim"]))
 
-            # DeepSpectralLinear specifics
             f.write(struct.pack('I', layer["depth"]))
             for k in range(layer["depth"]):
                 write_tensor(f, layer["scales"][k])
                 write_perm(f, layer["perms"][k])
 
-            # Bias
             if layer["bias"] is not None:
                 f.write(struct.pack('?', True))
                 write_tensor(f, layer["bias"])
@@ -171,85 +149,82 @@ def recast_whisper(model_name="openai/whisper-tiny", min_dim=256, batch_size=4, 
     print(f"Saved weights to {output_weights}")
 
     # --- Distillation Data Generation ---
-    print("Generating synthetic distillation data...")
+    print(f"Generating synthetic distillation data (Batch={batch_size}, Seq={seq_len})...")
 
     # Create synthetic input
-    # Mel spectrogram: (Batch, 80, 3000) for standard Whisper
-    seq_len = 3000
     mel_input = torch.randn(batch_size, config.num_mel_bins, seq_len)
-
-    # Decoder input (tokens)
-    # just random tokens
     decoder_input_ids = torch.randint(0, config.vocab_size, (batch_size, 50))
 
-    # Hooks to capture intermediate values
-    captured_data = {} # key -> tensor
+    captured_data = {}
 
-    # We want to capture inputs/outputs of specific blocks to verify C++ implementation
-    # For now, let's just capture the Encoders' inputs/outputs and Decoders' inputs/outputs.
-
-    def get_hook(name):
+    def get_encoder_hook(name):
         def hook(module, input, output):
-            # Input is tuple
-            if isinstance(input, tuple):
-                inp = input[0]
-            else:
-                inp = input
-
-            # Output might be tuple (hidden_state, cache, attentions)
-            if isinstance(output, tuple):
-                out = output[0]
-            else:
-                out = output
-
+            inp = input[0] if isinstance(input, tuple) else input
+            out = output[0] if isinstance(output, tuple) else output
             captured_data[f"{name}_input"] = inp.detach().cpu().numpy()
             captured_data[f"{name}_output"] = out.detach().cpu().numpy()
         return hook
 
-    # Register hooks
-    hooks = []
+    def get_decoder_hook(name):
+        def hook(module, args, kwargs, output):
+            # args is tuple of positional args
+            # kwargs is dict
 
+            # Positional mapping for WhisperDecoderLayer:
+            # forward(hidden_states, attention_mask=None, encoder_hidden_states=None, ...)
+
+            hidden_states = args[0]
+
+            # encoder_hidden_states might be in args or kwargs
+            encoder_hidden_states = kwargs.get('encoder_hidden_states')
+            if encoder_hidden_states is None and len(args) > 2:
+                encoder_hidden_states = args[2]
+
+            out = output[0] if isinstance(output, tuple) else output
+
+            captured_data[f"{name}_input"] = hidden_states.detach().cpu().numpy()
+            if encoder_hidden_states is not None:
+                captured_data[f"{name}_enc_out"] = encoder_hidden_states.detach().cpu().numpy()
+            captured_data[f"{name}_output"] = out.detach().cpu().numpy()
+        return hook
+
+    hooks = []
     # Encoder Layers
     for i, layer in enumerate(model.encoder.layers):
-        hooks.append(layer.register_forward_hook(get_hook(f"encoder_layer_{i}")))
+        hooks.append(layer.register_forward_hook(get_encoder_hook(f"encoder_layer_{i}")))
 
     # Decoder Layers
+    # Use with_kwargs=True
     for i, layer in enumerate(model.decoder.layers):
-        hooks.append(layer.register_forward_hook(get_hook(f"decoder_layer_{i}")))
+        hooks.append(layer.register_forward_hook(get_decoder_hook(f"decoder_layer_{i}"), with_kwargs=True))
 
     # Forward pass
     with torch.no_grad():
-        # WhisperModel forward expects input_features (mels) and decoder_input_ids
         outputs = model(input_features=mel_input, decoder_input_ids=decoder_input_ids)
 
-    # Clean hooks
     for h in hooks: h.remove()
 
     # Save data
     with open(output_data, "wb") as f:
-        # Write metadata
         f.write(struct.pack('I', config.encoder_layers))
         f.write(struct.pack('I', config.decoder_layers))
 
-        # Write Mel Input
         write_tensor(f, mel_input.numpy())
 
-        # Write Decoder Input (Embeddings? Or IDs? C++ usually wants embeddings or handled internally)
-        # The C++ SpectralWhisper forward takes `decoder_input_embeds`.
-        # So we should save the embeddings of the decoder_input_ids.
-        # We can extract them manually
         decoder_embeds = model.decoder.embed_tokens(decoder_input_ids) * config.d_model**0.5 + model.decoder.embed_positions(decoder_input_ids)
         write_tensor(f, decoder_embeds.detach().numpy())
 
-        # Write Layer Data
-        # Encoder
         for i in range(config.encoder_layers):
             write_tensor(f, captured_data[f"encoder_layer_{i}_input"])
             write_tensor(f, captured_data[f"encoder_layer_{i}_output"])
 
-        # Decoder
         for i in range(config.decoder_layers):
             write_tensor(f, captured_data[f"decoder_layer_{i}_input"])
+            if f"decoder_layer_{i}_enc_out" in captured_data:
+                write_tensor(f, captured_data[f"decoder_layer_{i}_enc_out"])
+            else:
+                # Fallback empty tensor if missing (should not happen in normal flow)
+                write_tensor(f, np.array([]))
             write_tensor(f, captured_data[f"decoder_layer_{i}_output"])
 
     print(f"Saved distillation data to {output_data}")
@@ -260,8 +235,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="openai/whisper-tiny", help="HuggingFace model name")
     parser.add_argument("--min-dim", type=int, default=256, help="Minimum spectral dimension")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
+    parser.add_argument("--seq-len", type=int, default=3000, help="Sequence length (audio frames)")
     parser.add_argument("--output-weights", type=str, default="whisper_spectral_weights.bin")
     parser.add_argument("--output-data", type=str, default="whisper_layer_data.bin")
     args = parser.parse_args()
 
-    recast_whisper(args.model, args.min_dim, args.batch_size, args.output_weights, args.output_data)
+    recast_whisper(args.model, args.min_dim, args.batch_size, args.seq_len, args.output_weights, args.output_data)
