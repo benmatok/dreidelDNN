@@ -228,6 +228,16 @@ public:
 
     std::string name() const override { return "MultiHeadAttentionSpectral"; }
 
+    // Accessors for weight loading
+    // Since we store as Layer base pointer, we need to cast if we want DeepSpectral specifics,
+    // but DeepSpectralLinear inherits from Layer.
+    // However, load_weights in SpectralWhisper expects shared_ptr<DeepSpectralLinear>.
+    // So we need to cast.
+    std::shared_ptr<DeepSpectralLinear<T, B>> q_proj_public() { return std::dynamic_pointer_cast<DeepSpectralLinear<T, B>>(q_proj_); }
+    std::shared_ptr<DeepSpectralLinear<T, B>> k_proj_public() { return std::dynamic_pointer_cast<DeepSpectralLinear<T, B>>(k_proj_); }
+    std::shared_ptr<DeepSpectralLinear<T, B>> v_proj_public() { return std::dynamic_pointer_cast<DeepSpectralLinear<T, B>>(v_proj_); }
+    std::shared_ptr<DeepSpectralLinear<T, B>> o_proj_public() { return std::dynamic_pointer_cast<DeepSpectralLinear<T, B>>(o_proj_); }
+
 private:
     size_t dim_;
     size_t num_heads_;
