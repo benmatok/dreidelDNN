@@ -2,4 +2,24 @@ train_spectral_vit
 vit_distillation_data.bin
 vit_spectral_weights.bin
 vit_layer_data.bin
-vit_layer_data.bin
+# Whisper
+whisper_spectral_weights.bin
+whisper_layer_data.bin
+tests/test_whisper_recast
+tests/test_spectral_vit
+tests/test_allocator
+tests/test_alsh
+tests/test_audio
+tests/test_conv3d_spectral
+tests/test_deep_spectral
+tests/test_linear_wht
+tests/test_mnist_mock
+tests/test_phase8
+tests/test_rosenbrock
+tests/test_spectral_whisper
+tests/test_tensor
+tests/test_wht
+tests/test_xor
+tests/verify_spectral
+test_outputs.txt
+test_results.txt

@@ -63,7 +63,9 @@ public:
         // to fit the spectral theme, or assume input is already projected?
         // The prompt asks for "full Encoder-Decoder class".
         // I will add a LinearWHT for input projection.
-        input_proj_ = std::make_shared<layers::LinearWHT<T, B>>(config.n_audio_state);
+        // Updated to DeepSpectralLinear to match recast script and power-of-2 requirement.
+        size_t proj_dim = next_power_of_2(config.n_audio_state);
+        input_proj_ = std::make_shared<layers::DeepSpectralLinear<T, B>>(proj_dim);
     }
 
     // Full forward pass
@@ -99,6 +101,11 @@ public:
 
         x_enc = input_proj_->forward(x_enc);
 
+        // Slice back to n_audio_state if needed (because DeepSpectralLinear outputs power of 2)
+        if (x_enc.shape().back() > config_.n_audio_state) {
+            x_enc = x_enc.slice_last_dim(config_.n_audio_state);
+        }
+
         // 3. Encoder Blocks
         for (auto& layer : encoder_layers_) {
             x_enc = layer->forward(x_enc);
@@ -122,7 +129,20 @@ public:
 private:
     WhisperConfig config_;
     std::shared_ptr<transforms::AudioEncoder> audio_encoder_;
-    std::shared_ptr<layers::LinearWHT<T, B>> input_proj_;
+    std::shared_ptr<layers::DeepSpectralLinear<T, B>> input_proj_;
+
+    // Helper for Po2
+    static size_t next_power_of_2(size_t n) {
+        if (n == 0) return 1;
+        n--;
+        n |= n >> 1;
+        n |= n >> 2;
+        n |= n >> 4;
+        n |= n >> 8;
+        n |= n >> 16;
+        n++;
+        return n;
+    }
 
     struct EncoderBlock {
         std::shared_ptr<layers::MultiHeadAttentionSpectral<T, B>> attn;
@@ -133,9 +153,29 @@ private:
         // but it's crucial for convergence.
 
         EncoderBlock(int dim, int heads) {
+            size_t spectral_dim = next_power_of_2(dim);
+            size_t expanded_dim = dim * 4; // Usual MLP expansion
+            size_t spectral_expanded_dim = next_power_of_2(expanded_dim);
+
+            // Attention usually keeps dim.
+            // But we need to check MultiHeadAttentionSpectral requirements too.
+            // Assuming it handles it or we pass spectral_dim if needed.
+            // Let's assume MHA handles padding internally or we pass original dim.
+            // Wait, MHA uses LinearWHT/DeepSpectral internally.
+
             attn = std::make_shared<layers::MultiHeadAttentionSpectral<T, B>>(dim, heads);
-            mlp_fc1 = std::make_shared<layers::DeepSpectralLinear<T, B>>(dim); // usually expansion * 4
-            mlp_fc2 = std::make_shared<layers::DeepSpectralLinear<T, B>>(dim);
+
+            // For MLP, FC1 maps dim -> expanded_dim.
+            // DeepSpectralLinear is square (dim -> dim) usually, or we use it to approximate rectangular?
+            // "The DeepSpectralLinear layer approximates dense matrices...".
+            // It currently takes ONE dim in constructor: `DeepSpectralLinear(dim)`.
+            // This implies SQUARE transform.
+            // But MLP is Rectangular (dim -> 4*dim).
+            // So we need to use `dim` = max(in, out) = 4*dim?
+            // Yes, DeepSpectralLinear is usually used as a square transform wrapper where we pad inputs and slice outputs.
+
+            mlp_fc1 = std::make_shared<layers::DeepSpectralLinear<T, B>>(spectral_expanded_dim);
+            mlp_fc2 = std::make_shared<layers::DeepSpectralLinear<T, B>>(spectral_expanded_dim);
         }
 
         Tensor<T, B> forward(const Tensor<T, B>& x) {
@@ -150,6 +190,11 @@ private:
             out = gelu.forward(out);
             out = mlp_fc2->forward(out);
 
+            // Slice back to original dim
+            if (out.shape().back() > res.shape().back()) {
+                out = out.slice_last_dim(res.shape().back());
+            }
+
             out = out + res;
             return out;
         }
@@ -162,10 +207,14 @@ private:
         std::shared_ptr<layers::DeepSpectralLinear<T, B>> mlp_fc2;
 
         DecoderBlock(int dim, int heads) {
+            size_t spectral_dim = next_power_of_2(dim);
+            size_t expanded_dim = dim * 4;
+            size_t spectral_expanded_dim = next_power_of_2(expanded_dim);
+
             self_attn = std::make_shared<layers::MultiHeadAttentionSpectral<T, B>>(dim, heads);
             cross_attn = std::make_shared<layers::MultiHeadAttentionSpectral<T, B>>(dim, heads);
-            mlp_fc1 = std::make_shared<layers::DeepSpectralLinear<T, B>>(dim);
-            mlp_fc2 = std::make_shared<layers::DeepSpectralLinear<T, B>>(dim);
+            mlp_fc1 = std::make_shared<layers::DeepSpectralLinear<T, B>>(spectral_expanded_dim);
+            mlp_fc2 = std::make_shared<layers::DeepSpectralLinear<T, B>>(spectral_expanded_dim);
         }
 
         Tensor<T, B> forward(const Tensor<T, B>& x, const Tensor<T, B>& enc_out) {
@@ -186,6 +235,11 @@ private:
             layers::GELU<T, B> gelu;
             out = gelu.forward(out);
             out = mlp_fc2->forward(out);
+
+            // Slice back to original dim
+            if (out.shape().back() > res.shape().back()) {
+                out = out.slice_last_dim(res.shape().back());
+            }
 
             out = out + res;
             return out;
