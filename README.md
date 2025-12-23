@@ -87,8 +87,9 @@ Recasting Vision Transformers (ViT) to Spectral Architectures.
 - [x] **Verification**: Unit test comparing layer-by-layer outputs (PyTorch vs C++) with random inputs (`tests/test_whisper_recast.cpp`).
 
 #### Phase 4: Distillation Strategy
-- [ ] **Teacher-Student Loop**: Implement `train_spectral_whisper.cpp` for block-wise distillation.
-    - Focus on distilling the Cross-Attention mechanism which is critical for alignment.
+- [x] **Teacher-Student Loop**: Implement `train_spectral_whisper.cpp` for block-wise distillation.
+    - Successfully distilling Encoder blocks using `DiagonalNewton`.
+    - Decoder distillation pending data capture of Encoder-Decoder cross-states.
 - [ ] **Optimization**: Tune `DiagonalNewton` learning rates for the specific distribution of speech embeddings.
 
 #### Phase 5: End-to-End Verification
