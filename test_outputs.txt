@@ -1,5 +1,5 @@
 Running Regression Suite...
-Date: Tue Dec 23 11:25:48 UTC 2025
+Date: Tue Dec 23 22:05:11 UTC 2025
 --------------------------------------------------
 Running Test test_allocator...
 Disk Usage:
@@ -7,7 +7,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       472Mi       3.0Gi       544Ki       4.6Gi       7.3Gi
+Mem:           7.8Gi       473Mi       3.2Gi       544Ki       4.4Gi       7.3Gi
 Swap:             0B          0B          0B
 Compiling tests/test_allocator.cpp...
 Running tests/test_allocator...
@@ -21,14 +21,14 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       545Mi       2.9Gi       548Ki       4.6Gi       7.2Gi
+Mem:           7.8Gi       576Mi       3.1Gi       540Ki       4.4Gi       7.2Gi
 Swap:             0B          0B          0B
 Compiling tests/test_alsh.cpp...
 Running tests/test_alsh...
 Running ALSH Test...
 Index build time: 93 ms
-Brute Force Time: 3304 us
-ALSH Query Time (incl. re-rank): 131 us
+Brute Force Time: 3431 us
+ALSH Query Time (incl. re-rank): 153 us
 Candidates count: 115 / 10000
 Recall @ 10: 10 / 10 (100%)
 Test Passed: Retrieved at least some relevant items.
@@ -40,7 +40,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       586Mi       2.9Gi       548Ki       4.6Gi       7.2Gi
+Mem:           7.8Gi       665Mi       3.0Gi       540Ki       4.4Gi       7.1Gi
 Swap:             0B          0B          0B
 Compiling tests/test_audio.cpp...
 Running tests/test_audio...
@@ -48,7 +48,7 @@ Testing FFT...
 FFT Passed.
 Testing AudioEncoder...
 Output shape: 1 80 101
-Max Mel Value: 32.7776
+Max Mel Value: 3.97276
 AudioEncoder Passed.
 [PASS] Test test_audio
 --------------------------------------------------
@@ -58,7 +58,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       652Mi       2.8Gi       548Ki       4.6Gi       7.1Gi
+Mem:           7.8Gi       623Mi       3.0Gi       540Ki       4.4Gi       7.2Gi
 Swap:             0B          0B          0B
 Compiling tests/test_conv3d_spectral.cpp...
 Running tests/test_conv3d_spectral...
@@ -78,7 +78,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       724Mi       2.8Gi       548Ki       4.6Gi       7.1Gi
+Mem:           7.8Gi       655Mi       3.0Gi       540Ki       4.4Gi       7.1Gi
 Swap:             0B          0B          0B
 Compiling tests/test_deep_spectral.cpp...
 Running tests/test_deep_spectral...
@@ -86,16 +86,16 @@ Testing DeepSpectralLinear Forward/Backward...
 Forward Pass Complete.
 Backward Pass Complete.
 Testing Overfitting Random Matrix...
-Epoch 0 MSE: 1.6115
-Epoch 50 MSE: 1.39158
-Epoch 100 MSE: 1.24025
-Epoch 150 MSE: 1.17415
-Epoch 200 MSE: 1.21348
-Epoch 250 MSE: 1.12405
-Epoch 300 MSE: 1.163
-Epoch 350 MSE: 1.0255
-Epoch 400 MSE: 1.09699
-Epoch 450 MSE: 1.03849
+Epoch 0 MSE: 1.59136
+Epoch 50 MSE: 1.46628
+Epoch 100 MSE: 1.29661
+Epoch 150 MSE: 1.2071
+Epoch 200 MSE: 1.19091
+Epoch 250 MSE: 1.16301
+Epoch 300 MSE: 1.1746
+Epoch 350 MSE: 1.12083
+Epoch 400 MSE: 1.10577
+Epoch 450 MSE: 1.1388
 Training Complete.
 [PASS] Test test_deep_spectral
 --------------------------------------------------
@@ -105,7 +105,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       646Mi       2.8Gi       548Ki       4.6Gi       7.1Gi
+Mem:           7.8Gi       580Mi       3.1Gi       540Ki       4.4Gi       7.2Gi
 Swap:             0B          0B          0B
 Compiling tests/test_linear_wht.cpp...
 Running tests/test_linear_wht...
@@ -128,13 +128,13 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       647Mi       2.8Gi       548Ki       4.6Gi       7.1Gi
+Mem:           7.8Gi       682Mi       3.0Gi       540Ki       4.4Gi       7.1Gi
 Swap:             0B          0B          0B
 Compiling tests/test_mnist_mock.cpp...
 Running tests/test_mnist_mock...
 --- Testing Mock MNIST Training with LinearWHT ---
-Initial Loss: 2.30831
-Final Loss: 0.87181
+Initial Loss: 2.30852
+Final Loss: 0.692928
 PASS: Training loop ran successfully.
 [PASS] Test test_mnist_mock
 --------------------------------------------------
@@ -144,7 +144,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       698Mi       2.8Gi       548Ki       4.6Gi       7.1Gi
+Mem:           7.8Gi       686Mi       3.0Gi       540Ki       4.4Gi       7.1Gi
 Swap:             0B          0B          0B
 Compiling tests/test_phase8.cpp...
 Running tests/test_phase8...
@@ -154,9 +154,9 @@ PASS: Hasher preserves locality.
 --- Testing Sparse Gather ---
 PASS: Sparse Gather correct.
 --- Benchmarking Filter Pruning (Simulation) ---
-Sparse Compute Time (Gather+Dot): 0.012014 s
-Dense Compute Time (Full Dot): 0.0627663 s
-Speedup: 5.22442x
+Sparse Compute Time (Gather+Dot): 0.012719 s
+Dense Compute Time (Full Dot): 0.0645882 s
+Speedup: 5.07808x
 PASS: Speedup observed.
 [PASS] Test test_phase8
 --------------------------------------------------
@@ -166,7 +166,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       723Mi       2.8Gi       548Ki       4.6Gi       7.1Gi
+Mem:           7.8Gi       782Mi       2.9Gi       540Ki       4.4Gi       7.0Gi
 Swap:             0B          0B          0B
 Compiling tests/test_rosenbrock.cpp...
 Running tests/test_rosenbrock...
@@ -184,7 +184,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       708Mi       2.8Gi       548Ki       4.6Gi       7.1Gi
+Mem:           7.8Gi       748Mi       2.9Gi       540Ki       4.4Gi       7.0Gi
 Swap:             0B          0B          0B
 Compiling tests/test_spectral_whisper.cpp...
 Running tests/test_spectral_whisper...
@@ -199,7 +199,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       662Mi       2.8Gi       548Ki       4.6Gi       7.1Gi
+Mem:           7.8Gi       702Mi       2.9Gi       540Ki       4.4Gi       7.1Gi
 Swap:             0B          0B          0B
 Compiling tests/test_tensor.cpp...
 Running tests/test_tensor...
@@ -220,17 +220,17 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       638Mi       2.9Gi       548Ki       4.6Gi       7.1Gi
+Mem:           7.8Gi       751Mi       2.9Gi       540Ki       4.4Gi       7.0Gi
 Swap:             0B          0B          0B
 Compiling tests/test_whisper_recast.cpp...
 Running tests/test_whisper_recast...
 Loading weights from whisper_spectral_weights.bin...
 Found 65 layers in weights file.
 Loading distillation data from whisper_layer_data.bin...
-Mel Input Shape: 4x80x3000
+Mel Input Shape: 1x80x3000
 Running Forward Pass...
 Forward pass successful.
-Output shape: 4x50x384
+Output shape: 1x50x384
 [SUCCESS] SpectralWhisper initialized and ran forward pass.
 [PASS] Test test_whisper_recast
 --------------------------------------------------
@@ -240,7 +240,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       532Mi       5.5Gi       548Ki       2.1Gi       7.3Gi
+Mem:           7.8Gi       652Mi       3.0Gi       540Ki       4.4Gi       7.1Gi
 Swap:             0B          0B          0B
 Compiling tests/test_wht.cpp...
 Running tests/test_wht...
@@ -249,9 +249,9 @@ Max diff: 4.76837e-07
 PASS
 Running Throughput Test...
 Allocating 128 MB Tensor...
-FWHT Throughput: 4.17746 GB/s
-Memcpy Throughput: 4.38676 GB/s
-Ratio: 95.229%
+FWHT Throughput: 4.0304 GB/s
+Memcpy Throughput: 4.37035 GB/s
+Ratio: 92.2215%
 PASS (Excellent)
 [PASS] Test test_wht
 --------------------------------------------------
@@ -261,28 +261,28 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       806Mi       5.2Gi       548Ki       2.1Gi       7.0Gi
+Mem:           7.8Gi       765Mi       2.9Gi       540Ki       4.4Gi       7.0Gi
 Swap:             0B          0B          0B
 Compiling tests/test_xor.cpp...
 Running tests/test_xor...
 Training XOR Network...
-Epoch 0, Loss: 0.742325
-Epoch 1000, Loss: 0.0145005
-Epoch 2000, Loss: 0.00573379
-Epoch 3000, Loss: 0.0034769
-Epoch 4000, Loss: 0.00246988
-Epoch 5000, Loss: 0.00190549
-Epoch 6000, Loss: 0.00154649
-Epoch 7000, Loss: 0.00129871
-Epoch 8000, Loss: 0.00111775
-Epoch 9000, Loss: 0.000980105
+Epoch 0, Loss: 0.698539
+Epoch 1000, Loss: 0.478507
+Epoch 2000, Loss: 0.477846
+Epoch 3000, Loss: 0.477661
+Epoch 4000, Loss: 0.477585
+Epoch 5000, Loss: 0.477536
+Epoch 6000, Loss: 0.477496
+Epoch 7000, Loss: 0.477485
+Epoch 8000, Loss: 0.477472
+Epoch 9000, Loss: 0.477462
 Predictions:
-Input [0, 0] -> Prob [0]: 0.99735, [1]: 0.00264965 | Pred: 0 True: 0
-Input [0, 1] -> Prob [0]: 0.000339061, [1]: 0.999661 | Pred: 1 True: 1
-Input [1, 0] -> Prob [0]: 0.000327417, [1]: 0.999673 | Pred: 1 True: 1
-Input [1, 1] -> Prob [0]: 0.999832, [1]: 0.000168152 | Pred: 0 True: 0
-Accuracy: 4/4
-PASS
+Input [0, 0] -> Prob [0]: 0.666583, [1]: 0.333417 | Pred: 0 True: 0
+Input [0, 1] -> Prob [0]: 0.000250304, [1]: 0.99975 | Pred: 1 True: 1
+Input [1, 0] -> Prob [0]: 0.666583, [1]: 0.333417 | Pred: 0 True: 1
+Input [1, 1] -> Prob [0]: 0.666583, [1]: 0.333417 | Pred: 0 True: 0
+Accuracy: 3/4
+FAIL
 [PASS] Test test_xor
 --------------------------------------------------
 Running Test verify_spectral...
@@ -291,7 +291,7 @@ Disk Usage:
 overlayfs:/overlay/root   98G   12G   82G  13% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       723Mi       5.3Gi       548Ki       2.1Gi       7.1Gi
+Mem:           7.8Gi       715Mi       2.9Gi       540Ki       4.4Gi       7.1Gi
 Swap:             0B          0B          0B
 Compiling tests/verify_spectral.cpp...
 Running tests/verify_spectral...
@@ -302,25 +302,25 @@ LinearWHT Layer Parameters: 1024 (Expected: 1024)
 Reduction Ratio: 1025x
 PASS: Significant parameter reduction observed.
 --- Verifying Inverse FWHT ---
-Max diff: 7.15256e-07
+Max diff: 5.36442e-07
 PASS: Inverse FWHT restores original.
 --- Verifying Throughput ---
-FWHT Throughput: 2.13061 GB/s
-Memcpy Throughput: 3.90015 GB/s
-Ratio: 54.6289%
+FWHT Throughput: 3.75881 GB/s
+Memcpy Throughput: 4.87106 GB/s
+Ratio: 77.1661%
 PASS: Throughput acceptable.
 [PASS] Test verify_spectral
 --------------------------------------------------
 Running Python Tests...
-K=1 Rel Error: 0.9910
-K=1 Rel Error: 0.9910
-K=2 Rel Error: 0.9827
-K=3 Rel Error: 0.9745
-K=4 Rel Error: 0.9677
-K=5 Rel Error: 0.9605
-K=6 Rel Error: 0.9523
-K=7 Rel Error: 0.9443
-K=8 Rel Error: 0.9360
+K=1 Rel Error: 0.9921
+K=1 Rel Error: 0.9921
+K=2 Rel Error: 0.9857
+K=3 Rel Error: 0.9795
+K=4 Rel Error: 0.9719
+K=5 Rel Error: 0.9654
+K=6 Rel Error: 0.9585
+K=7 Rel Error: 0.9511
+K=8 Rel Error: 0.9440
 [PASS] test_expressivity.py
 --------------------------------------------------
 Regression Suite Completed.

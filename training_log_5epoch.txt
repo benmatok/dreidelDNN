@@ -1,0 +1,31 @@
+--- Spectral Whisper Distillation ---
+Weights: whisper_spectral_weights.bin
+Data: whisper_layer_data.bin
+Epochs: 5, LR: 1
+Loading Weights...
+Weights loaded successfully.
+Loading Distillation Data...
+
+--- Distilling Encoders (4 blocks) ---
+Block 0 | Input: 1x1500x384
+  Block 0 MSE: 0.707684 -> 0.67134
+Block 1 | Input: 1x1500x384
+  Block 1 MSE: 0.321443 -> 0.274429
+Block 2 | Input: 1x1500x384
+  Block 2 MSE: 0.416718 -> 0.358948
+Block 3 | Input: 1x1500x384
+  Block 3 MSE: 0.878912 -> 0.769439
+
+--- Distilling Decoders (4 blocks) ---
+Block 0 | Input: 1x50x384
+  Block 0 MSE: 0.342311 -> -nan
+Block 1 | Input: 1x50x384
+  Block 1 MSE: 0.537289 -> -nan
+Block 2 | Input: 1x50x384
+  Block 2 MSE: 0.547343 -> -nan
+Block 3 | Input: 1x50x384
+  Block 3 MSE: 0.559149 -> inf
+
+Total Initial MSE: 4.31085
+Total Final MSE: -nan
+Distillation Complete.

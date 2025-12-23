@@ -1,0 +1,21 @@
+--- Spectral Whisper Distillation ---
+Weights: whisper_spectral_weights.bin
+Data: whisper_layer_data.bin
+Epochs: 5, LR: 0.1
+Loading Weights...
+Weights loaded successfully.
+Loading Distillation Data...
+
+--- Distilling Encoders (4 blocks) ---
+Block 0 | Input: 1x1500x384
+  Block 0 MSE: 0.707684 -> 0.700876
+Block 1 | Input: 1x1500x384
+  Block 1 MSE: 0.321443 -> 0.308629
+Block 2 | Input: 1x1500x384
+  Block 2 MSE: 0.416718 -> 0.401958
+Block 3 | Input: 1x1500x384
+  Block 3 MSE: 0.878912 -> 0.859155
+
+--- Distilling Decoders (4 blocks) ---
+Block 0 | Input: 1x50x384
+Error: Shapes incompatible for element-wise multiplication.
