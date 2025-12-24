@@ -272,9 +272,32 @@ double get_analytical_psi(double x, int n=30) {
 template <typename T>
 void train_benchmark(bool use_custom, int epochs=2000) {
     QuantumPINN<T> model(use_custom);
-    optim::DiagonalNewton<T> optimizer(1e-3); // Learning rate
+    // Use lower learning rate for DeepSpectralLinear to prevent divergence
+    T lr = use_custom ? 1e-4 : 1e-3;
+    optim::DiagonalNewton<T> optimizer(lr);
 
     optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
+
+    // Re-initialize DeepSpectralLinear scales to be smaller to avoid explosion at start
+    if (use_custom) {
+        auto params = model.parameters();
+        // Standard MLP has 8 params (4 weights, 4 biases)
+        // DSL model: DSL(4*2=8 params if depth=4? No, depth=4 means 4 scales)
+        // DSL: 4 scales. Tanh: 0.
+        // 3 DSL layers * 4 scales = 12 scales.
+        // Final Dense: 2 params.
+        // Total 14 params.
+        // We iterate and if size > 1 (scales are vector of size dim), we scale them down.
+        for (auto* p : params) {
+            if (p->size() > 1) { // Likely a scale vector or weight matrix
+                // Scale down current random values
+                T* ptr = p->data();
+                for(size_t i=0; i<p->size(); ++i) {
+                    ptr[i] *= 0.1;
+                }
+            }
+        }
+    }
 
     size_t batch_size = 500;
     T epsilon = 1e-3; // Finite Difference step
@@ -490,6 +513,11 @@ void train_benchmark(bool use_custom, int epochs=2000) {
 
         // Optimizer Step
         optimizer.step();
+
+        if (std::isnan(total_loss)) {
+            std::cout << "Epoch " << epoch+1 << " | Loss: NaN (Diverged)" << std::endl;
+            break;
+        }
 
         if ((epoch+1) % 100 == 0) {
             std::cout << "Epoch " << epoch+1 << " | Loss: " << total_loss << std::endl;
