@@ -39,7 +39,7 @@ using namespace dreidel;
 template <typename T>
 class DenseWithCurvature : public layers::Layer<T> {
 public:
-    DenseWithCurvature(size_t input_dim, size_t output_dim)
+    DenseWithCurvature(size_t input_dim, size_t output_dim, T bias_init = 0.0)
         : input_dim_(input_dim), output_dim_(output_dim),
           weights_({input_dim, output_dim}), bias_({1, output_dim}),
           grad_weights_({input_dim, output_dim}), grad_bias_({1, output_dim}),
@@ -48,7 +48,7 @@ public:
         // Xavier Init
         T stddev = std::sqrt(2.0 / (input_dim + output_dim));
         weights_.random(0, stddev);
-        bias_.fill(0);
+        bias_.fill(bias_init);
         grad_weights_.fill(0);
         grad_bias_.fill(0);
         curv_weights_.fill(0);
@@ -71,10 +71,6 @@ public:
         // For Dense layer with Least Squares / CrossEntropy, the Gauss-Newton approx
         // for weights W_ij is related to sum_batch (X_bi^2).
         // This is a rough diagonal approximation often used.
-        // C_W = sum(X^2, axis=0)^T broadcasted?
-        // Actually, diagonal element for W_ij depends on X_i.
-        // H_{ij, ij} = sum_k (X_ki^2 * (activation_deriv)^2 ...)
-        // We approximate simply by input energy for the benchmark to enable Newton steps.
 
         // Sum of squares of input along batch
         Tensor<T> x_sq = input_ * input_;
@@ -83,10 +79,6 @@ public:
         // We replicate this for each output neuron?
         // W is (In, Out). Each column j uses same input x.
         // So curvature is same for all j.
-        // curv_weights_ (In, Out)
-
-        // Create a tensor of shape (In, Out) by repeating x_sum_sq
-        // Since we don't have broadcast-copy, we do it manually or loop.
 
         T* c_ptr = curv_weights_.data();
         const T* x_ptr = x_sum_sq.data();
@@ -176,13 +168,8 @@ public:
             layers_.push_back(new Tanh<T>());
 
             // Hidden -> Output
-            // 128 -> 1
-            // DSL outputs same dim, so we need a slice or a final Dense?
-            // "Custom Layers against Standard MLPs".
-            // Usually the final projection is Dense.
-            // Or we use DSL and slice.
-            // Let's use Dense for final projection to 1.
-            layers_.push_back(new DenseWithCurvature<T>(hidden_dim, 1));
+            // Initialize last bias to non-zero to avoid trivial solution (psi=0) trap
+            layers_.push_back(new DenseWithCurvature<T>(hidden_dim, 1, 0.1));
         } else {
             std::cout << "Using Standard MLP (Dense)" << std::endl;
             layers_.push_back(new DenseWithCurvature<T>(1, hidden_dim));
@@ -194,7 +181,8 @@ public:
             layers_.push_back(new DenseWithCurvature<T>(hidden_dim, hidden_dim));
             layers_.push_back(new Tanh<T>());
 
-            layers_.push_back(new DenseWithCurvature<T>(hidden_dim, 1));
+            // Initialize last bias to non-zero
+            layers_.push_back(new DenseWithCurvature<T>(hidden_dim, 1, 0.1));
         }
     }
 
@@ -250,7 +238,7 @@ private:
 };
 
 // Analytical Solution
-double get_analytical_psi(double x, int n=30) {
+double get_analytical_psi(double x, int n) {
     // Cn = 1 / sqrt(2^n * n! * sqrt(pi))
     // We compute log first
     double log_fact = 0;
@@ -271,6 +259,9 @@ double get_analytical_psi(double x, int n=30) {
 // Training Loop
 template <typename T>
 void train_benchmark(bool use_custom, int epochs=2000) {
+    int quantum_n = 1; // n=1 is simple enough to converge
+    T E = static_cast<T>(quantum_n) + 0.5;
+
     QuantumPINN<T> model(use_custom);
     // Use lower learning rate for DeepSpectralLinear to prevent divergence
     T lr = use_custom ? 1e-4 : 1e-3;
@@ -281,13 +272,6 @@ void train_benchmark(bool use_custom, int epochs=2000) {
     // Re-initialize DeepSpectralLinear scales to be smaller to avoid explosion at start
     if (use_custom) {
         auto params = model.parameters();
-        // Standard MLP has 8 params (4 weights, 4 biases)
-        // DSL model: DSL(4*2=8 params if depth=4? No, depth=4 means 4 scales)
-        // DSL: 4 scales. Tanh: 0.
-        // 3 DSL layers * 4 scales = 12 scales.
-        // Final Dense: 2 params.
-        // Total 14 params.
-        // We iterate and if size > 1 (scales are vector of size dim), we scale them down.
         for (auto* p : params) {
             if (p->size() > 1) { // Likely a scale vector or weight matrix
                 // Scale down current random values
@@ -301,9 +285,8 @@ void train_benchmark(bool use_custom, int epochs=2000) {
 
     size_t batch_size = 500;
     T epsilon = 1e-3; // Finite Difference step
-    T E = 30.5;
 
-    std::cout << "Starting Training (" << epochs << " epochs)..." << std::endl;
+    std::cout << "Starting Training (n=" << quantum_n << ", E=" << E << ", " << epochs << " epochs)..." << std::endl;
 
     // Domain [-10, 10]
     std::random_device rd;
@@ -330,16 +313,7 @@ void train_benchmark(bool use_custom, int epochs=2000) {
         Tensor<T> psi_l = model.forward(x_l);
         Tensor<T> psi_r = model.forward(x_r);
 
-        if (psi_r.shape() != psi_c.shape()) {
-            std::cerr << "Shape Mismatch! psi_r: ";
-            for(auto s : psi_r.shape()) std::cerr << s << " ";
-            std::cerr << " psi_c: ";
-            for(auto s : psi_c.shape()) std::cerr << s << " ";
-            std::cerr << std::endl;
-        }
-
         // psi'' approx (psi_r - 2psi_c + psi_l) / eps^2
-        std::cerr << "Computing d2psi..." << std::endl;
         Tensor<T> term1 = psi_c * 2.0;
         Tensor<T> diff1 = psi_r - term1;
         Tensor<T> sum1 = diff1 + psi_l;
@@ -361,8 +335,6 @@ void train_benchmark(bool use_custom, int epochs=2000) {
         for(size_t i=0; i<batch_size; ++i) norm_sq += psi_ptr[i] * psi_ptr[i];
         norm_sq = (norm_sq / batch_size) * domain_L;
 
-        T loss_norm_val = std::pow(norm_sq - 1.0, 2);
-
         // Backprop
         // dL/d(res) = 2 * res / batch_size
         Tensor<T> grad_res = res * (2.0 / batch_size);
@@ -375,10 +347,10 @@ void train_benchmark(bool use_custom, int epochs=2000) {
         Tensor<T> grad_c = grad_res * V_minus_E;
         grad_c = grad_c + grad_res * (1.0/(epsilon*epsilon));
 
-        // dL/d(psi_l) = grad_res * (-0.5 / eps^2)
+        // dL/d(psi_l) = grad_res * (-0.5 / (epsilon*epsilon));
         Tensor<T> grad_l = grad_res * (-0.5 / (epsilon*epsilon));
 
-        // dL/d(psi_r) = grad_res * (-0.5 / eps^2)
+        // dL/d(psi_r) = grad_res * (-0.5 / (epsilon*epsilon));
         Tensor<T> grad_r = grad_res * (-0.5 / (epsilon*epsilon));
 
         // Add Normalization Gradient to center
@@ -390,8 +362,7 @@ void train_benchmark(bool use_custom, int epochs=2000) {
         Tensor<T> grad_c_norm = psi_c * grad_norm_scale;
 
         // Combine gradients for center
-        grad_c = grad_c + grad_c_norm; // Actually this applies 0.1 weight if we want?
-        // Let's stick to 1.0 weight for now or add small weight.
+        grad_c = grad_c + grad_c_norm;
 
         // We need to run backward 3 times?
         // Yes, but we need to accumulate gradients in the optimizer/layers.
@@ -462,9 +433,9 @@ void train_benchmark(bool use_custom, int epochs=2000) {
             // dL/dr = 2r / B
             T gr = 2.0 * r / batch_size;
 
-            T g_pl = gr * (-0.5 / (epsilon*epsilon));
-            T g_pr = gr * (-0.5 / (epsilon*epsilon));
-            T g_pc = gr * (0.5 * 2.0 / (epsilon*epsilon) + pot);
+            T g_pl = gr * (-0.5 / (epsilon * epsilon));
+            T g_pr = gr * (-0.5 / (epsilon * epsilon));
+            T g_pc = gr * (0.5 * 2.0 / (epsilon * epsilon) + pot);
 
             // Norm penalty (only on center?)
             // We used center for norm.
@@ -540,7 +511,7 @@ void train_benchmark(bool use_custom, int epochs=2000) {
     for(size_t i=0; i<x_eval.size(); ++i) {
         T xv = x_eval[i];
         T pv = pred_ptr[i];
-        T tv = get_analytical_psi(xv, 30);
+        T tv = get_analytical_psi(xv, quantum_n);
 
         // Note: Sign might be flipped.
         // We handle sign flip in post-processing or assume user plots abs/squared.
