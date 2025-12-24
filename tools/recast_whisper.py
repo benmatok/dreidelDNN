@@ -152,7 +152,35 @@ def recast_whisper(model_name="openai/whisper-tiny", min_dim=256, batch_size=4, 
     print(f"Generating synthetic distillation data (Batch={batch_size}, Seq={seq_len})...")
 
     # Create synthetic input
-    mel_input = torch.randn(batch_size, config.num_mel_bins, seq_len)
+    print("Generating human-like harmonic noise with distortion...")
+    # 1. Base noise (background)
+    mel_input = torch.randn(batch_size, config.num_mel_bins, seq_len) * 0.5
+
+    # 2. Add Harmonics (simulate formants/pitch)
+    # Time axis
+    t = torch.linspace(0, 4 * np.pi, seq_len)
+
+    for b in range(batch_size):
+        # Random pitch movement
+        base_freq = np.random.uniform(5.0, 20.0)
+
+        for h in range(1, 8):  # 8 Harmonics
+            freq_bin = int(base_freq * h)
+            if freq_bin >= config.num_mel_bins: break
+
+            # Amplitude modulation (speech envelope)
+            envelope = torch.abs(torch.sin(t * np.random.uniform(0.5, 2.0)))
+
+            # Add the harmonic line (broadcast over time)
+            # We need to act on the specific frequency bin across all time steps
+            mel_input[b, freq_bin:freq_bin + 2, :] += 2.0 * envelope.unsqueeze(0)
+
+    # 3. Distortion
+    mel_input = torch.tanh(mel_input) * 2.0  # Soft clipping
+
+    # 4. Add more noise
+    mel_input += torch.randn(batch_size, config.num_mel_bins, seq_len) * 0.2
+
     decoder_input_ids = torch.randint(0, config.vocab_size, (batch_size, 50))
 
     captured_data = {}
@@ -234,7 +262,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="openai/whisper-tiny", help="HuggingFace model name")
     parser.add_argument("--min-dim", type=int, default=256, help="Minimum spectral dimension")
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
     parser.add_argument("--seq-len", type=int, default=3000, help="Sequence length (audio frames)")
     parser.add_argument("--output-weights", type=str, default="whisper_spectral_weights.bin")
     parser.add_argument("--output-data", type=str, default="whisper_layer_data.bin")
