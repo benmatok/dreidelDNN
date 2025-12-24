@@ -32,7 +32,7 @@ void read_tensor_util(std::ifstream& f, Tensor<T>& t) {
 int main(int argc, char** argv) {
     std::string weights_path = "whisper_spectral_weights.bin";
     std::string data_path = "whisper_layer_data.bin";
-    int epochs = 1;
+    int epochs = 50;
     float lr = 0.1; // Reduced from 1.0 to prevent divergence
 
     for (int i = 1; i < argc; ++i) {
