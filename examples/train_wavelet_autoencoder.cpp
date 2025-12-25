@@ -284,9 +284,56 @@ private:
     layers::DeepSpectralLinear<T>* decoder_dsl_;
 };
 
+// Helper to save PGM
+void save_pgm_grid(const std::string& filename, const std::vector<std::vector<float>>& images, int rows, int cols, int size) {
+    int total_width = cols * size;
+    int total_height = rows * size;
+
+    std::ofstream out(filename, std::ios::binary);
+    out << "P5\n" << total_width << " " << total_height << "\n255\n";
+
+    std::vector<unsigned char> buffer(total_width * total_height);
+
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            int img_idx = r * cols + c;
+            if (img_idx >= images.size()) continue;
+
+            const auto& img = images[img_idx];
+
+            // Find min/max for normalization
+            float min_val = 1e9, max_val = -1e9;
+            for (float v : img) {
+                if (v < min_val) min_val = v;
+                if (v > max_val) max_val = v;
+            }
+            if (max_val == min_val) max_val = min_val + 1e-6;
+
+            for (int y = 0; y < size; ++y) {
+                for (int x = 0; x < size; ++x) {
+                    float val = img[y * size + x];
+                    // Normalize to 0-255
+                    float norm = (val - min_val) / (max_val - min_val);
+                    // Handle binary/quantized case nicely (0 or 1)
+                    if (max_val == 1.0f && min_val == -1.0f) {
+                         // Already roughly in range, but let's just use min/max
+                    }
+
+                    int p_r = r * size + y;
+                    int p_c = c * size + x;
+
+                    buffer[p_r * total_width + p_c] = static_cast<unsigned char>(std::min(255.0f, std::max(0.0f, norm * 255.0f)));
+                }
+            }
+        }
+    }
+    out.write(reinterpret_cast<const char*>(buffer.data()), buffer.size());
+    out.close();
+}
+
 // Training Loop
 template <typename T>
-void train(size_t iterations, size_t batch_size) {
+void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
     size_t dim = 4096; // 64x64
     WaveletAutoencoder<T> model(dim);
     optim::DiagonalNewton<T> optimizer(1e-4); // Low LR for spectral
@@ -294,98 +341,130 @@ void train(size_t iterations, size_t batch_size) {
     // Register params
     optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
 
-    // Init scales to small values to avoid explosion
-    auto params = model.parameters();
-    for(auto* p : params) {
-        if(p->size() > 1) { // Likely scale vector
-             // DeepSpectralLinear initializes to 1/sqrt(dim).
-             // 1/64 = 0.015. This is fine.
-             // Benchmark used 0.1 explicitly. Let's trust default or set if needed.
+    std::cout << "Starting training: " << epochs << " epochs, " << batches_per_epoch << " batches/epoch, batch " << batch_size << std::endl;
+
+    for (size_t epoch = 0; epoch < epochs; ++epoch) {
+        T epoch_mse = 0;
+        T epoch_reg = 0;
+
+        for (size_t b = 0; b < batches_per_epoch; ++b) {
+            Tensor<T> x({batch_size, dim});
+            WaveletGenerator2D<T>::generate(x, batch_size);
+
+            optimizer.zero_grad();
+
+            Tensor<T> z; // Latent
+            Tensor<T> y = model.forward_train(x, z);
+
+            // 1. Reconstruction Loss (MSE)
+            Tensor<T> diff = y + (x * -1.0);
+
+            T mse = 0;
+            {
+                 const T* d_ptr = diff.data();
+                 for(size_t k=0; k<diff.size(); ++k) mse += d_ptr[k]*d_ptr[k];
+                 mse /= diff.size();
+            }
+
+            Tensor<T> grad_recon = diff * (2.0 / diff.size());
+
+            // 2. Binary Regularization
+            Tensor<T> grad_reg_z({batch_size, dim});
+            T reg_loss = 0;
+
+            const T* z_ptr = z.data();
+            T* gz_ptr = grad_reg_z.data();
+            T reg_lambda = 0.1;
+
+            for(size_t k=0; k<z.size(); ++k) {
+                T val = z_ptr[k];
+                T term = val*val - 1.0;
+                reg_loss += term*term;
+
+                gz_ptr[k] = reg_lambda * (4.0 * val * term) / z.size();
+            }
+            reg_loss /= z.size();
+            reg_loss *= reg_lambda;
+
+            model.backward_with_reg(grad_recon, grad_reg_z);
+
+            optimizer.step();
+
+            epoch_mse += mse;
+            epoch_reg += reg_loss;
+        }
+
+        if (epoch % 10 == 0) {
+            std::cout << "Epoch " << epoch << ": MSE=" << epoch_mse/batches_per_epoch << " Reg=" << epoch_reg/batches_per_epoch << std::endl;
         }
     }
 
-    std::cout << "Starting training: " << iterations << " iterations, batch " << batch_size << std::endl;
+    // --- Testing and Visualization ---
+    std::cout << "Testing Compression..." << std::endl;
+    size_t test_size = 8;
+    Tensor<T> test_x({test_size, dim});
+    WaveletGenerator2D<T>::generate(test_x, test_size);
 
-    for (size_t i = 0; i < iterations; ++i) {
-        Tensor<T> x({batch_size, dim});
-        WaveletGenerator2D<T>::generate(x, batch_size);
+    Tensor<T> test_z = model.encode(test_x);
+    Tensor<T> test_rec = model.decode(test_z); // Float reconstruction
 
-        optimizer.zero_grad();
-
-        Tensor<T> z; // Latent
-        Tensor<T> y = model.forward_train(x, z);
-
-        // 1. Reconstruction Loss (MSE)
-        // L_recon = mean((y - x)^2)
-        // dL/dy = 2(y-x)/N
-
-        Tensor<T> diff = y + (x * -1.0); // y - x
-
-        // Calc MSE for reporting
-        T mse = 0;
-        {
-             const T* d_ptr = diff.data();
-             for(size_t k=0; k<diff.size(); ++k) mse += d_ptr[k]*d_ptr[k];
-             mse /= diff.size();
-        }
-
-        // Grad Recon
-        Tensor<T> grad_recon = diff * (2.0 / diff.size());
-
-        // 2. Binary Regularization
-        // L_reg = mean((z^2 - 1)^2)
-        // dL/dz = 2 * (z^2 - 1) * 2z = 4z(z^2 - 1)
-
-        // Need to calculate dL/dz
-        Tensor<T> grad_reg_z({batch_size, dim});
-        T reg_loss = 0;
-
-        const T* z_ptr = z.data();
-        T* gz_ptr = grad_reg_z.data();
-        T reg_lambda = 0.1; // Weight for regularization
-
-        for(size_t k=0; k<z.size(); ++k) {
-            T val = z_ptr[k];
-            T term = val*val - 1.0;
-            reg_loss += term*term;
-
-            // Derivative: 4 * z * (z^2 - 1)
-            // Normalize by size? Yes, usually mean.
-            gz_ptr[k] = reg_lambda * (4.0 * val * term) / z.size();
-        }
-        reg_loss /= z.size();
-        reg_loss *= reg_lambda;
-
-        // Backward
-        model.backward_with_reg(grad_recon, grad_reg_z);
-
-        optimizer.step();
-
-        if (i % 10 == 0) {
-            std::cout << "Iter " << i << ": MSE=" << mse << " Reg=" << reg_loss << " Total=" << mse+reg_loss << std::endl;
-        }
+    // Quantize z
+    Tensor<T> test_z_q = test_z;
+    T* zq_ptr = test_z_q.data();
+    for(size_t i=0; i<test_z_q.size(); ++i) {
+        // Round to {-1, 1}
+        zq_ptr[i] = (zq_ptr[i] > 0) ? 1.0f : -1.0f;
     }
 
-    // Save a sample
-    std::cout << "Saving reconstruction sample..." << std::endl;
-    Tensor<T> val_x({1, dim});
-    WaveletGenerator2D<T>::generate(val_x, 1);
-    Tensor<T> val_z;
-    Tensor<T> val_y = model.forward_train(val_x, val_z);
+    Tensor<T> test_rec_q = model.decode(test_z_q); // Quantized reconstruction
 
-    std::ofstream out("wavelet_reconstruction.csv");
-    out << "idx,original,latent,reconstructed\n";
-    const T* orig = val_x.data();
-    const T* lat = val_z.data();
-    const T* rec = val_y.data();
-    for(size_t k=0; k<dim; ++k) {
-        out << k << "," << orig[k] << "," << lat[k] << "," << rec[k] << "\n";
+    // Compute Quantized MSE
+    Tensor<T> diff_q = test_rec_q + (test_x * -1.0);
+    T mse_q = 0;
+    const T* dq_ptr = diff_q.data();
+    for(size_t i=0; i<diff_q.size(); ++i) mse_q += dq_ptr[i]*dq_ptr[i];
+    mse_q /= diff_q.size();
+
+    std::cout << "Quantized MSE: " << mse_q << std::endl;
+
+    // Visualize
+    std::vector<std::vector<float>> vis_images;
+    const T* x_ptr = test_x.data();
+    const T* z_ptr = test_z.data();
+    const T* r_ptr = test_rec.data();
+    const T* rq_ptr = test_rec_q.data();
+
+    // We visualize 8 samples, 4 rows: Original, Latent, Rec Float, Rec Quant
+    // 1. Originals
+    for(int i=0; i<8; ++i) {
+        std::vector<float> img(dim);
+        for(int j=0; j<dim; ++j) img[j] = x_ptr[i*dim + j];
+        vis_images.push_back(img);
     }
-    out.close();
-    std::cout << "Saved to wavelet_reconstruction.csv" << std::endl;
+    // 2. Latents (reshaped to 64x64)
+    for(int i=0; i<8; ++i) {
+        std::vector<float> img(dim);
+        for(int j=0; j<dim; ++j) img[j] = z_ptr[i*dim + j];
+        vis_images.push_back(img);
+    }
+    // 3. Rec Float
+    for(int i=0; i<8; ++i) {
+        std::vector<float> img(dim);
+        for(int j=0; j<dim; ++j) img[j] = r_ptr[i*dim + j];
+        vis_images.push_back(img);
+    }
+    // 4. Rec Quant
+    for(int i=0; i<8; ++i) {
+        std::vector<float> img(dim);
+        for(int j=0; j<dim; ++j) img[j] = rq_ptr[i*dim + j];
+        vis_images.push_back(img);
+    }
+
+    save_pgm_grid("reconstruction_grid.pgm", vis_images, 4, 8, 64);
+    std::cout << "Saved visualization to reconstruction_grid.pgm" << std::endl;
 }
 
 int main() {
-    train<float>(100, 16); // 100 iters, batch 16
+    train<float>(1000, 1, 16); // 1000 epochs, 1 batch/epoch (1000 total batches)
     return 0;
 }
