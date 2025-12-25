@@ -22,24 +22,86 @@ public:
     static void fwht_1d(T* data, size_t N) {
         using Ops = hal::ActiveOps;
 
-        for (size_t len = 1; len < N; len <<= 1) {
-            for (size_t j = 0; j < N; j += 2 * len) {
-                size_t k = 0;
-                if constexpr (std::is_same_v<T, float>) {
-                    for (; k + Ops::SIMD_WIDTH <= len; k += Ops::SIMD_WIDTH) {
-                        auto u_vec = Ops::load(data + j + k);
-                        auto v_vec = Ops::load(data + j + k + len);
-                        Ops::butterfly(u_vec, v_vec);
-                        Ops::store(data + j + k, u_vec);
-                        Ops::store(data + j + k + len, v_vec);
+        size_t len = 1;
+        while (len < N) {
+            // Attempt Radix-4 (Fuse 2 layers: len and 2*len)
+            // Requires 4*len <= N
+            if (len * 4 <= N) {
+                size_t len2 = len * 2;
+                size_t step = len * 4;
+
+                for (size_t j = 0; j < N; j += step) {
+                    size_t k = 0;
+                    if constexpr (std::is_same_v<T, float>) {
+                        for (; k + Ops::SIMD_WIDTH <= len; k += Ops::SIMD_WIDTH) {
+                            // Load 4 blocks
+                            auto u = Ops::load(data + j + k);
+                            auto v = Ops::load(data + j + k + len);
+                            auto w = Ops::load(data + j + k + len2);
+                            auto z = Ops::load(data + j + k + len2 + len);
+
+                            // Layer 1 (len)
+                            // u' = u+v, v' = u-v
+                            // w' = w+z, z' = w-z
+                            Ops::butterfly(u, v);
+                            Ops::butterfly(w, z);
+
+                            // Layer 2 (len2)
+                            // u'' = u'+w', w'' = u'-w'
+                            // v'' = v'+z', z'' = v'-z'
+                            Ops::butterfly(u, w);
+                            Ops::butterfly(v, z);
+
+                            // Store
+                            Ops::store(data + j + k, u);
+                            Ops::store(data + j + k + len, v);
+                            Ops::store(data + j + k + len2, w);
+                            Ops::store(data + j + k + len2 + len, z);
+                        }
+                    }
+
+                    // Scalar fallback / Small len
+                    for (; k < len; ++k) {
+                        T u = data[j + k];
+                        T v = data[j + k + len];
+                        T w = data[j + k + len2];
+                        T z = data[j + k + len2 + len];
+
+                        // L1
+                        T u1 = u + v;
+                        T v1 = u - v;
+                        T w1 = w + z;
+                        T z1 = w - z;
+
+                        // L2
+                        data[j + k] = u1 + w1;
+                        data[j + k + len] = v1 + z1;
+                        data[j + k + len2] = u1 - w1;
+                        data[j + k + len2 + len] = v1 - z1;
                     }
                 }
-                for (; k < len; ++k) {
-                    T u = data[j + k];
-                    T v = data[j + k + len];
-                    data[j + k] = u + v;
-                    data[j + k + len] = u - v;
+                len *= 4;
+            } else {
+                // Radix-2 (Single layer)
+                for (size_t j = 0; j < N; j += 2 * len) {
+                    size_t k = 0;
+                    if constexpr (std::is_same_v<T, float>) {
+                        for (; k + Ops::SIMD_WIDTH <= len; k += Ops::SIMD_WIDTH) {
+                            auto u_vec = Ops::load(data + j + k);
+                            auto v_vec = Ops::load(data + j + k + len);
+                            Ops::butterfly(u_vec, v_vec);
+                            Ops::store(data + j + k, u_vec);
+                            Ops::store(data + j + k + len, v_vec);
+                        }
+                    }
+                    for (; k < len; ++k) {
+                        T u = data[j + k];
+                        T v = data[j + k + len];
+                        data[j + k] = u + v;
+                        data[j + k + len] = u - v;
+                    }
                 }
+                len *= 2;
             }
         }
     }
