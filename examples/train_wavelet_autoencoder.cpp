@@ -284,15 +284,19 @@ private:
     layers::DeepSpectralLinear<T>* decoder_dsl_;
 };
 
-// Helper to save PGM
-void save_pgm_grid(const std::string& filename, const std::vector<std::vector<float>>& images, int rows, int cols, int size) {
-    int total_width = cols * size;
-    int total_height = rows * size;
+// Helper to save SVG grid
+void save_svg_grid(const std::string& filename, const std::vector<std::vector<float>>& images, int rows, int cols, int size) {
+    std::ofstream out(filename);
 
-    std::ofstream out(filename, std::ios::binary);
-    out << "P5\n" << total_width << " " << total_height << "\n255\n";
+    int scale = 2; // Scale up for visibility
+    int padding = 10;
+    int img_w = size * scale;
+    int img_h = size * scale;
+    int total_width = cols * (img_w + padding) + padding;
+    int total_height = rows * (img_h + padding) + padding;
 
-    std::vector<unsigned char> buffer(total_width * total_height);
+    out << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << total_width << "\" height=\"" << total_height << "\">\n";
+    out << "<rect width=\"100%\" height=\"100%\" fill=\"white\" />\n";
 
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
@@ -309,25 +313,24 @@ void save_pgm_grid(const std::string& filename, const std::vector<std::vector<fl
             }
             if (max_val == min_val) max_val = min_val + 1e-6;
 
+            int start_x = padding + c * (img_w + padding);
+            int start_y = padding + r * (img_h + padding);
+
+            // Draw pixels
             for (int y = 0; y < size; ++y) {
                 for (int x = 0; x < size; ++x) {
                     float val = img[y * size + x];
-                    // Normalize to 0-255
                     float norm = (val - min_val) / (max_val - min_val);
-                    // Handle binary/quantized case nicely (0 or 1)
-                    if (max_val == 1.0f && min_val == -1.0f) {
-                         // Already roughly in range, but let's just use min/max
-                    }
+                    int gray = static_cast<int>(std::min(255.0f, std::max(0.0f, norm * 255.0f)));
 
-                    int p_r = r * size + y;
-                    int p_c = c * size + x;
-
-                    buffer[p_r * total_width + p_c] = static_cast<unsigned char>(std::min(255.0f, std::max(0.0f, norm * 255.0f)));
+                    out << "<rect x=\"" << start_x + x*scale << "\" y=\"" << start_y + y*scale
+                        << "\" width=\"" << scale << "\" height=\"" << scale
+                        << "\" fill=\"rgb(" << gray << "," << gray << "," << gray << ")\" />\n";
                 }
             }
         }
     }
-    out.write(reinterpret_cast<const char*>(buffer.data()), buffer.size());
+    out << "</svg>\n";
     out.close();
 }
 
@@ -408,12 +411,12 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
     Tensor<T> test_z = model.encode(test_x);
     Tensor<T> test_rec = model.decode(test_z); // Float reconstruction
 
-    // Quantize z
+    // Quantize z using sign function
     Tensor<T> test_z_q = test_z;
     T* zq_ptr = test_z_q.data();
     for(size_t i=0; i<test_z_q.size(); ++i) {
-        // Round to {-1, 1}
-        zq_ptr[i] = (zq_ptr[i] > 0) ? 1.0f : -1.0f;
+        // Sign function: -1 for x < 0, 1 for x >= 0
+        zq_ptr[i] = (zq_ptr[i] >= 0) ? 1.0f : -1.0f;
     }
 
     Tensor<T> test_rec_q = model.decode(test_z_q); // Quantized reconstruction
@@ -460,8 +463,8 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
         vis_images.push_back(img);
     }
 
-    save_pgm_grid("reconstruction_grid.pgm", vis_images, 4, 8, 64);
-    std::cout << "Saved visualization to reconstruction_grid.pgm" << std::endl;
+    save_svg_grid("reconstruction_grid.svg", vis_images, 4, 8, 64);
+    std::cout << "Saved visualization to reconstruction_grid.svg" << std::endl;
 }
 
 int main() {
