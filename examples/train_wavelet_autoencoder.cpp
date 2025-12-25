@@ -387,30 +387,17 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
 
             Tensor<T> grad_recon = diff * (2.0 / diff.size());
 
-            // 2. Binary Regularization
+            // 2. Binary Regularization (DISABLED)
+            // Just train on MSE as requested
             Tensor<T> grad_reg_z({batch_size, dim});
+            grad_reg_z.fill(0); // No regularization gradient
+
             T reg_loss = 0;
             T avg_abs_z = 0;
-
             const T* z_ptr = z.data();
-            T* gz_ptr = grad_reg_z.data();
-            T reg_lambda = 5.0;
-
             for(size_t k=0; k<z.size(); ++k) {
-                T val = z_ptr[k];
-                avg_abs_z += std::abs(val);
-                // Power 10 regularization: (z^2 - 1)^10
-                T term = val*val - 1.0;
-                T term_pow9 = std::pow(term, 9);
-                T term_pow10 = term * term_pow9;
-
-                reg_loss += term_pow10;
-
-                // dL/dz = 10 * (z^2 - 1)^9 * 2z = 20 * z * (z^2 - 1)^9
-                gz_ptr[k] = reg_lambda * (20.0 * val * term_pow9) / z.size();
+                avg_abs_z += std::abs(z_ptr[k]);
             }
-            reg_loss /= z.size();
-            reg_loss *= reg_lambda;
             avg_abs_z /= z.size();
             last_avg_abs_z = avg_abs_z;
 
