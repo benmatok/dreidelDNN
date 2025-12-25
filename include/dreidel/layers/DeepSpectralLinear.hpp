@@ -35,10 +35,6 @@ public:
             curv_scales_.emplace_back(std::vector<size_t>{1, dim});
 
             // Initialize scales to be close to 1 (identity flow) or random.
-            // FWHT scales energy by N. To preserve variance, we usually scale by 1/sqrt(N) or 1/N.
-            // Actually, if we use standard FWHT, it is orthogonal up to scale factor sqrt(N).
-            // If we want unitary, we need scale 1/sqrt(N).
-            // We initialize with mean 0 and stddev 1/sqrt(dim) to preserve variance across layers.
             T stddev = 1.0 / std::sqrt(static_cast<T>(dim));
             scales_.back().random(0, stddev);
 
@@ -114,11 +110,6 @@ public:
             algo::WHT::FWHT(x);
 
             // Save input for next block (which is current output x)
-            // But we need Input for Backward.
-            // intermediate_activations_[k] stores Input to Block k.
-            // Wait, we stored Input to Block 0 above.
-            // In loop k=0: We compute Output of Block 0.
-            // This Output is Input to Block 1.
             if (k < depth_ - 1) {
                 intermediate_activations_[k+1] = x;
             }
