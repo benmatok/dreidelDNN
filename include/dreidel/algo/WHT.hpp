@@ -131,7 +131,7 @@ public:
             }
         }
 
-        #pragma omp parallel for
+        #pragma omp parallel for if(total_elements > 16384)
         for (long i = 0; i < (long)outer_dims; ++i) {
             T* data_ptr = tensor.data() + i * N;
             fwht_1d(data_ptr, N);
