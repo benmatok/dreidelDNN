@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <chrono>
 #include <omp.h>
+#include <sys/stat.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../include/stb_image_write.h"
@@ -19,7 +20,7 @@
 
 using namespace dreidel;
 
-// Tanh Activation (copied from benchmark_autoencoder.cpp)
+// Tanh Activation
 template <typename T>
 class Tanh : public layers::Layer<T> {
 public:
@@ -43,24 +44,19 @@ private:
 };
 
 // 2D Wavelet Generator
-// Generates 64x64 patches flattened to 4096
 template <typename T>
 class WaveletGenerator2D {
 public:
     static void generate(Tensor<T>& batch, size_t batch_size) {
-        // Output shape: (batch_size, 4096)
-        // We assume batch is already allocated with correct size
         T* ptr = batch.data();
         size_t dim = 4096;
-        size_t size = 64; // 64x64
+        size_t size = 64;
 
         #pragma omp parallel
         {
-            // Thread-local RNG
             std::random_device rd;
             std::mt19937 gen(rd() + omp_get_thread_num());
 
-            // Expanded distribution: 0-29
             std::uniform_int_distribution<int> dist_type(0, 29);
             std::uniform_real_distribution<T> dist_pos(20.0, 44.0);
             std::uniform_real_distribution<T> dist_scale(3.0, 12.0);
@@ -73,34 +69,26 @@ public:
                 int type = dist_type(gen);
                 size_t offset = b * dim;
 
-                if (type < 5) {
-                    // Gabor
+                if (type < 5) { // Gabor
                     T cx = dist_pos(gen);
                     T cy = dist_pos(gen);
                     T sx = dist_scale(gen);
                     T sy = sx * std::uniform_real_distribution<T>(0.5, 1.5)(gen);
                     T theta = dist_angle(gen);
-                    T freq = dist_freq(gen);
-                    T psi = dist_phase(gen);
-                    generate_gabor(ptr + offset, size, cx, cy, sx, sy, theta, freq, psi);
-                } else if (type < 10) {
-                    // Curvelet-like (High Aspect Ratio)
+                    generate_gabor(ptr + offset, size, cx, cy, sx, sy, theta, dist_freq(gen), dist_phase(gen));
+                } else if (type < 10) { // Curvelet-like
                     T cx = dist_pos(gen);
                     T cy = dist_pos(gen);
-                    T sx = dist_scale(gen) * 1.5; // Longer
-                    T sy = sx * 0.1; // Very thin
+                    T sx = dist_scale(gen) * 1.5;
+                    T sy = sx * 0.1;
                     T theta = dist_angle(gen);
-                    T freq = dist_freq(gen);
-                    T psi = dist_phase(gen);
-                    generate_gabor(ptr + offset, size, cx, cy, sx, sy, theta, freq, psi);
-                } else if (type < 15) {
-                    // Mexican Hat 2D (Isotropic or Anisotropic)
+                    generate_gabor(ptr + offset, size, cx, cy, sx, sy, theta, dist_freq(gen), dist_phase(gen));
+                } else if (type < 15) { // Mexican Hat
                     T cx = dist_pos(gen);
                     T cy = dist_pos(gen);
                     T s = dist_scale(gen);
                     generate_mexican_hat(ptr + offset, size, cx, cy, s);
-                } else if (type < 20) {
-                    // High Complexity: Sum of 3 random wavelets
+                } else if (type < 20) { // High Complexity
                     std::fill(ptr + offset, ptr + offset + dim, 0);
                     for(int k=0; k<3; ++k) {
                         int subtype = std::uniform_int_distribution<int>(0, 2)(gen);
@@ -120,8 +108,7 @@ public:
                         for(size_t i=0; i<dim; ++i) ptr[offset+i] += temp[i];
                     }
                     for(size_t i=0; i<dim; ++i) ptr[offset+i] /= 1.5;
-                } else if (type < 25) {
-                    // Texture: Interference pattern (Sum of 5 cosines)
+                } else if (type < 25) { // Texture
                     std::fill(ptr + offset, ptr + offset + dim, 0);
                     for(int k=0; k<5; ++k) {
                         T kx = std::uniform_real_distribution<T>(0.1, 0.8)(gen);
@@ -134,8 +121,7 @@ public:
                         }
                     }
                     for(size_t i=0; i<dim; ++i) ptr[offset+i] /= 2.5;
-                } else {
-                    // Geometric: Rectangles or Lines
+                } else { // Geometric
                     std::fill(ptr + offset, ptr + offset + dim, -1.0f);
                     T cx = dist_pos(gen);
                     T cy = dist_pos(gen);
@@ -144,7 +130,6 @@ public:
                     T angle = dist_angle(gen);
                     T ca = std::cos(angle);
                     T sa = std::sin(angle);
-
                     for(size_t y=0; y<size; ++y) {
                         for(size_t x=0; x<size; ++x) {
                             T dx = (T)x - cx;
@@ -158,14 +143,9 @@ public:
                     }
                 }
 
-                // Normalize batch item to [-1, 1]
                 T max_val = 0;
-                for(size_t i=0; i<dim; ++i) {
-                    max_val = std::max(max_val, std::abs(ptr[offset+i]));
-                }
-                if (max_val > 1e-6) {
-                    for(size_t i=0; i<dim; ++i) ptr[offset+i] /= max_val;
-                }
+                for(size_t i=0; i<dim; ++i) max_val = std::max(max_val, std::abs(ptr[offset+i]));
+                if (max_val > 1e-6) for(size_t i=0; i<dim; ++i) ptr[offset+i] /= max_val;
             }
         }
     }
@@ -174,18 +154,14 @@ private:
     static void generate_gabor(T* buffer, size_t size, T cx, T cy, T sx, T sy, T theta, T freq, T psi) {
         T cos_t = std::cos(theta);
         T sin_t = std::sin(theta);
-
         for(size_t y=0; y<size; ++y) {
             for(size_t x=0; x<size; ++x) {
                 T dx = (T)x - cx;
                 T dy = (T)y - cy;
-
                 T xp = dx * cos_t + dy * sin_t;
                 T yp = -dx * sin_t + dy * cos_t;
-
                 T env = std::exp(-(xp*xp)/(2*sx*sx) - (yp*yp)/(2*sy*sy));
                 T carrier = std::cos(2*3.14159 * freq * xp + psi);
-
                 buffer[y*size + x] = env * carrier;
             }
         }
@@ -198,7 +174,6 @@ private:
                 T dy = (T)y - cy;
                 T r2 = dx*dx + dy*dy;
                 T s2 = sigma*sigma;
-
                 buffer[y*size + x] = (1.0 - r2/s2) * std::exp(-r2/(2*s2));
             }
         }
@@ -210,48 +185,40 @@ template <typename T>
 class WaveletAutoencoder {
 public:
     WaveletAutoencoder(size_t dim) {
-        // Encoder: DSL -> GELU -> DSL -> Tanh
-        enc_1_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        // Keep typed pointers for saving/loading
+        dsl_enc_1_ = new layers::DeepSpectralLinear<T>(dim, 8);
         enc_act_1_ = new layers::GELU<T>();
-        enc_2_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        dsl_enc_2_ = new layers::DeepSpectralLinear<T>(dim, 8);
         enc_act_2_ = new Tanh<T>();
 
-        // Decoder: DSL -> GELU -> DSL
-        dec_1_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        dsl_dec_1_ = new layers::DeepSpectralLinear<T>(dim, 8);
         dec_act_1_ = new layers::GELU<T>();
-        dec_2_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        dsl_dec_2_ = new layers::DeepSpectralLinear<T>(dim, 8);
 
-        layers_.push_back(enc_1_);
+        layers_.push_back(dsl_enc_1_);
         layers_.push_back(enc_act_1_);
-        layers_.push_back(enc_2_);
+        layers_.push_back(dsl_enc_2_);
         layers_.push_back(enc_act_2_);
-
-        layers_.push_back(dec_1_);
+        layers_.push_back(dsl_dec_1_);
         layers_.push_back(dec_act_1_);
-        layers_.push_back(dec_2_);
+        layers_.push_back(dsl_dec_2_);
     }
 
     ~WaveletAutoencoder() {
         for(auto l : layers_) delete l;
     }
 
-    // Returns latent code z
     Tensor<T> encode(const Tensor<T>& x) {
-        Tensor<T> h = enc_1_->forward(x);
+        Tensor<T> h = dsl_enc_1_->forward(x);
         h = enc_act_1_->forward(h);
-        h = enc_2_->forward(h);
+        h = dsl_enc_2_->forward(h);
         return enc_act_2_->forward(h);
     }
 
-    // Returns reconstruction
     Tensor<T> decode(const Tensor<T>& z) {
-        Tensor<T> h = dec_1_->forward(z);
+        Tensor<T> h = dsl_dec_1_->forward(z);
         h = dec_act_1_->forward(h);
-        return dec_2_->forward(h);
-    }
-
-    Tensor<T> forward(const Tensor<T>& x) {
-        return decode(encode(x));
+        return dsl_dec_2_->forward(h);
     }
 
     Tensor<T> forward_train(const Tensor<T>& x, Tensor<T>& z_out) {
@@ -259,22 +226,15 @@ public:
         return decode(z_out);
     }
 
-    // Custom backward for regularization
     void backward_with_reg(const Tensor<T>& grad_recon, const Tensor<T>& grad_reg_z) {
-        // Decoder backward
-        Tensor<T> g = dec_2_->backward(grad_recon);
+        Tensor<T> g = dsl_dec_2_->backward(grad_recon);
         g = dec_act_1_->backward(g);
-        g = dec_1_->backward(g);
-
-        // Inject regularization at z (output of enc_act_2_)
-        // Total dL/dz = dL_recon/dz + dL_reg/dz
+        g = dsl_dec_1_->backward(g);
         g = g + grad_reg_z;
-
-        // Encoder backward
         g = enc_act_2_->backward(g);
-        g = enc_2_->backward(g);
+        g = dsl_enc_2_->backward(g);
         g = enc_act_1_->backward(g);
-        enc_1_->backward(g);
+        dsl_enc_1_->backward(g);
     }
 
     std::vector<Tensor<T>*> parameters() {
@@ -304,19 +264,85 @@ public:
         return curvs;
     }
 
+    void save(const std::string& filename, size_t epoch) {
+        std::ofstream out(filename, std::ios::binary);
+        if(!out) return;
+
+        out.write((char*)&epoch, sizeof(size_t));
+
+        auto save_dsl = [&](layers::DeepSpectralLinear<T>* dsl) {
+            auto params = dsl->parameters();
+            size_t depth = params.size();
+            out.write((char*)&depth, sizeof(size_t));
+
+            for(size_t k=0; k<depth; ++k) {
+                // Save Scale
+                size_t sz = params[k]->size();
+                out.write((char*)&sz, sizeof(size_t));
+                out.write((char*)params[k]->data(), sz * sizeof(T));
+
+                // Save Permutation
+                const auto& p = dsl->get_permutation(k);
+                size_t p_sz = p.size();
+                out.write((char*)&p_sz, sizeof(size_t));
+                out.write((char*)p.data(), p_sz * sizeof(size_t));
+            }
+        };
+
+        save_dsl(dsl_enc_1_);
+        save_dsl(dsl_enc_2_);
+        save_dsl(dsl_dec_1_);
+        save_dsl(dsl_dec_2_);
+        out.close();
+        std::cout << "Saved Checkpoint to " << filename << std::endl;
+    }
+
+    bool load(const std::string& filename, size_t& epoch) {
+        std::ifstream in(filename, std::ios::binary);
+        if(!in) return false;
+
+        in.read((char*)&epoch, sizeof(size_t));
+
+        auto load_dsl = [&](layers::DeepSpectralLinear<T>* dsl) {
+            size_t depth;
+            in.read((char*)&depth, sizeof(size_t));
+            auto params = dsl->parameters();
+
+            for(size_t k=0; k<depth; ++k) {
+                size_t sz;
+                in.read((char*)&sz, sizeof(size_t));
+                in.read((char*)params[k]->data(), sz * sizeof(T));
+
+                size_t p_sz;
+                in.read((char*)&p_sz, sizeof(size_t));
+                std::vector<size_t> p(p_sz);
+                in.read((char*)p.data(), p_sz * sizeof(size_t));
+
+                dsl->set_permutation(k, p);
+            }
+        };
+
+        load_dsl(dsl_enc_1_);
+        load_dsl(dsl_enc_2_);
+        load_dsl(dsl_dec_1_);
+        load_dsl(dsl_dec_2_);
+        in.close();
+        std::cout << "Loaded Checkpoint from " << filename << " (Epoch " << epoch << ")" << std::endl;
+        return true;
+    }
+
 private:
     std::vector<layers::Layer<T>*> layers_;
-    layers::Layer<T>* enc_1_;
+    layers::DeepSpectralLinear<T>* dsl_enc_1_;
     layers::Layer<T>* enc_act_1_;
-    layers::Layer<T>* enc_2_;
+    layers::DeepSpectralLinear<T>* dsl_enc_2_;
     layers::Layer<T>* enc_act_2_;
 
-    layers::Layer<T>* dec_1_;
+    layers::DeepSpectralLinear<T>* dsl_dec_1_;
     layers::Layer<T>* dec_act_1_;
-    layers::Layer<T>* dec_2_;
+    layers::DeepSpectralLinear<T>* dsl_dec_2_;
 };
 
-// Helper to save PNG grid
 void save_png_grid(const std::string& filename, const std::vector<std::vector<float>>& images, int rows, int cols, int size) {
     int scale = 2;
     int padding = 10;
@@ -325,7 +351,7 @@ void save_png_grid(const std::string& filename, const std::vector<std::vector<fl
     int total_width = cols * (img_w + padding) + padding;
     int total_height = rows * (img_h + padding) + padding;
 
-    std::vector<unsigned char> pixels(total_width * total_height, 255); // White background
+    std::vector<unsigned char> pixels(total_width * total_height, 255);
 
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
@@ -333,8 +359,6 @@ void save_png_grid(const std::string& filename, const std::vector<std::vector<fl
             if (img_idx >= images.size()) continue;
 
             const auto& img = images[img_idx];
-
-            // Find min/max for normalization
             float min_val = 1e9, max_val = -1e9;
             for (float v : img) {
                 if (v < min_val) min_val = v;
@@ -345,7 +369,6 @@ void save_png_grid(const std::string& filename, const std::vector<std::vector<fl
             int start_x = padding + c * (img_w + padding);
             int start_y = padding + r * (img_h + padding);
 
-            // Draw pixels
             for (int y = 0; y < size; ++y) {
                 for (int x = 0; x < size; ++x) {
                     float val = img[y * size + x];
@@ -369,18 +392,12 @@ void save_png_grid(const std::string& filename, const std::vector<std::vector<fl
     stbi_write_png(filename.c_str(), total_width, total_height, 1, pixels.data(), total_width);
 }
 
-// Helper to compute Total Variation Gradient
 template <typename T>
 void compute_tv_grad(const Tensor<T>& img_batch, Tensor<T>& grad_tv, size_t width, size_t height) {
-    // img_batch: (B, W*H)
     size_t batch_size = img_batch.shape()[0];
     const T* img_ptr = img_batch.data();
     T* g_ptr = grad_tv.data();
-
-    // Clear gradient
     grad_tv.fill(0);
-
-    // Simple TV: sum(|I_{i+1,j} - I_{i,j}| + |I_{i,j+1} - I_{i,j}|)
 
     #pragma omp parallel for
     for (size_t b = 0; b < batch_size; ++b) {
@@ -389,27 +406,19 @@ void compute_tv_grad(const Tensor<T>& img_batch, Tensor<T>& grad_tv, size_t widt
             for (size_t x = 0; x < width; ++x) {
                 size_t idx = offset + y * width + x;
 
-                // Horizontal diff (right neighbor)
                 if (x + 1 < width) {
                     size_t idx_right = idx + 1;
                     T diff = img_ptr[idx_right] - img_ptr[idx];
                     T sign = (diff > 0) ? 1.0f : ((diff < 0) ? -1.0f : 0.0f);
-
-                    // d(|right - curr|)/d(right) = sign
                     g_ptr[idx_right] += sign;
-                    // d(|right - curr|)/d(curr) = -sign
                     g_ptr[idx] -= sign;
                 }
 
-                // Vertical diff (bottom neighbor)
                 if (y + 1 < height) {
                     size_t idx_down = idx + width;
                     T diff = img_ptr[idx_down] - img_ptr[idx];
                     T sign = (diff > 0) ? 1.0f : ((diff < 0) ? -1.0f : 0.0f);
-
-                    // d(|down - curr|)/d(down) = sign
                     g_ptr[idx_down] += sign;
-                    // d(|down - curr|)/d(curr) = -sign
                     g_ptr[idx] -= sign;
                 }
             }
@@ -420,23 +429,28 @@ void compute_tv_grad(const Tensor<T>& img_batch, Tensor<T>& grad_tv, size_t widt
     for(size_t i=0; i<grad_tv.size(); ++i) g_ptr[i] *= scale;
 }
 
-// Training Loop
 template <typename T>
-void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
-    size_t dim = 4096; // 64x64
+void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, const std::string& checkpoint_file) {
+    size_t dim = 4096;
     size_t side = 64;
     WaveletAutoencoder<T> model(dim);
-    // Lower LR to 0.2 for stability with batch 64 and regularization
-    optim::DiagonalNewton<T> optimizer(0.2, 1e-8, 1.0);
+    // Reduced LR to 0.1 to avoid divergence
+    optim::DiagonalNewton<T> optimizer(0.1, 1e-8, 1.0);
 
-    // Register params
     optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
 
-    std::cout << "Starting training: " << epochs << " epochs, " << batches_per_epoch << " batches/epoch, batch " << batch_size << std::endl;
+    size_t start_epoch = 0;
+    if (model.load(checkpoint_file, start_epoch)) {
+        start_epoch += 1;
+    } else {
+        std::cout << "No checkpoint found. Starting from scratch." << std::endl;
+    }
 
-    for (size_t epoch = 0; epoch < epochs; ++epoch) {
+    size_t end_epoch = start_epoch + epochs_to_run;
+    std::cout << "Training from epoch " << start_epoch << " to " << end_epoch << std::endl;
+
+    for (size_t epoch = start_epoch; epoch < end_epoch; ++epoch) {
         T epoch_mse = 0;
-        T epoch_reg = 0;
         T last_avg_abs_z = 0;
 
         for (size_t b = 0; b < batches_per_epoch; ++b) {
@@ -445,58 +459,36 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
 
             optimizer.zero_grad();
 
-            Tensor<T> z; // Latent
+            Tensor<T> z;
             Tensor<T> y = model.forward_train(x, z);
 
-            // 1. Reconstruction Loss (MSE)
+            // MSE
             Tensor<T> diff = y + (x * -1.0);
-
             T mse = 0;
-            {
-                 const T* d_ptr = diff.data();
-                 for(size_t k=0; k<diff.size(); ++k) mse += d_ptr[k]*d_ptr[k];
-                 mse /= diff.size();
-            }
+            const T* d_ptr = diff.data();
+            for(size_t k=0; k<diff.size(); ++k) mse += d_ptr[k]*d_ptr[k];
+            mse /= diff.size();
 
             Tensor<T> grad_recon = diff * (2.0 / diff.size());
 
-            // 2. Total Variation Loss (Prior for smoothness)
+            // TV Loss
             Tensor<T> grad_tv({batch_size, dim});
             compute_tv_grad(y, grad_tv, side, side);
 
             T tv_weight = 0.0001;
-
-            // Add TV gradient to reconstruction gradient
             const T* gtv_ptr = grad_tv.data();
             T* gr_ptr = grad_recon.data();
             for(size_t k=0; k<grad_recon.size(); ++k) {
                 gr_ptr[k] += tv_weight * gtv_ptr[k];
             }
 
-            // 3. Binary Regularization: (z^2 - 1)^2
+            // Binary Regularization DISABLED as requested
             Tensor<T> grad_reg_z({batch_size, dim});
-            T reg_weight = 0.01;
+            grad_reg_z.fill(0);
 
-            T* gz_ptr = grad_reg_z.data();
-            const T* z_ptr = z.data();
-
-            T batch_reg_loss = 0;
             T avg_abs_z = 0;
-
-            #pragma omp parallel for reduction(+:batch_reg_loss, avg_abs_z)
-            for(size_t k=0; k<z.size(); ++k) {
-                T val = z_ptr[k];
-                T val2 = val * val;
-                T term = val2 - 1.0;
-
-                // Loss = (z^2 - 1)^2
-                batch_reg_loss += term * term;
-
-                // dLoss/dz = 2 * (z^2 - 1) * 2z = 4 * z * (z^2 - 1)
-                gz_ptr[k] = reg_weight * 4.0 * val * term / batch_size; // Normalize by batch if needed, but here simple sum
-
-                avg_abs_z += std::abs(val);
-            }
+            const T* z_ptr = z.data();
+            for(size_t k=0; k<z.size(); ++k) avg_abs_z += std::abs(z_ptr[k]);
             avg_abs_z /= z.size();
             last_avg_abs_z = avg_abs_z;
 
@@ -505,86 +497,50 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
             optimizer.step();
 
             epoch_mse += mse;
-            epoch_reg += (batch_reg_loss / z.size()) * reg_weight;
         }
 
-        if (epoch % 10 == 0) {
-            // Log statistics
+        if (epoch % 10 == 0 || epoch == end_epoch - 1) {
             std::cout << "Epoch " << epoch << ": MSE=" << epoch_mse/batches_per_epoch
-                      << " Reg=" << epoch_reg/batches_per_epoch
                       << " Avg|z|=" << last_avg_abs_z
                       << std::endl;
         }
+
+        if (epoch > 0 && epoch % 100 == 0) {
+            model.save(checkpoint_file, epoch);
+        }
     }
 
-    // --- Testing and Visualization ---
-    std::cout << "Testing Compression..." << std::endl;
-    size_t test_size = 8;
+    model.save(checkpoint_file, end_epoch - 1);
+
+    // Visualization
+    std::cout << "Generating Visualization..." << std::endl;
+    size_t test_size = 4;
     Tensor<T> test_x({test_size, dim});
     WaveletGenerator2D<T>::generate(test_x, test_size);
-
     Tensor<T> test_z = model.encode(test_x);
-    Tensor<T> test_rec = model.decode(test_z); // Float reconstruction
+    Tensor<T> test_rec = model.decode(test_z);
 
-    // Quantize z using sign function
-    Tensor<T> test_z_q = test_z;
-    T* zq_ptr = test_z_q.data();
-    for(size_t i=0; i<test_z_q.size(); ++i) {
-        // Sign function: -1 for x < 0, 1 for x >= 0
-        zq_ptr[i] = (zq_ptr[i] >= 0) ? 1.0f : -1.0f;
-    }
-
-    Tensor<T> test_rec_q = model.decode(test_z_q); // Quantized reconstruction
-
-    // Compute Quantized MSE
-    Tensor<T> diff_q = test_rec_q + (test_x * -1.0);
-    T mse_q = 0;
-    const T* dq_ptr = diff_q.data();
-    for(size_t i=0; i<diff_q.size(); ++i) mse_q += dq_ptr[i]*dq_ptr[i];
-    mse_q /= diff_q.size();
-
-    std::cout << "Quantized MSE: " << mse_q << std::endl;
-
-    // Visualize (Reduce to 2 samples to keep SVG size manageable)
     std::vector<std::vector<float>> vis_images;
     const T* x_ptr = test_x.data();
-    const T* z_ptr = test_z.data();
     const T* r_ptr = test_rec.data();
-    const T* rq_ptr = test_rec_q.data();
 
-    int vis_cols = 2;
-
-    // We visualize vis_cols samples, 4 rows: Original, Latent, Rec Float, Rec Quant
-    // 1. Originals
-    for(int i=0; i<vis_cols; ++i) {
+    for(size_t i=0; i<test_size; ++i) {
         std::vector<float> img(dim);
-        for(int j=0; j<dim; ++j) img[j] = x_ptr[i*dim + j];
+        for(size_t j=0; j<dim; ++j) img[j] = x_ptr[i*dim+j];
         vis_images.push_back(img);
     }
-    // 2. Latents (reshaped to 64x64)
-    for(int i=0; i<vis_cols; ++i) {
+    for(size_t i=0; i<test_size; ++i) {
         std::vector<float> img(dim);
-        for(int j=0; j<dim; ++j) img[j] = z_ptr[i*dim + j];
-        vis_images.push_back(img);
-    }
-    // 3. Rec Float
-    for(int i=0; i<vis_cols; ++i) {
-        std::vector<float> img(dim);
-        for(int j=0; j<dim; ++j) img[j] = r_ptr[i*dim + j];
-        vis_images.push_back(img);
-    }
-    // 4. Rec Quant
-    for(int i=0; i<vis_cols; ++i) {
-        std::vector<float> img(dim);
-        for(int j=0; j<dim; ++j) img[j] = rq_ptr[i*dim + j];
+        for(size_t j=0; j<dim; ++j) img[j] = r_ptr[i*dim+j];
         vis_images.push_back(img);
     }
 
-    save_png_grid("reconstruction_grid.png", vis_images, 4, vis_cols, 64);
-    std::cout << "Saved visualization to reconstruction_grid.png" << std::endl;
+    save_png_grid("reconstruction_grid.png", vis_images, 2, test_size, 64);
 }
 
-int main() {
-    train<float>(1000, 1, 64); // 1000 epochs, batch 64
+int main(int argc, char** argv) {
+    size_t epochs = 1000;
+    if(argc > 1) epochs = std::atoi(argv[1]);
+    train<float>(epochs, 1, 64, "checkpoint.bin");
     return 0;
 }
