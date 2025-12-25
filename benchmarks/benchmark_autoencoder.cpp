@@ -179,7 +179,8 @@ public:
             // To allow amplitude reconstruction.
         } else {
             std::cout << "Model: Standard Autoencoder (Dense)" << std::endl;
-            size_t hidden = 64;
+            // Scale hidden dimension with input dimension (N/4) to demonstrate O(N^2) complexity
+            size_t hidden = std::max((size_t)64, input_dim / 4);
             // Encoder
             layers_.push_back(new DenseWithCurvature<T>(input_dim, hidden));
             layers_.push_back(new Tanh<T>());
@@ -423,21 +424,21 @@ T train_step(Autoencoder<T>& model, optim::DiagonalNewton<T>& optimizer, const T
     return loss;
 }
 
-int main() {
-    std::cout << "=== Autoencoder Benchmark (Wavelets) ===" << std::endl;
+// Helper to run benchmark for a specific dimension
+void run_scaling_benchmark(size_t dim, std::ofstream& scaling_csv) {
+    size_t input_dim = dim;
+    size_t latent_dim = 64;
+    size_t batch_size = 64;
+    size_t epochs = 100; // Balanced run for scaling test
 
-    // Increased dimension to demonstrate O(N log N) vs O(N^2) speedup
-    size_t input_dim = 4096;
-    size_t latent_dim = 128;
-    size_t batch_size = 128;
-    size_t epochs = 200;
+    std::cout << "\nRunning Benchmark for Input Dim: " << input_dim << std::endl;
 
     // Initialize Models
     Autoencoder<float> model_std(false, input_dim, latent_dim);
     Autoencoder<float> model_dsl(true, input_dim, latent_dim);
 
     optim::DiagonalNewton<float> opt_std(1e-2f);
-    optim::DiagonalNewton<float> opt_dsl(1e-4f); // DSL usually needs lower LR
+    optim::DiagonalNewton<float> opt_dsl(1e-4f);
 
     opt_std.add_parameters(model_std.parameters(), model_std.gradients(), model_std.curvatures());
     opt_dsl.add_parameters(model_dsl.parameters(), model_dsl.gradients(), model_dsl.curvatures());
@@ -454,48 +455,62 @@ int main() {
     double time_std = 0;
     double time_dsl = 0;
 
+    // Warmup? No, just run
+
     for (size_t epoch = 0; epoch < epochs; ++epoch) {
         Tensor<float> x({batch_size, input_dim});
         generate_mixed_wavelets(x, batch_size, input_dim);
 
         auto t1 = std::chrono::high_resolution_clock::now();
-        float loss_std = train_step(model_std, opt_std, x);
+        train_step(model_std, opt_std, x);
         auto t2 = std::chrono::high_resolution_clock::now();
         time_std += std::chrono::duration<double>(t2 - t1).count();
 
         auto t3 = std::chrono::high_resolution_clock::now();
-        float loss_dsl = train_step(model_dsl, opt_dsl, x);
+        train_step(model_dsl, opt_dsl, x);
         auto t4 = std::chrono::high_resolution_clock::now();
         time_dsl += std::chrono::duration<double>(t4 - t3).count();
-
-        if ((epoch+1) % 100 == 0) {
-            std::cout << "Epoch " << epoch+1
-                      << " | Std: " << loss_std
-                      << " | DSL: " << loss_dsl << std::endl;
-        }
     }
 
     std::cout << "Time Std: " << time_std << "s" << std::endl;
     std::cout << "Time DSL: " << time_dsl << "s" << std::endl;
 
-    // Save Example
-    std::cout << "Saving results..." << std::endl;
-    std::ofstream out("autoencoder_results.csv");
-    out << "t,input,std_recon,dsl_recon\n";
+    scaling_csv << input_dim << "," << time_std << "," << time_dsl << "\n";
 
-    Tensor<float> val_x({1, input_dim});
-    generate_mixed_wavelets(val_x, 1, input_dim);
-    Tensor<float> rec_std = model_std.forward(val_x);
-    Tensor<float> rec_dsl = model_dsl.forward(val_x);
+    // If largest dimension, output reconstruction CSV
+    if (input_dim == 4096) {
+        std::cout << "Saving reconstruction results..." << std::endl;
+        std::ofstream out("autoencoder_results.csv");
+        out << "t,input,std_recon,dsl_recon\n";
 
-    const float* in_ptr = val_x.data();
-    const float* s_ptr = rec_std.data();
-    const float* d_ptr = rec_dsl.data();
+        Tensor<float> val_x({1, input_dim});
+        generate_mixed_wavelets(val_x, 1, input_dim);
+        Tensor<float> rec_std = model_std.forward(val_x);
+        Tensor<float> rec_dsl = model_dsl.forward(val_x);
 
-    for(size_t t=0; t<input_dim; ++t) {
-        out << t << "," << in_ptr[t] << "," << s_ptr[t] << "," << d_ptr[t] << "\n";
+        const float* in_ptr = val_x.data();
+        const float* s_ptr = rec_std.data();
+        const float* d_ptr = rec_dsl.data();
+
+        for(size_t t=0; t<input_dim; ++t) {
+            out << t << "," << in_ptr[t] << "," << s_ptr[t] << "," << d_ptr[t] << "\n";
+        }
+        out.close();
     }
-    out.close();
+}
 
+int main() {
+    std::cout << "=== Autoencoder Scaling Benchmark (Wavelets) ===" << std::endl;
+
+    std::ofstream scaling_csv("scaling_results.csv");
+    scaling_csv << "Dim,Time_Std,Time_DSL\n";
+
+    std::vector<size_t> dims = {512, 1024, 2048, 4096};
+
+    for (size_t dim : dims) {
+        run_scaling_benchmark(dim, scaling_csv);
+    }
+
+    scaling_csv.close();
     return 0;
 }
