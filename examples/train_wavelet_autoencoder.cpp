@@ -346,7 +346,7 @@ template <typename T>
 void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
     size_t dim = 4096; // 64x64
     WaveletAutoencoder<T> model(dim);
-    optim::DiagonalNewton<T> optimizer(1e-4); // Low LR for spectral
+    optim::DiagonalNewton<T> optimizer(0.1); // Moderate LR for stability
 
     // Register params
     optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
@@ -407,33 +407,6 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
                       << " Reg=" << epoch_reg/batches_per_epoch
                       << " Avg|z|=" << last_avg_abs_z
                       << std::endl;
-
-            // Debug stats
-            if (epoch % 50 == 0) {
-                 Tensor<T> debug_x({batch_size, dim});
-                 WaveletGenerator2D<T>::generate(debug_x, batch_size);
-                 Tensor<T> debug_z;
-                 Tensor<T> debug_y = model.forward_train(debug_x, debug_z);
-
-                 auto calc_stats = [](const Tensor<T>& t, const std::string& name) {
-                     T min_v = 1e9, max_v = -1e9, sum = 0, sum_sq = 0;
-                     const T* ptr = t.data();
-                     for(size_t i=0; i<t.size(); ++i) {
-                         T v = ptr[i];
-                         if(v < min_v) min_v = v;
-                         if(v > max_v) max_v = v;
-                         sum += v;
-                         sum_sq += v*v;
-                     }
-                     T mean = sum / t.size();
-                     T var = sum_sq / t.size() - mean*mean;
-                     std::cout << "  " << name << ": Range=[" << min_v << ", " << max_v << "] Mean=" << mean << " Std=" << std::sqrt(var) << std::endl;
-                 };
-
-                 calc_stats(debug_x, "Input");
-                 calc_stats(debug_z, "Latent");
-                 calc_stats(debug_y, "Recon");
-            }
         }
     }
 
@@ -505,6 +478,6 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
 }
 
 int main() {
-    train<float>(200, 1, 16); // 200 epochs for debugging
+    train<float>(500, 1, 16); // 500 epochs
     return 0;
 }
