@@ -369,12 +369,65 @@ void save_png_grid(const std::string& filename, const std::vector<std::vector<fl
     stbi_write_png(filename.c_str(), total_width, total_height, 1, pixels.data(), total_width);
 }
 
+// Helper to compute Total Variation Gradient
+template <typename T>
+void compute_tv_grad(const Tensor<T>& img_batch, Tensor<T>& grad_tv, size_t width, size_t height) {
+    // img_batch: (B, W*H)
+    size_t batch_size = img_batch.shape()[0];
+    const T* img_ptr = img_batch.data();
+    T* g_ptr = grad_tv.data();
+
+    // Clear gradient
+    grad_tv.fill(0);
+
+    // Simple TV: sum(|I_{i+1,j} - I_{i,j}| + |I_{i,j+1} - I_{i,j}|)
+
+    #pragma omp parallel for
+    for (size_t b = 0; b < batch_size; ++b) {
+        size_t offset = b * width * height;
+        for (size_t y = 0; y < height; ++y) {
+            for (size_t x = 0; x < width; ++x) {
+                size_t idx = offset + y * width + x;
+
+                // Horizontal diff (right neighbor)
+                if (x + 1 < width) {
+                    size_t idx_right = idx + 1;
+                    T diff = img_ptr[idx_right] - img_ptr[idx];
+                    T sign = (diff > 0) ? 1.0f : ((diff < 0) ? -1.0f : 0.0f);
+
+                    // d(|right - curr|)/d(right) = sign
+                    g_ptr[idx_right] += sign;
+                    // d(|right - curr|)/d(curr) = -sign
+                    g_ptr[idx] -= sign;
+                }
+
+                // Vertical diff (bottom neighbor)
+                if (y + 1 < height) {
+                    size_t idx_down = idx + width;
+                    T diff = img_ptr[idx_down] - img_ptr[idx];
+                    T sign = (diff > 0) ? 1.0f : ((diff < 0) ? -1.0f : 0.0f);
+
+                    // d(|down - curr|)/d(down) = sign
+                    g_ptr[idx_down] += sign;
+                    // d(|down - curr|)/d(curr) = -sign
+                    g_ptr[idx] -= sign;
+                }
+            }
+        }
+    }
+
+    T scale = 1.0f / batch_size;
+    for(size_t i=0; i<grad_tv.size(); ++i) g_ptr[i] *= scale;
+}
+
 // Training Loop
 template <typename T>
 void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
     size_t dim = 4096; // 64x64
+    size_t side = 64;
     WaveletAutoencoder<T> model(dim);
-    optim::DiagonalNewton<T> optimizer(0.01); // Lower LR for stability with complex textures
+    // Lower LR to 0.2 for stability with batch 64 and regularization
+    optim::DiagonalNewton<T> optimizer(0.2, 1e-8, 1.0);
 
     // Register params
     optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
@@ -407,16 +460,42 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
 
             Tensor<T> grad_recon = diff * (2.0 / diff.size());
 
-            // 2. Binary Regularization (DISABLED)
-            // Just train on MSE as requested
-            Tensor<T> grad_reg_z({batch_size, dim});
-            grad_reg_z.fill(0); // No regularization gradient
+            // 2. Total Variation Loss (Prior for smoothness)
+            Tensor<T> grad_tv({batch_size, dim});
+            compute_tv_grad(y, grad_tv, side, side);
 
-            T reg_loss = 0;
-            T avg_abs_z = 0;
+            T tv_weight = 0.0001;
+
+            // Add TV gradient to reconstruction gradient
+            const T* gtv_ptr = grad_tv.data();
+            T* gr_ptr = grad_recon.data();
+            for(size_t k=0; k<grad_recon.size(); ++k) {
+                gr_ptr[k] += tv_weight * gtv_ptr[k];
+            }
+
+            // 3. Binary Regularization: (z^2 - 1)^2
+            Tensor<T> grad_reg_z({batch_size, dim});
+            T reg_weight = 0.01;
+
+            T* gz_ptr = grad_reg_z.data();
             const T* z_ptr = z.data();
+
+            T batch_reg_loss = 0;
+            T avg_abs_z = 0;
+
+            #pragma omp parallel for reduction(+:batch_reg_loss, avg_abs_z)
             for(size_t k=0; k<z.size(); ++k) {
-                avg_abs_z += std::abs(z_ptr[k]);
+                T val = z_ptr[k];
+                T val2 = val * val;
+                T term = val2 - 1.0;
+
+                // Loss = (z^2 - 1)^2
+                batch_reg_loss += term * term;
+
+                // dLoss/dz = 2 * (z^2 - 1) * 2z = 4 * z * (z^2 - 1)
+                gz_ptr[k] = reg_weight * 4.0 * val * term / batch_size; // Normalize by batch if needed, but here simple sum
+
+                avg_abs_z += std::abs(val);
             }
             avg_abs_z /= z.size();
             last_avg_abs_z = avg_abs_z;
@@ -426,7 +505,7 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
             optimizer.step();
 
             epoch_mse += mse;
-            epoch_reg += reg_loss;
+            epoch_reg += (batch_reg_loss / z.size()) * reg_weight;
         }
 
         if (epoch % 10 == 0) {
@@ -506,6 +585,6 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
 }
 
 int main() {
-    train<float>(500, 1, 16); // 500 epochs (Increase for full convergence)
+    train<float>(1000, 1, 64); // 1000 epochs, batch 64
     return 0;
 }
