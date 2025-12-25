@@ -14,6 +14,7 @@
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/layers/Layer.hpp"
 #include "../include/dreidel/layers/DeepSpectralLinear.hpp"
+#include "../include/dreidel/layers/GELU.hpp"
 #include "../include/dreidel/optim/DiagonalNewton.hpp"
 
 using namespace dreidel;
@@ -181,20 +182,25 @@ template <typename T>
 class WaveletAutoencoder {
 public:
     WaveletAutoencoder(size_t dim) {
-        // Encoder
-        // DSL(dim) -> Tanh
-        // Latent is dim-sized but we constrain it in loss
-        encoder_dsl_ = new layers::DeepSpectralLinear<T>(dim, 4);
-        encoder_act_ = new Tanh<T>();
+        // Encoder: DSL -> GELU -> DSL -> Tanh
+        enc_1_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        enc_act_1_ = new layers::GELU<T>();
+        enc_2_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        enc_act_2_ = new Tanh<T>();
 
-        // Decoder
-        // DSL(dim) -> Identity (Linear reconstruction)
-        // Usually decoder mirrors encoder.
-        decoder_dsl_ = new layers::DeepSpectralLinear<T>(dim, 4);
+        // Decoder: DSL -> GELU -> DSL
+        dec_1_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        dec_act_1_ = new layers::GELU<T>();
+        dec_2_ = new layers::DeepSpectralLinear<T>(dim, 8);
 
-        layers_.push_back(encoder_dsl_);
-        layers_.push_back(encoder_act_);
-        layers_.push_back(decoder_dsl_);
+        layers_.push_back(enc_1_);
+        layers_.push_back(enc_act_1_);
+        layers_.push_back(enc_2_);
+        layers_.push_back(enc_act_2_);
+
+        layers_.push_back(dec_1_);
+        layers_.push_back(dec_act_1_);
+        layers_.push_back(dec_2_);
     }
 
     ~WaveletAutoencoder() {
@@ -203,63 +209,44 @@ public:
 
     // Returns latent code z
     Tensor<T> encode(const Tensor<T>& x) {
-        Tensor<T> z = encoder_dsl_->forward(x);
-        z = encoder_act_->forward(z);
-        return z;
+        Tensor<T> h = enc_1_->forward(x);
+        h = enc_act_1_->forward(h);
+        h = enc_2_->forward(h);
+        return enc_act_2_->forward(h);
     }
 
     // Returns reconstruction
     Tensor<T> decode(const Tensor<T>& z) {
-        return decoder_dsl_->forward(z);
+        Tensor<T> h = dec_1_->forward(z);
+        h = dec_act_1_->forward(h);
+        return dec_2_->forward(h);
     }
 
     Tensor<T> forward(const Tensor<T>& x) {
         return decode(encode(x));
     }
 
-    // We need a custom forward pass for training to access z for regularization
     Tensor<T> forward_train(const Tensor<T>& x, Tensor<T>& z_out) {
-        Tensor<T> z = encoder_dsl_->forward(x);
-        z = encoder_act_->forward(z);
-        z_out = z; // Copy z for loss calculation
-        return decoder_dsl_->forward(z);
-    }
-
-    void backward(const Tensor<T>& grad_output) {
-         // This only backprops from decoder output
-         // If we have regularization on z, we need to inject gradient at z.
-         // See train_step.
-         // Standard backward chain
-         Tensor<T> grad = grad_output;
-         for (int i = layers_.size() - 1; i >= 0; --i) {
-             grad = layers_[i]->backward(grad);
-         }
+        z_out = encode(x);
+        return decode(z_out);
     }
 
     // Custom backward for regularization
-    // grad_recon: gradient of MSE w.r.t output
-    // grad_reg_z: gradient of Reg w.r.t z
     void backward_with_reg(const Tensor<T>& grad_recon, const Tensor<T>& grad_reg_z) {
-        // 1. Backprop through Decoder
-        Tensor<T> grad_z_from_recon = decoder_dsl_->backward(grad_recon);
+        // Decoder backward
+        Tensor<T> g = dec_2_->backward(grad_recon);
+        g = dec_act_1_->backward(g);
+        g = dec_1_->backward(g);
 
-        // 2. Add regularization gradient
+        // Inject regularization at z (output of enc_act_2_)
         // Total dL/dz = dL_recon/dz + dL_reg/dz
-        // grad_reg_z is dL_reg/dz
+        g = g + grad_reg_z;
 
-        // Ensure shapes match
-        if (grad_z_from_recon.shape() != grad_reg_z.shape()) {
-             std::cerr << "Shape mismatch in backward_with_reg" << std::endl;
-             exit(1);
-        }
-
-        Tensor<T> total_grad_z = grad_z_from_recon + grad_reg_z;
-
-        // 3. Backprop through Encoder Activation
-        Tensor<T> grad_enc_out = encoder_act_->backward(total_grad_z);
-
-        // 4. Backprop through Encoder DSL
-        encoder_dsl_->backward(grad_enc_out);
+        // Encoder backward
+        g = enc_act_2_->backward(g);
+        g = enc_2_->backward(g);
+        g = enc_act_1_->backward(g);
+        enc_1_->backward(g);
     }
 
     std::vector<Tensor<T>*> parameters() {
@@ -291,9 +278,14 @@ public:
 
 private:
     std::vector<layers::Layer<T>*> layers_;
-    layers::DeepSpectralLinear<T>* encoder_dsl_;
-    layers::Layer<T>* encoder_act_;
-    layers::DeepSpectralLinear<T>* decoder_dsl_;
+    layers::Layer<T>* enc_1_;
+    layers::Layer<T>* enc_act_1_;
+    layers::Layer<T>* enc_2_;
+    layers::Layer<T>* enc_act_2_;
+
+    layers::Layer<T>* dec_1_;
+    layers::Layer<T>* dec_act_1_;
+    layers::Layer<T>* dec_2_;
 };
 
 // Helper to save PNG grid
