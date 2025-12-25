@@ -8,6 +8,9 @@
 #include <chrono>
 #include <omp.h>
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../include/stb_image_write.h"
+
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/layers/Layer.hpp"
 #include "../include/dreidel/layers/DeepSpectralLinear.hpp"
@@ -124,6 +127,15 @@ public:
 
                     // Normalize roughly
                     for(size_t i=0; i<dim; ++i) ptr[offset+i] /= 1.5;
+                }
+
+                // Normalize batch item to [-1, 1]
+                T max_val = 0;
+                for(size_t i=0; i<dim; ++i) {
+                    max_val = std::max(max_val, std::abs(ptr[offset+i]));
+                }
+                if (max_val > 1e-6) {
+                    for(size_t i=0; i<dim; ++i) ptr[offset+i] /= max_val;
                 }
             }
         }
@@ -284,19 +296,16 @@ private:
     layers::DeepSpectralLinear<T>* decoder_dsl_;
 };
 
-// Helper to save SVG grid
-void save_svg_grid(const std::string& filename, const std::vector<std::vector<float>>& images, int rows, int cols, int size) {
-    std::ofstream out(filename);
-
-    int scale = 2; // Scale up for visibility
+// Helper to save PNG grid
+void save_png_grid(const std::string& filename, const std::vector<std::vector<float>>& images, int rows, int cols, int size) {
+    int scale = 2;
     int padding = 10;
     int img_w = size * scale;
     int img_h = size * scale;
     int total_width = cols * (img_w + padding) + padding;
     int total_height = rows * (img_h + padding) + padding;
 
-    out << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << total_width << "\" height=\"" << total_height << "\">\n";
-    out << "<rect width=\"100%\" height=\"100%\" fill=\"white\" />\n";
+    std::vector<unsigned char> pixels(total_width * total_height, 255); // White background
 
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
@@ -321,17 +330,23 @@ void save_svg_grid(const std::string& filename, const std::vector<std::vector<fl
                 for (int x = 0; x < size; ++x) {
                     float val = img[y * size + x];
                     float norm = (val - min_val) / (max_val - min_val);
-                    int gray = static_cast<int>(std::min(255.0f, std::max(0.0f, norm * 255.0f)));
+                    unsigned char gray = static_cast<unsigned char>(std::min(255.0f, std::max(0.0f, norm * 255.0f)));
 
-                    out << "<rect x=\"" << start_x + x*scale << "\" y=\"" << start_y + y*scale
-                        << "\" width=\"" << scale << "\" height=\"" << scale
-                        << "\" fill=\"rgb(" << gray << "," << gray << "," << gray << ")\" />\n";
+                    for(int sy = 0; sy < scale; ++sy) {
+                        for(int sx = 0; sx < scale; ++sx) {
+                            int px = start_x + x*scale + sx;
+                            int py = start_y + y*scale + sy;
+                            if (px < total_width && py < total_height) {
+                                pixels[py * total_width + px] = gray;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    out << "</svg>\n";
-    out.close();
+
+    stbi_write_png(filename.c_str(), total_width, total_height, 1, pixels.data(), total_width);
 }
 
 // Training Loop
@@ -349,6 +364,7 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
     for (size_t epoch = 0; epoch < epochs; ++epoch) {
         T epoch_mse = 0;
         T epoch_reg = 0;
+        T last_avg_abs_z = 0;
 
         for (size_t b = 0; b < batches_per_epoch; ++b) {
             Tensor<T> x({batch_size, dim});
@@ -374,20 +390,29 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
             // 2. Binary Regularization
             Tensor<T> grad_reg_z({batch_size, dim});
             T reg_loss = 0;
+            T avg_abs_z = 0;
 
             const T* z_ptr = z.data();
             T* gz_ptr = grad_reg_z.data();
-            T reg_lambda = 0.1;
+            T reg_lambda = 5.0;
 
             for(size_t k=0; k<z.size(); ++k) {
                 T val = z_ptr[k];
+                avg_abs_z += std::abs(val);
+                // Power 10 regularization: (z^2 - 1)^10
                 T term = val*val - 1.0;
-                reg_loss += term*term;
+                T term_pow9 = std::pow(term, 9);
+                T term_pow10 = term * term_pow9;
 
-                gz_ptr[k] = reg_lambda * (4.0 * val * term) / z.size();
+                reg_loss += term_pow10;
+
+                // dL/dz = 10 * (z^2 - 1)^9 * 2z = 20 * z * (z^2 - 1)^9
+                gz_ptr[k] = reg_lambda * (20.0 * val * term_pow9) / z.size();
             }
             reg_loss /= z.size();
             reg_loss *= reg_lambda;
+            avg_abs_z /= z.size();
+            last_avg_abs_z = avg_abs_z;
 
             model.backward_with_reg(grad_recon, grad_reg_z);
 
@@ -398,7 +423,11 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
         }
 
         if (epoch % 10 == 0) {
-            std::cout << "Epoch " << epoch << ": MSE=" << epoch_mse/batches_per_epoch << " Reg=" << epoch_reg/batches_per_epoch << std::endl;
+            // Log statistics
+            std::cout << "Epoch " << epoch << ": MSE=" << epoch_mse/batches_per_epoch
+                      << " Reg=" << epoch_reg/batches_per_epoch
+                      << " Avg|z|=" << last_avg_abs_z
+                      << std::endl;
         }
     }
 
@@ -430,41 +459,43 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
 
     std::cout << "Quantized MSE: " << mse_q << std::endl;
 
-    // Visualize
+    // Visualize (Reduce to 2 samples to keep SVG size manageable)
     std::vector<std::vector<float>> vis_images;
     const T* x_ptr = test_x.data();
     const T* z_ptr = test_z.data();
     const T* r_ptr = test_rec.data();
     const T* rq_ptr = test_rec_q.data();
 
-    // We visualize 8 samples, 4 rows: Original, Latent, Rec Float, Rec Quant
+    int vis_cols = 2;
+
+    // We visualize vis_cols samples, 4 rows: Original, Latent, Rec Float, Rec Quant
     // 1. Originals
-    for(int i=0; i<8; ++i) {
+    for(int i=0; i<vis_cols; ++i) {
         std::vector<float> img(dim);
         for(int j=0; j<dim; ++j) img[j] = x_ptr[i*dim + j];
         vis_images.push_back(img);
     }
     // 2. Latents (reshaped to 64x64)
-    for(int i=0; i<8; ++i) {
+    for(int i=0; i<vis_cols; ++i) {
         std::vector<float> img(dim);
         for(int j=0; j<dim; ++j) img[j] = z_ptr[i*dim + j];
         vis_images.push_back(img);
     }
     // 3. Rec Float
-    for(int i=0; i<8; ++i) {
+    for(int i=0; i<vis_cols; ++i) {
         std::vector<float> img(dim);
         for(int j=0; j<dim; ++j) img[j] = r_ptr[i*dim + j];
         vis_images.push_back(img);
     }
     // 4. Rec Quant
-    for(int i=0; i<8; ++i) {
+    for(int i=0; i<vis_cols; ++i) {
         std::vector<float> img(dim);
         for(int j=0; j<dim; ++j) img[j] = rq_ptr[i*dim + j];
         vis_images.push_back(img);
     }
 
-    save_svg_grid("reconstruction_grid.svg", vis_images, 4, 8, 64);
-    std::cout << "Saved visualization to reconstruction_grid.svg" << std::endl;
+    save_png_grid("reconstruction_grid.png", vis_images, 4, vis_cols, 64);
+    std::cout << "Saved visualization to reconstruction_grid.png" << std::endl;
 }
 
 int main() {
