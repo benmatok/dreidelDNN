@@ -5,6 +5,7 @@
 #include <fstream>
 #include <algorithm>
 #include <iomanip>
+#include <chrono>
 
 // Include Dreidel headers
 #include "../include/dreidel/core/Tensor.hpp"
@@ -68,36 +69,25 @@ public:
         grad_bias_ = grad_output.sum(0);
 
         // Curvature Approximation: diag(H) approx sum(X^2)
-        // For Dense layer with Least Squares / CrossEntropy, the Gauss-Newton approx
-        // for weights W_ij is related to sum_batch (X_bi^2).
-        // This is a rough diagonal approximation often used.
-
-        // Sum of squares of input along batch
         Tensor<T> x_sq = input_ * input_;
         Tensor<T> x_sum_sq = x_sq.sum(0); // (1, In)
-
-        // We replicate this for each output neuron?
-        // W is (In, Out). Each column j uses same input x.
-        // So curvature is same for all j.
 
         T* c_ptr = curv_weights_.data();
         const T* x_ptr = x_sum_sq.data();
 
         for (size_t r = 0; r < input_dim_; ++r) {
-            T val = x_ptr[r]; // + epsilon done in optimizer
+            T val = x_ptr[r];
             for (size_t c = 0; c < output_dim_; ++c) {
-                c_ptr[r * output_dim_ + c] += val; // Accumulate
+                c_ptr[r * output_dim_ + c] += val;
             }
         }
 
-        // Bias curvature = Batch Size (sum of 1s)
         T batch_size = static_cast<T>(input_.shape()[0]);
         T* cb_ptr = curv_bias_.data();
         for (size_t i=0; i<curv_bias_.size(); ++i) {
             cb_ptr[i] += batch_size;
         }
 
-        // dL/dX = G * W^T
         return grad_output.matmul(weights_.transpose());
     }
 
@@ -132,12 +122,10 @@ public:
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
-        // d/dx = (1 - y^2) * grad
         Tensor<T> grad_input = grad_output * output_.apply([](T y) { return 1.0 - y * y; });
         return grad_input;
     }
 
-    // Tanh has no params, returns empty
     std::vector<Tensor<T>*> parameters() override { return {}; }
     std::vector<Tensor<T>*> gradients() override { return {}; }
     std::vector<Tensor<T>*> curvatures() override { return {}; }
@@ -153,25 +141,17 @@ class QuantumPINN {
 public:
     QuantumPINN(bool use_custom_layer, size_t hidden_dim = 128) {
         if (use_custom_layer) {
-            std::cout << "Using DeepSpectralLinear" << std::endl;
-            // Input -> Hidden
-            // Input is 1D. DSL requires Power of 2 usually, or padding.
-            // 1 -> 128 (Power of 2)
-            layers_.push_back(new layers::DeepSpectralLinear<T>(hidden_dim, 4));
-            layers_.push_back(new Tanh<T>());
-
-            // Hidden -> Hidden
             layers_.push_back(new layers::DeepSpectralLinear<T>(hidden_dim, 4));
             layers_.push_back(new Tanh<T>());
 
             layers_.push_back(new layers::DeepSpectralLinear<T>(hidden_dim, 4));
             layers_.push_back(new Tanh<T>());
 
-            // Hidden -> Output
-            // Initialize last bias to non-zero to avoid trivial solution (psi=0) trap
+            layers_.push_back(new layers::DeepSpectralLinear<T>(hidden_dim, 4));
+            layers_.push_back(new Tanh<T>());
+
             layers_.push_back(new DenseWithCurvature<T>(hidden_dim, 1, 0.1));
         } else {
-            std::cout << "Using Standard MLP (Dense)" << std::endl;
             layers_.push_back(new DenseWithCurvature<T>(1, hidden_dim));
             layers_.push_back(new Tanh<T>());
 
@@ -181,7 +161,6 @@ public:
             layers_.push_back(new DenseWithCurvature<T>(hidden_dim, hidden_dim));
             layers_.push_back(new Tanh<T>());
 
-            // Initialize last bias to non-zero
             layers_.push_back(new DenseWithCurvature<T>(hidden_dim, 1, 0.1));
         }
     }
@@ -198,7 +177,6 @@ public:
         return out;
     }
 
-    // Manual Backprop for Accumulation
     void backward(const Tensor<T>& grad_output) {
         Tensor<T> grad = grad_output;
         for (int i = layers_.size() - 1; i >= 0; --i) {
@@ -239,14 +217,11 @@ private:
 
 // Analytical Solution
 double get_analytical_psi(double x, int n) {
-    // Cn = 1 / sqrt(2^n * n! * sqrt(pi))
-    // We compute log first
     double log_fact = 0;
     for(int i=1; i<=n; ++i) log_fact += std::log((double)i);
     double log_Cn = -0.5 * (n * std::log(2.0) + log_fact + 0.5 * std::log(M_PI));
     double Cn = std::exp(log_Cn);
 
-    // Hermite
 #if __cplusplus >= 201703L
     double Hn = std::hermite(n, x);
 #else
@@ -256,285 +231,192 @@ double get_analytical_psi(double x, int n) {
     return Cn * std::exp(-0.5 * x * x) * Hn;
 }
 
-// Training Loop
+// Single Training Step
 template <typename T>
-void train_benchmark(bool use_custom, int epochs=2000) {
-    int quantum_n = 1; // n=1 is simple enough to converge
-    T E = static_cast<T>(quantum_n) + 0.5;
+T train_step(QuantumPINN<T>& model, optim::DiagonalNewton<T>& optimizer,
+             const Tensor<T>& x, const Tensor<T>& x_l, const Tensor<T>& x_r,
+             const std::vector<T>& x_data, T epsilon, T E, T domain_L) {
 
-    QuantumPINN<T> model(use_custom);
-    // Use lower learning rate for DeepSpectralLinear to prevent divergence
-    T lr = use_custom ? 1e-4 : 1e-3;
-    optim::DiagonalNewton<T> optimizer(lr);
+    optimizer.zero_grad();
+    size_t batch_size = x.shape()[0];
 
-    optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
+    // Forward
+    Tensor<T> psi_c = model.forward(x);
+    Tensor<T> psi_l = model.forward(x_l);
+    Tensor<T> psi_r = model.forward(x_r);
 
-    // Re-initialize DeepSpectralLinear scales to be smaller to avoid explosion at start
-    if (use_custom) {
-        auto params = model.parameters();
-        for (auto* p : params) {
-            if (p->size() > 1) { // Likely a scale vector or weight matrix
-                // Scale down current random values
-                T* ptr = p->data();
-                for(size_t i=0; i<p->size(); ++i) {
-                    ptr[i] *= 0.1;
-                }
-            }
+    // Finite Diff
+    Tensor<T> term1 = psi_c * 2.0;
+    Tensor<T> diff1 = psi_r - term1;
+    Tensor<T> sum1 = diff1 + psi_l;
+    Tensor<T> d2psi = sum1 * (1.0 / (epsilon * epsilon));
+
+    // Residual
+    Tensor<T> V = x.apply([](T v){ return 0.5 * v * v; });
+    Tensor<T> V_minus_E = V.apply([E](T v){ return v - E; });
+    Tensor<T> potential_term = V_minus_E * psi_c;
+    Tensor<T> res = d2psi * (-0.5) + potential_term;
+
+    // Loss Calculation
+    T norm_sq = 0;
+    const T* psi_ptr = psi_c.data();
+    for(size_t i=0; i<batch_size; ++i) norm_sq += psi_ptr[i] * psi_ptr[i];
+    norm_sq = (norm_sq / batch_size) * domain_L;
+
+    // Gradients via Concat trick
+    // 1. Concat inputs
+    std::vector<T> all_data;
+    all_data.reserve(3*batch_size);
+    const T* l_ptr = x_l.data();
+    const T* c_ptr = x.data();
+    const T* r_ptr = x_r.data();
+    for(size_t i=0; i<batch_size; ++i) all_data.push_back(l_ptr[i]);
+    for(size_t i=0; i<batch_size; ++i) all_data.push_back(c_ptr[i]);
+    for(size_t i=0; i<batch_size; ++i) all_data.push_back(r_ptr[i]);
+
+    Tensor<T> x_all({3*batch_size, 1}, all_data);
+
+    // 2. Forward Full Batch
+    Tensor<T> psi_all = model.forward(x_all);
+    const T* p_ptr = psi_all.data();
+
+    // 3. Compute Gradients per sample
+    std::vector<T> g_all(3*batch_size);
+    T total_loss = 0;
+
+    // Norm gradient factor
+    T norm_grad_factor = 2.0 * (norm_sq - 1.0) * 2.0 * domain_L / batch_size;
+
+    for(size_t i=0; i<batch_size; ++i) {
+        T pl = p_ptr[i];
+        T pc = p_ptr[batch_size + i];
+        T pr = p_ptr[2*batch_size + i];
+
+        T d2 = (pr - 2*pc + pl) / (epsilon * epsilon);
+        T xv = x_data[i];
+        T pot = 0.5 * xv * xv - E;
+        T r = -0.5 * d2 + pot * pc;
+
+        total_loss += r * r;
+
+        // dL/dr = 2r / B
+        T gr = 2.0 * r / batch_size;
+
+        g_all[i] = gr * (-0.5 / (epsilon * epsilon)); // Left
+        g_all[batch_size + i] = gr * (1.0/(epsilon * epsilon) + pot) + norm_grad_factor * pc; // Center
+        g_all[2*batch_size + i] = gr * (-0.5 / (epsilon * epsilon)); // Right
+    }
+
+    total_loss = total_loss / batch_size;
+    total_loss += (norm_sq - 1.0)*(norm_sq - 1.0);
+
+    Tensor<T> grad_all({3*batch_size, 1}, g_all);
+
+    // 4. Backward
+    model.backward(grad_all);
+
+    // 5. Optimizer
+    optimizer.step();
+
+    return total_loss;
+}
+
+// Main Training Function
+void train_benchmark_all() {
+    int quantum_n = 1;
+    float E = static_cast<float>(quantum_n) + 0.5f;
+    int epochs = 2000;
+    size_t batch_size = 500;
+    float epsilon = 1e-3f;
+    float domain_L = 20.0f;
+
+    std::cout << "Starting Benchmark (n=" << quantum_n << ", E=" << E << ", " << epochs << " epochs)..." << std::endl;
+
+    // Models
+    std::cout << "Initializing Models..." << std::endl;
+    QuantumPINN<float> model_std(false);
+    QuantumPINN<float> model_dsl(true);
+
+    // Optimizers
+    optim::DiagonalNewton<float> opt_std(1e-3f);
+    optim::DiagonalNewton<float> opt_dsl(1e-5f); // Slower learning rate for DSL
+
+    opt_std.add_parameters(model_std.parameters(), model_std.gradients(), model_std.curvatures());
+    opt_dsl.add_parameters(model_dsl.parameters(), model_dsl.gradients(), model_dsl.curvatures());
+
+    // DSL Initialization Fix
+    auto params_dsl = model_dsl.parameters();
+    for (auto* p : params_dsl) {
+        if (p->size() > 1) {
+            float* ptr = p->data();
+            for(size_t i=0; i<p->size(); ++i) ptr[i] *= 0.1f;
         }
     }
 
-    size_t batch_size = 500;
-    T epsilon = 1e-3; // Finite Difference step
-
-    std::cout << "Starting Training (n=" << quantum_n << ", E=" << E << ", " << epochs << " epochs)..." << std::endl;
-
-    // Domain [-10, 10]
+    // Random Generation
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_real_distribution<T> dist(-10.0, 10.0);
+    std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
-    std::vector<T> loss_history;
+    double time_std = 0;
+    double time_dsl = 0;
 
     for (int epoch = 0; epoch < epochs; ++epoch) {
-        optimizer.zero_grad();
-
-        // 1. Generate Batch
-        std::vector<T> x_data(batch_size);
+        // Generate Batch (Shared)
+        std::vector<float> x_data(batch_size);
         for(size_t i=0; i<batch_size; ++i) x_data[i] = dist(gen);
+        Tensor<float> x({batch_size, 1}, x_data);
 
-        Tensor<T> x({batch_size, 1}, x_data);
+        Tensor<float> x_l = x.apply([&](float v){ return v - epsilon; });
+        Tensor<float> x_r = x.apply([&](float v){ return v + epsilon; });
 
-        // 2. Finite Differences for Laplacian
-        // x_l, x_c, x_r
-        Tensor<T> x_l = x.apply([&](T v){ return v - epsilon; });
-        Tensor<T> x_r = x.apply([&](T v){ return v + epsilon; });
+        // Standard MLP Step
+        auto t1 = std::chrono::high_resolution_clock::now();
+        float loss_std = train_step(model_std, opt_std, x, x_l, x_r, x_data, epsilon, E, domain_L);
+        auto t2 = std::chrono::high_resolution_clock::now();
+        time_std += std::chrono::duration<double>(t2 - t1).count();
 
-        Tensor<T> psi_c = model.forward(x);
-        Tensor<T> psi_l = model.forward(x_l);
-        Tensor<T> psi_r = model.forward(x_r);
+        // DSL Step
+        auto t3 = std::chrono::high_resolution_clock::now();
+        float loss_dsl = train_step(model_dsl, opt_dsl, x, x_l, x_r, x_data, epsilon, E, domain_L);
+        auto t4 = std::chrono::high_resolution_clock::now();
+        time_dsl += std::chrono::duration<double>(t4 - t3).count();
 
-        // psi'' approx (psi_r - 2psi_c + psi_l) / eps^2
-        Tensor<T> term1 = psi_c * 2.0;
-        Tensor<T> diff1 = psi_r - term1;
-        Tensor<T> sum1 = diff1 + psi_l;
-        Tensor<T> d2psi = sum1 * (1.0 / (epsilon * epsilon));
-
-        // Residual: -0.5 psi'' + (0.5 x^2 - E) psi
-        Tensor<T> V = x.apply([](T v){ return 0.5 * v * v; });
-        Tensor<T> V_minus_E = V.apply([E](T v){ return v - E; });
-        Tensor<T> potential_term = V_minus_E * psi_c;
-
-        // Recalculate residual properly
-        Tensor<T> res = d2psi * (-0.5) + potential_term;
-
-        // Loss = mean(res^2)
-        // Also Normalization penalty: mean(psi^2) * L approx 1
-        T domain_L = 20.0;
-        T norm_sq = 0;
-        const T* psi_ptr = psi_c.data();
-        for(size_t i=0; i<batch_size; ++i) norm_sq += psi_ptr[i] * psi_ptr[i];
-        norm_sq = (norm_sq / batch_size) * domain_L;
-
-        // Backprop
-        // dL/d(res) = 2 * res / batch_size
-        Tensor<T> grad_res = res * (2.0 / batch_size);
-
-        // dL/d(psi_c) from PDE part:
-        // res = -0.5/eps^2 (r - 2c + l) + (V-E) c
-        // d(res)/dc = 1.0/eps^2 + (V-E)
-        // grad_c_pde = grad_res * (1/eps^2 + V-E)
-
-        Tensor<T> grad_c = grad_res * V_minus_E;
-        grad_c = grad_c + grad_res * (1.0/(epsilon*epsilon));
-
-        // dL/d(psi_l) = grad_res * (-0.5 / (epsilon*epsilon));
-        Tensor<T> grad_l = grad_res * (-0.5 / (epsilon*epsilon));
-
-        // dL/d(psi_r) = grad_res * (-0.5 / (epsilon*epsilon));
-        Tensor<T> grad_r = grad_res * (-0.5 / (epsilon*epsilon));
-
-        // Add Normalization Gradient to center
-        // L_norm = (S - 1)^2, S = mean(c^2)*L
-        // dL_norm/dS = 2(S-1)
-        // dS/dc = 2c * L / B
-        // dL_norm/dc = 2(S-1) * 2c * L / B
-        T grad_norm_scale = 2.0 * (norm_sq - 1.0) * 2.0 * domain_L / batch_size;
-        Tensor<T> grad_c_norm = psi_c * grad_norm_scale;
-
-        // Combine gradients for center
-        grad_c = grad_c + grad_c_norm;
-
-        // We need to run backward 3 times?
-        // Yes, but we need to accumulate gradients in the optimizer/layers.
-        // Does Layer::backward accumulate?
-        // Dense::backward overwrites grad_weights_! "grad_weights_ = ..."
-        // This is a problem.
-        // We cannot simply call backward 3 times sequentially if it overwrites.
-        // We must modify layers to accumulate, or manually sum.
-        // Or, since Dense backprop is linear in grad_output,
-        // we can compute the effective grad_output on x_c?
-        // Wait, the backward pass depends on the stored input "input_".
-        // Forward was called 3 times: l, c, r.
-        // The last call was 'r'. So layers currently hold state for 'r'.
-        // So we can only backprop for 'r' immediately.
-        // For 'c' and 'l', the state is lost!
-        // This is the limitation of the stateful Layer design.
-
-        // WORKAROUND:
-        // We must do Forward-Backward interleaved for each point, or save/restore state.
-        // But we want to do it in one batch update.
-        // Since we are doing FD, we effectively treat the network as processing 3 independent batches.
-        // Or one big batch of size 3*B.
-
-        // Let's concat inputs!
-        // X_all = [x_l; x_c; x_r] (Size 3B)
-        // Forward(X_all) -> Psi_all
-        // Split Psi_all -> Psi_l, Psi_c, Psi_r
-        // Compute Gradients dL/dPsi_all
-        // Backward(dL/dPsi_all)
-        // This works perfectly and handles state correctly.
-
-        // Concatenate
-        std::vector<T> all_data;
-        all_data.reserve(3*batch_size);
-        const T* l_ptr = x_l.data();
-        const T* c_ptr = x.data();
-        const T* r_ptr = x_r.data();
-        for(size_t i=0; i<batch_size; ++i) all_data.push_back(l_ptr[i]);
-        for(size_t i=0; i<batch_size; ++i) all_data.push_back(c_ptr[i]);
-        for(size_t i=0; i<batch_size; ++i) all_data.push_back(r_ptr[i]);
-
-        Tensor<T> x_all({3*batch_size, 1}, all_data);
-
-        // Forward
-        Tensor<T> psi_all = model.forward(x_all);
-
-        // Split output to compute loss/grads
-        // Since we don't have split, we access data pointer.
-        // Output is (3B, 1).
-        const T* p_ptr = psi_all.data();
-        std::vector<T> g_all(3*batch_size);
-
-        T total_loss = 0;
-
-        for(size_t i=0; i<batch_size; ++i) {
-            T pl = p_ptr[i];
-            T pc = p_ptr[batch_size + i];
-            T pr = p_ptr[2*batch_size + i];
-
-            T d2 = (pr - 2*pc + pl) / (epsilon * epsilon);
-            T xv = x_data[i];
-            T pot = 0.5 * xv * xv - E;
-            T r = -0.5 * d2 + pot * pc;
-
-            total_loss += r * r;
-
-            // Gradients
-            // dL/dr = 2r / B
-            T gr = 2.0 * r / batch_size;
-
-            T g_pl = gr * (-0.5 / (epsilon * epsilon));
-            T g_pr = gr * (-0.5 / (epsilon * epsilon));
-            T g_pc = gr * (0.5 * 2.0 / (epsilon * epsilon) + pot);
-
-            // Norm penalty (only on center?)
-            // We used center for norm.
-            // dL_norm/dpc
-            // We calculated grad_norm_scale * pc earlier.
-            // Recalc local contribution:
-            // S = sum(pc^2)/B * L. Loss=(S-1)^2.
-            // dLoss/dpc_i = 2(S-1) * (2*pc_i/B * L)
-            // We need S first.
-        }
-
-        // Compute Norm S
-        T sum_sq_c = 0;
-        for(size_t i=0; i<batch_size; ++i) {
-            T pc = p_ptr[batch_size + i];
-            sum_sq_c += pc*pc;
-        }
-        T S = (sum_sq_c / batch_size) * domain_L;
-        total_loss = total_loss / batch_size; // Mean PDE loss
-        total_loss += (S - 1.0)*(S - 1.0); // + Norm loss
-
-        T norm_grad_factor = 2.0 * (S - 1.0) * 2.0 * domain_L / batch_size;
-
-        // Fill gradients
-        for(size_t i=0; i<batch_size; ++i) {
-            T pl = p_ptr[i];
-            T pc = p_ptr[batch_size + i];
-            T pr = p_ptr[2*batch_size + i];
-
-            T d2 = (pr - 2*pc + pl) / (epsilon * epsilon);
-            T xv = x_data[i];
-            T pot = 0.5 * xv * xv - E;
-            T r = -0.5 * d2 + pot * pc;
-
-            T gr = 2.0 * r / batch_size;
-
-            g_all[i] = gr * (-0.5 / (epsilon*epsilon)); // Left
-            g_all[batch_size + i] = gr * (1.0/(epsilon*epsilon) + pot) + norm_grad_factor * pc; // Center
-            g_all[2*batch_size + i] = gr * (-0.5 / (epsilon*epsilon)); // Right
-        }
-
-        Tensor<T> grad_all({3*batch_size, 1}, g_all);
-
-        // Backward
-        model.backward(grad_all);
-
-        // Optimizer Step
-        optimizer.step();
-
-        if (std::isnan(total_loss)) {
-            std::cout << "Epoch " << epoch+1 << " | Loss: NaN (Diverged)" << std::endl;
-            break;
-        }
-
-        if ((epoch+1) % 100 == 0) {
-            std::cout << "Epoch " << epoch+1 << " | Loss: " << total_loss << std::endl;
+        if (std::isnan(loss_dsl)) {
+             if ((epoch+1) % 100 == 0) std::cout << "Epoch " << epoch+1 << " | Std Loss: " << loss_std << " | DSL Loss: NaN (Diverged)" << std::endl;
+        } else {
+             if ((epoch+1) % 100 == 0) std::cout << "Epoch " << epoch+1 << " | Std Loss: " << loss_std << " | DSL Loss: " << loss_dsl << std::endl;
         }
     }
+
+    std::cout << "Training Complete." << std::endl;
+    std::cout << "Standard MLP Time: " << time_std << " s" << std::endl;
+    std::cout << "DeepSpectralLinear Time: " << time_dsl << " s" << std::endl;
 
     // Evaluate
     std::cout << "Evaluating..." << std::endl;
-    std::ofstream out("quantum_benchmark_results.csv", std::ios::app);
-    if (use_custom) out << "Type,x,psi_pred,psi_true\n";
+    std::ofstream out("quantum_benchmark_results.csv");
+    out << "x,psi_true,psi_std,psi_dsl\n";
 
-    // Evaluation grid
-    std::vector<T> x_eval;
-    for(T val = -10.0; val <= 10.0; val += 0.1) x_eval.push_back(val);
+    std::vector<float> x_eval;
+    for(float val = -10.0f; val <= 10.0f; val += 0.1f) x_eval.push_back(val);
 
-    Tensor<T> x_t({x_eval.size(), 1}, x_eval);
-    Tensor<T> psi_pred = model.forward(x_t);
+    Tensor<float> x_t({x_eval.size(), 1}, x_eval);
+    Tensor<float> psi_std = model_std.forward(x_t);
+    Tensor<float> psi_dsl = model_dsl.forward(x_t);
 
-    const T* pred_ptr = psi_pred.data();
+    const float* ptr_std = psi_std.data();
+    const float* ptr_dsl = psi_dsl.data();
+
     for(size_t i=0; i<x_eval.size(); ++i) {
-        T xv = x_eval[i];
-        T pv = pred_ptr[i];
-        T tv = get_analytical_psi(xv, quantum_n);
-
-        // Note: Sign might be flipped.
-        // We handle sign flip in post-processing or assume user plots abs/squared.
-        // Or we check alignment.
-
-        out << (use_custom ? "DeepSpectralLinear" : "StandardMLP") << ","
-            << xv << "," << pv << "," << tv << "\n";
+        float xv = x_eval[i];
+        float tv = (float)get_analytical_psi(xv, quantum_n);
+        out << xv << "," << tv << "," << ptr_std[i] << "," << ptr_dsl[i] << "\n";
     }
     out.close();
 }
 
 int main() {
-    std::cout << "=== Quantum PINN Benchmark (C++) ===" << std::endl;
-
-    // Clear CSV
-    std::ofstream out("quantum_benchmark_results.csv");
-    out.close();
-
-    // Train Standard
-    train_benchmark<float>(false, 2000);
-
-    // Train Custom
-    train_benchmark<float>(true, 2000);
-
+    train_benchmark_all();
     return 0;
 }
