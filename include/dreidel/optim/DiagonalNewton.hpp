@@ -12,8 +12,8 @@ namespace optim {
 template <typename T, BackendType B = BackendType::CPU>
 class DiagonalNewton : public Optimizer<T, B> {
 public:
-    DiagonalNewton(T learning_rate, T epsilon = 1e-8)
-        : learning_rate_(learning_rate), epsilon_(epsilon) {}
+    DiagonalNewton(T learning_rate, T epsilon = 1e-8, T damping = 0.0)
+        : learning_rate_(learning_rate), epsilon_(epsilon), damping_(damping) {}
 
     void add_parameters(std::vector<Tensor<T, B>*> params,
                         std::vector<Tensor<T, B>*> grads,
@@ -63,14 +63,11 @@ public:
 
                 DREIDEL_SIMD_LOOP
                 for (size_t j = 0; j < size; ++j) {
-                    // Update rule: D_new = D - eta * g / (h + eps)
-                    // Note: For Rosenbrock test or general Newton, curvature could be negative?
-                    // Usually in NN we use abs(curvature) or dampening to ensure positive definite.
-                    // Or we trust it's positive (like x^2 sum).
+                    // Update rule: D_new = D - eta * g / (|h| + lambda + eps)
+                    // Damping (lambda) ensures stability when curvature is small
 
                     T h = c_ptr[j];
-                    // Simple dampening
-                    p_ptr[j] -= lr * g_ptr[j] / (std::abs(h) + eps);
+                    p_ptr[j] -= lr * g_ptr[j] / (std::abs(h) + damping_ + eps);
                 }
             } else {
                 // Fallback to SGD if no curvature
@@ -95,6 +92,7 @@ public:
 private:
     T learning_rate_;
     T epsilon_;
+    T damping_;
     std::vector<Tensor<T, B>*> parameters_;
     std::vector<Tensor<T, B>*> gradients_;
     std::vector<Tensor<T, B>*> curvatures_;
