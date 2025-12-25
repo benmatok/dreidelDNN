@@ -202,6 +202,14 @@ public:
         }
     }
 
+    // Get permutation for serialization
+    const std::vector<size_t>& get_permutation(size_t index) const {
+         if (index >= depth_) {
+            throw std::out_of_range("Layer index out of range in DeepSpectralLinear");
+        }
+        return perms_[index];
+    }
+
 private:
     void permute_forward(const Tensor<T, B>& input, Tensor<T, B>& output, const std::vector<size_t>& p) {
         // Output shape matches input
