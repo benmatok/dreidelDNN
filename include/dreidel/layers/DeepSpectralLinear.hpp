@@ -68,45 +68,59 @@ public:
     Tensor<T, B> forward(const Tensor<T, B>& input) override {
         // Pad input if needed
         if (input.shape().back() < dim_) {
-             cached_input_raw_ = input; // Save original for backward padding logic if needed?
-             // Actually we just need to know it was padded.
-             // But simpler to just work in padded space.
+             cached_input_raw_ = input;
              cached_input_padded_ = input.pad_last_dim(dim_);
         } else if (input.shape().back() > dim_) {
              throw std::runtime_error("Input dimension larger than DeepSpectralLinear dimension.");
         } else {
+             // Avoid copying if possible, but Tensor assigment copies data.
+             // If we can avoid cached_input_padded_ logic by just using input in loop?
+             // But we need to modify x.
              cached_input_padded_ = input;
         }
 
         Tensor<T, B> x = cached_input_padded_;
 
-        // Clear cache
-        intermediate_activations_.clear();
-        // We store input to each layer k.
-        // Input to layer 0 is x.
-        intermediate_activations_.push_back(x);
+        // Optimized Cache Management: Reuse buffers
+        // We need to store: Input to Block 0 (x), Output of Block 0 (Input to Block 1), etc.
+        // Total (Depth) stored tensors.
+        if (intermediate_activations_.size() < depth_) {
+            intermediate_activations_.resize(depth_);
+        }
+
+        // Store input to layer 0
+        intermediate_activations_[0] = x;
+
+        // Working buffers for Permute/Scale to avoid allocation in loop
+        // We reuse x for output of FWHT (in-place).
+        // But Permute is out-of-place.
+        // Scale is out-of-place (create x_scaled).
+        // Let's implement in-place Scale.
+
+        // Buffer for Permutation Output
+        if (perm_buffer_.size() != x.size()) {
+             perm_buffer_ = Tensor<T, B>(x.shape());
+        }
 
         for (size_t k = 0; k < depth_; ++k) {
-            // 1. Permutation
-            // x_perm = P(x)
-            // We need a helper to permute last dim.
-            // Since Tensor doesn't have it, we implement loop.
+            // 1. Permutation: x -> perm_buffer_
+            permute_forward(x, perm_buffer_, perms_[k]);
 
-            Tensor<T, B> x_perm(x.shape());
-            permute_forward(x, x_perm, perms_[k]);
+            // 2. Scale: perm_buffer_ * scales_[k] -> x (Reuse x as output)
+            // We implement a manual loop to avoid allocation of x_scaled
+            apply_scale(perm_buffer_, scales_[k], x);
 
-            // 2. Scale
-            // x_scaled = x_perm * D
-            Tensor<T, B> x_scaled = x_perm * scales_[k];
+            // 3. FWHT (In-Place on x)
+            algo::WHT::FWHT(x);
 
-            // 3. FWHT
-            algo::WHT::FWHT(x_scaled);
-
-            x = x_scaled;
-
-            // Save output of layer k (which is input to k+1)
+            // Save input for next block (which is current output x)
+            // But we need Input for Backward.
+            // intermediate_activations_[k] stores Input to Block k.
+            // Wait, we stored Input to Block 0 above.
+            // In loop k=0: We compute Output of Block 0.
+            // This Output is Input to Block 1.
             if (k < depth_ - 1) {
-                intermediate_activations_.push_back(x);
+                intermediate_activations_[k+1] = x;
             }
         }
 
@@ -283,9 +297,30 @@ private:
     std::vector<std::vector<size_t>> inv_perms_;
 
     // Cache for backward
+    // Helper to apply scale: out = in * scale
+    void apply_scale(const Tensor<T, B>& in, const Tensor<T, B>& scale, Tensor<T, B>& out) {
+        // Assuming matching shapes/broadcast
+        size_t last_dim = dim_;
+        size_t total = in.size();
+        size_t outer = total / last_dim;
+
+        const T* in_ptr = in.data();
+        const T* s_ptr = scale.data();
+        T* out_ptr = out.data();
+
+        #pragma omp parallel for
+        for (long i = 0; i < (long)outer; ++i) {
+            size_t offset = i * last_dim;
+            for (size_t j = 0; j < last_dim; ++j) {
+                out_ptr[offset + j] = in_ptr[offset + j] * s_ptr[j];
+            }
+        }
+    }
+
     Tensor<T, B> cached_input_raw_;
     Tensor<T, B> cached_input_padded_;
     std::vector<Tensor<T, B>> intermediate_activations_;
+    Tensor<T, B> perm_buffer_; // Reusable buffer
 };
 
 } // namespace layers

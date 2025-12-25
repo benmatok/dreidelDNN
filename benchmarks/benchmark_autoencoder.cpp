@@ -426,10 +426,11 @@ T train_step(Autoencoder<T>& model, optim::DiagonalNewton<T>& optimizer, const T
 int main() {
     std::cout << "=== Autoencoder Benchmark (Wavelets) ===" << std::endl;
 
-    size_t input_dim = 128;
-    size_t latent_dim = 16;
-    size_t batch_size = 64;
-    size_t epochs = 1000;
+    // Increased dimension to demonstrate O(N log N) vs O(N^2) speedup
+    size_t input_dim = 4096;
+    size_t latent_dim = 128;
+    size_t batch_size = 128;
+    size_t epochs = 300;
 
     // Initialize Models
     Autoencoder<float> model_std(false, input_dim, latent_dim);
