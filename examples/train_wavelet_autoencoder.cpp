@@ -60,7 +60,8 @@ public:
             std::random_device rd;
             std::mt19937 gen(rd() + omp_get_thread_num());
 
-            std::uniform_int_distribution<int> dist_type(0, 19);
+            // Expanded distribution: 0-29
+            std::uniform_int_distribution<int> dist_type(0, 29);
             std::uniform_real_distribution<T> dist_pos(20.0, 44.0);
             std::uniform_real_distribution<T> dist_scale(3.0, 12.0);
             std::uniform_real_distribution<T> dist_angle(0.0, 3.14159);
@@ -98,20 +99,15 @@ public:
                     T cy = dist_pos(gen);
                     T s = dist_scale(gen);
                     generate_mexican_hat(ptr + offset, size, cx, cy, s);
-                } else {
+                } else if (type < 20) {
                     // High Complexity: Sum of 3 random wavelets
-                    // Clear buffer first
                     std::fill(ptr + offset, ptr + offset + dim, 0);
-
-                    // Add 3 components
                     for(int k=0; k<3; ++k) {
-                        // Random subtype
                         int subtype = std::uniform_int_distribution<int>(0, 2)(gen);
                         std::vector<T> temp(dim);
                         T cx = dist_pos(gen);
                         T cy = dist_pos(gen);
                         T theta = dist_angle(gen);
-
                         if (subtype == 0) {
                              T sx = dist_scale(gen);
                              generate_gabor(temp.data(), size, cx, cy, sx, sx, theta, dist_freq(gen), dist_phase(gen));
@@ -121,13 +117,45 @@ public:
                         } else {
                              generate_mexican_hat(temp.data(), size, cx, cy, dist_scale(gen));
                         }
-
-                        // Accumulate
                         for(size_t i=0; i<dim; ++i) ptr[offset+i] += temp[i];
                     }
-
-                    // Normalize roughly
                     for(size_t i=0; i<dim; ++i) ptr[offset+i] /= 1.5;
+                } else if (type < 25) {
+                    // Texture: Interference pattern (Sum of 5 cosines)
+                    std::fill(ptr + offset, ptr + offset + dim, 0);
+                    for(int k=0; k<5; ++k) {
+                        T kx = std::uniform_real_distribution<T>(0.1, 0.8)(gen);
+                        T ky = std::uniform_real_distribution<T>(0.1, 0.8)(gen);
+                        T phase = dist_phase(gen);
+                        for(size_t y=0; y<size; ++y) {
+                            for(size_t x=0; x<size; ++x) {
+                                ptr[offset + y*size + x] += std::cos(kx*x + ky*y + phase);
+                            }
+                        }
+                    }
+                    for(size_t i=0; i<dim; ++i) ptr[offset+i] /= 2.5;
+                } else {
+                    // Geometric: Rectangles or Lines
+                    std::fill(ptr + offset, ptr + offset + dim, -1.0f);
+                    T cx = dist_pos(gen);
+                    T cy = dist_pos(gen);
+                    T w = dist_scale(gen);
+                    T h = dist_scale(gen);
+                    T angle = dist_angle(gen);
+                    T ca = std::cos(angle);
+                    T sa = std::sin(angle);
+
+                    for(size_t y=0; y<size; ++y) {
+                        for(size_t x=0; x<size; ++x) {
+                            T dx = (T)x - cx;
+                            T dy = (T)y - cy;
+                            T rx = dx * ca - dy * sa;
+                            T ry = dx * sa + dy * ca;
+                            if (std::abs(rx) < w && std::abs(ry) < h) {
+                                ptr[offset + y*size + x] = 1.0f;
+                            }
+                        }
+                    }
                 }
 
                 // Normalize batch item to [-1, 1]
@@ -346,7 +374,7 @@ template <typename T>
 void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
     size_t dim = 4096; // 64x64
     WaveletAutoencoder<T> model(dim);
-    optim::DiagonalNewton<T> optimizer(0.1); // Moderate LR for stability
+    optim::DiagonalNewton<T> optimizer(0.01); // Lower LR for stability with complex textures
 
     // Register params
     optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
@@ -478,6 +506,6 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
 }
 
 int main() {
-    train<float>(500, 1, 16); // 500 epochs
+    train<float>(500, 1, 16); // 500 epochs (Increase for full convergence)
     return 0;
 }
