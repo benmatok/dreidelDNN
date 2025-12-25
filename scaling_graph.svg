@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600">
+<rect width="100%" height="100%" fill="white" />
+<line x1="60" y1="540" x2="740" y2="540" stroke="black" />
+<line x1="60" y1="540" x2="60" y2="60" stroke="black" />
+<text x="400" y="590" text-anchor="middle">Dimension (N)</text>
+<text x="20" y="300" text-anchor="middle" transform="rotate(-90 20 300)">Time (s)</text>
+<path d="M145 533.115 L 230 515.208 L 400 437.662 L 740 60" fill="none" stroke="red" stroke-width="2" />
+<path d="M145 533.589 L 230 533.018 L 400 527.128 L 740 515.424" fill="none" stroke="blue" stroke-width="2" />
+<circle cx="145" cy="533.115" r="4" fill="red" />
+<circle cx="145" cy="533.589" r="4" fill="blue" />
+<circle cx="230" cy="515.208" r="4" fill="red" />
+<circle cx="230" cy="533.018" r="4" fill="blue" />
+<circle cx="400" cy="437.662" r="4" fill="red" />
+<circle cx="400" cy="527.128" r="4" fill="blue" />
+<circle cx="740" cy="60" r="4" fill="red" />
+<circle cx="740" cy="515.424" r="4" fill="blue" />
+<rect x="650" y="50" width="120" height="60" fill="white" stroke="black" />
+<line x1="660" y1="70" x2="690" y2="70" stroke="red" stroke-width="2" />
+<text x="700" y="75">Dense (O(N^2))</text>
+<line x1="660" y1="90" x2="690" y2="90" stroke="blue" stroke-width="2" />
+<text x="700" y="95">DSL (O(N log N))</text>
+</svg>
