@@ -407,6 +407,33 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
                       << " Reg=" << epoch_reg/batches_per_epoch
                       << " Avg|z|=" << last_avg_abs_z
                       << std::endl;
+
+            // Debug stats
+            if (epoch % 50 == 0) {
+                 Tensor<T> debug_x({batch_size, dim});
+                 WaveletGenerator2D<T>::generate(debug_x, batch_size);
+                 Tensor<T> debug_z;
+                 Tensor<T> debug_y = model.forward_train(debug_x, debug_z);
+
+                 auto calc_stats = [](const Tensor<T>& t, const std::string& name) {
+                     T min_v = 1e9, max_v = -1e9, sum = 0, sum_sq = 0;
+                     const T* ptr = t.data();
+                     for(size_t i=0; i<t.size(); ++i) {
+                         T v = ptr[i];
+                         if(v < min_v) min_v = v;
+                         if(v > max_v) max_v = v;
+                         sum += v;
+                         sum_sq += v*v;
+                     }
+                     T mean = sum / t.size();
+                     T var = sum_sq / t.size() - mean*mean;
+                     std::cout << "  " << name << ": Range=[" << min_v << ", " << max_v << "] Mean=" << mean << " Std=" << std::sqrt(var) << std::endl;
+                 };
+
+                 calc_stats(debug_x, "Input");
+                 calc_stats(debug_z, "Latent");
+                 calc_stats(debug_y, "Recon");
+            }
         }
     }
 
@@ -478,6 +505,6 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size) {
 }
 
 int main() {
-    train<float>(1000, 1, 16); // 1000 epochs, 1 batch/epoch (1000 total batches)
+    train<float>(200, 1, 16); // 200 epochs for debugging
     return 0;
 }
