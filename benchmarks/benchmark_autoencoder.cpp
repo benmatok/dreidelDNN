@@ -424,8 +424,84 @@ T train_step(Autoencoder<T>& model, optim::DiagonalNewton<T>& optimizer, const T
     return loss;
 }
 
+struct ScalingResult {
+    size_t dim;
+    double time_std;
+    double time_dsl;
+};
+
+// Helper to write SVG plot
+void generate_scaling_svg(const std::vector<ScalingResult>& results) {
+    std::ofstream svg("scaling_graph.svg");
+    if (!svg.is_open()) return;
+
+    double max_time = 0;
+    size_t max_dim = 0;
+    for (const auto& r : results) {
+        if (r.time_std > max_time) max_time = r.time_std;
+        if (r.time_dsl > max_time) max_time = r.time_dsl;
+        if (r.dim > max_dim) max_dim = r.dim;
+    }
+
+    // Canvas setup
+    double width = 800;
+    double height = 600;
+    double padding = 60;
+
+    svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << width << "\" height=\"" << height << "\">\n";
+    svg << "<rect width=\"100%\" height=\"100%\" fill=\"white\" />\n";
+
+    // Axes
+    svg << "<line x1=\"" << padding << "\" y1=\"" << height - padding << "\" x2=\"" << width - padding << "\" y2=\"" << height - padding << "\" stroke=\"black\" />\n"; // X axis
+    svg << "<line x1=\"" << padding << "\" y1=\"" << height - padding << "\" x2=\"" << padding << "\" y2=\"" << padding << "\" stroke=\"black\" />\n"; // Y axis
+
+    // Labels
+    svg << "<text x=\"" << width/2 << "\" y=\"" << height - 10 << "\" text-anchor=\"middle\">Dimension (N)</text>\n";
+    svg << "<text x=\"20\" y=\"" << height/2 << "\" text-anchor=\"middle\" transform=\"rotate(-90 20 " << height/2 << ")\">Time (s)</text>\n";
+
+    auto map_x = [&](size_t d) { return padding + (double)d / max_dim * (width - 2*padding); };
+    auto map_y = [&](double t) { return height - padding - (t / max_time * (height - 2*padding)); };
+
+    // Plot Std (Red)
+    svg << "<path d=\"M";
+    for (size_t i = 0; i < results.size(); ++i) {
+        svg << map_x(results[i].dim) << " " << map_y(results[i].time_std);
+        if (i < results.size() - 1) svg << " L ";
+    }
+    svg << "\" fill=\"none\" stroke=\"red\" stroke-width=\"2\" />\n";
+
+    // Plot DSL (Blue)
+    svg << "<path d=\"M";
+    for (size_t i = 0; i < results.size(); ++i) {
+        svg << map_x(results[i].dim) << " " << map_y(results[i].time_dsl);
+        if (i < results.size() - 1) svg << " L ";
+    }
+    svg << "\" fill=\"none\" stroke=\"blue\" stroke-width=\"2\" />\n";
+
+    // Points and Tooltips/Text
+    for (const auto& r : results) {
+        double x = map_x(r.dim);
+        double y_std = map_y(r.time_std);
+        double y_dsl = map_y(r.time_dsl);
+
+        svg << "<circle cx=\"" << x << "\" cy=\"" << y_std << "\" r=\"4\" fill=\"red\" />\n";
+        svg << "<circle cx=\"" << x << "\" cy=\"" << y_dsl << "\" r=\"4\" fill=\"blue\" />\n";
+    }
+
+    // Legend
+    svg << "<rect x=\"" << width - 150 << "\" y=\"50\" width=\"120\" height=\"60\" fill=\"white\" stroke=\"black\" />\n";
+    svg << "<line x1=\"" << width - 140 << "\" y1=\"70\" x2=\"" << width - 110 << "\" y2=\"70\" stroke=\"red\" stroke-width=\"2\" />\n";
+    svg << "<text x=\"" << width - 100 << "\" y=\"75\">Dense (O(N^2))</text>\n";
+    svg << "<line x1=\"" << width - 140 << "\" y1=\"90\" x2=\"" << width - 110 << "\" y2=\"90\" stroke=\"blue\" stroke-width=\"2\" />\n";
+    svg << "<text x=\"" << width - 100 << "\" y=\"95\">DSL (O(N log N))</text>\n";
+
+    svg << "</svg>\n";
+    svg.close();
+    std::cout << "Graph saved to scaling_graph.svg" << std::endl;
+}
+
 // Helper to run benchmark for a specific dimension
-void run_scaling_benchmark(size_t dim, std::ofstream& scaling_csv) {
+ScalingResult run_scaling_benchmark(size_t dim, std::ofstream& scaling_csv) {
     size_t input_dim = dim;
     size_t latent_dim = 64;
     size_t batch_size = 64;
@@ -497,6 +573,7 @@ void run_scaling_benchmark(size_t dim, std::ofstream& scaling_csv) {
         }
         out.close();
     }
+    return {dim, time_std, time_dsl};
 }
 
 int main() {
@@ -506,11 +583,15 @@ int main() {
     scaling_csv << "Dim,Time_Std,Time_DSL\n";
 
     std::vector<size_t> dims = {512, 1024, 2048, 4096};
+    std::vector<ScalingResult> results;
 
     for (size_t dim : dims) {
-        run_scaling_benchmark(dim, scaling_csv);
+        results.push_back(run_scaling_benchmark(dim, scaling_csv));
     }
 
     scaling_csv.close();
+
+    generate_scaling_svg(results);
+
     return 0;
 }
