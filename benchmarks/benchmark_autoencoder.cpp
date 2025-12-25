@@ -430,7 +430,7 @@ int main() {
     size_t input_dim = 4096;
     size_t latent_dim = 128;
     size_t batch_size = 128;
-    size_t epochs = 300;
+    size_t epochs = 200;
 
     // Initialize Models
     Autoencoder<float> model_std(false, input_dim, latent_dim);
