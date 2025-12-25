@@ -232,6 +232,11 @@ double get_analytical_psi(double x, int n) {
 }
 
 // Single Training Step
+// Note: We implement a manual training step because PINNs require the Laplacian (psi''),
+// which involves second-order derivatives w.r.t Input.
+// Standard backprop only gives gradients w.r.t Weights.
+// We use Finite Differences to approximate psi'' and the "Concat Trick"
+// to backpropagate through the 3-point stencil efficiently in one pass.
 template <typename T>
 T train_step(QuantumPINN<T>& model, optim::DiagonalNewton<T>& optimizer,
              const Tensor<T>& x, const Tensor<T>& x_l, const Tensor<T>& x_r,
@@ -358,6 +363,15 @@ void train_benchmark_all() {
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
+    // Debug shapes once
+    {
+        std::vector<float> x_data(batch_size);
+        Tensor<float> x({batch_size, 1}, x_data);
+        std::cout << "Input Shape: [" << x.shape()[0] << ", " << x.shape()[1] << "]" << std::endl;
+        Tensor<float> out = model_dsl.forward(x);
+        std::cout << "DSL Output Shape: [" << out.shape()[0] << ", " << out.shape()[1] << "]" << std::endl;
+    }
+
     double time_std = 0;
     double time_dsl = 0;
 
@@ -390,8 +404,8 @@ void train_benchmark_all() {
     }
 
     std::cout << "Training Complete." << std::endl;
-    std::cout << "Standard MLP Time: " << time_std << " s" << std::endl;
-    std::cout << "DeepSpectralLinear Time: " << time_dsl << " s" << std::endl;
+    std::cout << "Standard MLP Time: " << time_std << " s (" << (epochs * batch_size / time_std) << " samples/s)" << std::endl;
+    std::cout << "DeepSpectralLinear Time: " << time_dsl << " s (" << (epochs * batch_size / time_dsl) << " samples/s)" << std::endl;
 
     // Evaluate
     std::cout << "Evaluating..." << std::endl;
