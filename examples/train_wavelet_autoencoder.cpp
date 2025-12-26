@@ -216,9 +216,6 @@ public:
             for(auto* p : params) {
                 if(p->size() == dim) { // Identify scale vector
                     p->fill(scale_val);
-                    // Add small noise to break symmetry?
-                    // Actually, uniform scale is fine for identity + residuals.
-                    // Let's add very small noise.
                     T* ptr = p->data();
                     std::random_device rd;
                     std::mt19937 gen(rd());
@@ -296,7 +293,6 @@ public:
         // res1_enc = x + DSL1(x)
         Tensor<T> grad_dsl1_enc_in = dsl_enc_1_->backward(grad_res1_enc);
         // grad_x = grad_res1_enc + grad_dsl1_enc_in
-        // We don't need grad_x unless chaining further.
     }
 
     std::vector<Tensor<T>*> parameters() {
@@ -368,7 +364,13 @@ public:
         auto load_dsl = [&](layers::DeepSpectralLinear<T>* dsl) {
             size_t depth;
             in.read((char*)&depth, sizeof(size_t));
+
+            // Validate depth
             auto params = dsl->parameters();
+            if (depth != params.size()) {
+                std::cerr << "Checkpoint mismatch: DSL depth " << depth << " != model depth " << params.size() << std::endl;
+                throw std::runtime_error("Checkpoint architecture mismatch");
+            }
 
             for(size_t k=0; k<depth; ++k) {
                 size_t sz;
@@ -384,10 +386,16 @@ public:
             }
         };
 
-        load_dsl(dsl_enc_1_);
-        load_dsl(dsl_enc_2_);
-        load_dsl(dsl_dec_1_);
-        load_dsl(dsl_dec_2_);
+        try {
+            load_dsl(dsl_enc_1_);
+            load_dsl(dsl_enc_2_);
+            load_dsl(dsl_dec_1_);
+            load_dsl(dsl_dec_2_);
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to load checkpoint: " << e.what() << std::endl;
+            return false;
+        }
+
         in.close();
         std::cout << "Loaded Checkpoint from " << filename << " (Epoch " << epoch << ")" << std::endl;
         return true;
@@ -455,15 +463,18 @@ void save_png_grid(const std::string& filename, const std::vector<std::vector<fl
 }
 
 template <typename T>
-void compute_tv_grad(const Tensor<T>& img_batch, Tensor<T>& grad_tv, size_t width, size_t height) {
+T compute_tv_loss_and_grad(const Tensor<T>& img_batch, Tensor<T>& grad_tv, size_t width, size_t height) {
     size_t batch_size = img_batch.shape()[0];
     const T* img_ptr = img_batch.data();
     T* g_ptr = grad_tv.data();
     grad_tv.fill(0);
 
-    #pragma omp parallel for
+    T total_tv = 0;
+
+    #pragma omp parallel for reduction(+:total_tv)
     for (size_t b = 0; b < batch_size; ++b) {
         size_t offset = b * width * height;
+        T batch_tv = 0;
         for (size_t y = 0; y < height; ++y) {
             for (size_t x = 0; x < width; ++x) {
                 size_t idx = offset + y * width + x;
@@ -471,6 +482,7 @@ void compute_tv_grad(const Tensor<T>& img_batch, Tensor<T>& grad_tv, size_t widt
                 if (x + 1 < width) {
                     size_t idx_right = idx + 1;
                     T diff = img_ptr[idx_right] - img_ptr[idx];
+                    batch_tv += std::abs(diff);
                     T sign = (diff > 0) ? 1.0f : ((diff < 0) ? -1.0f : 0.0f);
                     g_ptr[idx_right] += sign;
                     g_ptr[idx] -= sign;
@@ -479,16 +491,20 @@ void compute_tv_grad(const Tensor<T>& img_batch, Tensor<T>& grad_tv, size_t widt
                 if (y + 1 < height) {
                     size_t idx_down = idx + width;
                     T diff = img_ptr[idx_down] - img_ptr[idx];
+                    batch_tv += std::abs(diff);
                     T sign = (diff > 0) ? 1.0f : ((diff < 0) ? -1.0f : 0.0f);
                     g_ptr[idx_down] += sign;
                     g_ptr[idx] -= sign;
                 }
             }
         }
+        total_tv += batch_tv;
     }
 
     T scale = 1.0f / batch_size;
     for(size_t i=0; i<grad_tv.size(); ++i) g_ptr[i] *= scale;
+
+    return total_tv / batch_size;
 }
 
 template <typename T>
@@ -496,6 +512,12 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
     size_t dim = 4096;
     size_t side = 64;
     WaveletAutoencoder<T> model(dim);
+
+    struct stat buffer;
+    bool exists = (stat(checkpoint_file.c_str(), &buffer) == 0);
+    if (exists) {
+        std::cout << "Found checkpoint file: " << checkpoint_file << std::endl;
+    }
 
     // Check if checkpoint exists
     size_t start_epoch = 0;
@@ -507,7 +529,6 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
         model.init_scales(dim);
     }
 
-    // LR Schedule: 0.1 -> 0.01
     optim::DiagonalNewton<T> optimizer(0.05, 1e-8, 1.0);
     optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
 
@@ -516,6 +537,7 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
 
     for (size_t epoch = start_epoch; epoch < end_epoch; ++epoch) {
         T epoch_mse = 0;
+        T epoch_tv = 0;
         T last_avg_abs_z = 0;
 
         for (size_t b = 0; b < batches_per_epoch; ++b) {
@@ -538,9 +560,10 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
 
             // TV Loss
             Tensor<T> grad_tv({batch_size, dim});
-            compute_tv_grad(y, grad_tv, side, side);
+            T batch_tv = compute_tv_loss_and_grad(y, grad_tv, side, side);
 
-            T tv_weight = 0.0001;
+            // Increased TV weight to 0.005 to force smoothness without killing signal
+            T tv_weight = 0.005;
             const T* gtv_ptr = grad_tv.data();
             T* gr_ptr = grad_recon.data();
             for(size_t k=0; k<grad_recon.size(); ++k) {
@@ -562,10 +585,12 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
             optimizer.step();
 
             epoch_mse += mse;
+            epoch_tv += batch_tv;
         }
 
         if (epoch % 10 == 0 || epoch == end_epoch - 1) {
             std::cout << "Epoch " << epoch << ": MSE=" << epoch_mse/batches_per_epoch
+                      << " TV=" << epoch_tv/batches_per_epoch
                       << " Avg|z|=" << last_avg_abs_z
                       << std::endl;
         }
@@ -604,7 +629,7 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
 }
 
 int main(int argc, char** argv) {
-    size_t epochs = 1000;
+    size_t epochs = 5000;
     if(argc > 1) epochs = std::atoi(argv[1]);
     train<float>(epochs, 1, 64, "checkpoint.bin");
     return 0;
