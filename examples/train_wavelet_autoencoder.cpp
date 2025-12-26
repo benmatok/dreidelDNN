@@ -180,20 +180,20 @@ private:
     }
 };
 
-// Wavelet Autoencoder
+// Wavelet Autoencoder with Residuals
 template <typename T>
 class WaveletAutoencoder {
 public:
     WaveletAutoencoder(size_t dim) {
-        // Keep typed pointers for saving/loading
-        dsl_enc_1_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        // Reduced depth to 4 for stability
+        dsl_enc_1_ = new layers::DeepSpectralLinear<T>(dim, 4);
         enc_act_1_ = new layers::GELU<T>();
-        dsl_enc_2_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        dsl_enc_2_ = new layers::DeepSpectralLinear<T>(dim, 4);
         enc_act_2_ = new Tanh<T>();
 
-        dsl_dec_1_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        dsl_dec_1_ = new layers::DeepSpectralLinear<T>(dim, 4);
         dec_act_1_ = new layers::GELU<T>();
-        dsl_dec_2_ = new layers::DeepSpectralLinear<T>(dim, 8);
+        dsl_dec_2_ = new layers::DeepSpectralLinear<T>(dim, 4);
 
         layers_.push_back(dsl_enc_1_);
         layers_.push_back(enc_act_1_);
@@ -208,17 +208,52 @@ public:
         for(auto l : layers_) delete l;
     }
 
+    // Force initialization of scales to 1/sqrt(dim) to preserve variance
+    void init_scales(size_t dim) {
+        T scale_val = 1.0 / std::sqrt(static_cast<T>(dim));
+        auto set_params = [&](layers::DeepSpectralLinear<T>* dsl) {
+            auto params = dsl->parameters();
+            for(auto* p : params) {
+                if(p->size() == dim) { // Identify scale vector
+                    p->fill(scale_val);
+                    // Add small noise to break symmetry?
+                    // Actually, uniform scale is fine for identity + residuals.
+                    // Let's add very small noise.
+                    T* ptr = p->data();
+                    std::random_device rd;
+                    std::mt19937 gen(rd());
+                    std::uniform_real_distribution<T> dist(-0.001*scale_val, 0.001*scale_val);
+                    for(size_t i=0; i<dim; ++i) ptr[i] += dist(gen);
+                }
+            }
+        };
+        set_params(dsl_enc_1_);
+        set_params(dsl_enc_2_);
+        set_params(dsl_dec_1_);
+        set_params(dsl_dec_2_);
+    }
+
     Tensor<T> encode(const Tensor<T>& x) {
+        // ResNet Block 1
         Tensor<T> h = dsl_enc_1_->forward(x);
-        h = enc_act_1_->forward(h);
-        h = dsl_enc_2_->forward(h);
-        return enc_act_2_->forward(h);
+        Tensor<T> res1 = x + h;
+        h = enc_act_1_->forward(res1);
+
+        // ResNet Block 2
+        Tensor<T> h2 = dsl_enc_2_->forward(h);
+        Tensor<T> res2 = h + h2;
+        return enc_act_2_->forward(res2);
     }
 
     Tensor<T> decode(const Tensor<T>& z) {
+        // ResNet Block 1
         Tensor<T> h = dsl_dec_1_->forward(z);
-        h = dec_act_1_->forward(h);
-        return dsl_dec_2_->forward(h);
+        Tensor<T> res1 = z + h;
+        h = dec_act_1_->forward(res1);
+
+        // ResNet Block 2
+        Tensor<T> h2 = dsl_dec_2_->forward(h);
+        return h + h2;
     }
 
     Tensor<T> forward_train(const Tensor<T>& x, Tensor<T>& z_out) {
@@ -227,14 +262,41 @@ public:
     }
 
     void backward_with_reg(const Tensor<T>& grad_recon, const Tensor<T>& grad_reg_z) {
-        Tensor<T> g = dsl_dec_2_->backward(grad_recon);
-        g = dec_act_1_->backward(g);
-        g = dsl_dec_1_->backward(g);
-        g = g + grad_reg_z;
-        g = enc_act_2_->backward(g);
-        g = dsl_enc_2_->backward(g);
-        g = enc_act_1_->backward(g);
-        dsl_enc_1_->backward(g);
+        // Decoder
+        // h_out = h + DSL2(h)
+        // dL/dh_out = grad_recon
+        // dL/dh = dL/dh_out + DSL2_back(dL/dh_out)
+
+        // Block 2
+        Tensor<T> grad_h2_out = grad_recon;
+        Tensor<T> grad_dsl2_in = dsl_dec_2_->backward(grad_h2_out);
+        Tensor<T> grad_h = grad_h2_out + grad_dsl2_in; // Residual backward
+
+        // Block 1
+        // h = Act1(res1)
+        Tensor<T> grad_res1 = dec_act_1_->backward(grad_h);
+        // res1 = z + DSL1(z)
+        Tensor<T> grad_dsl1_in = dsl_dec_1_->backward(grad_res1);
+        Tensor<T> grad_z = grad_res1 + grad_dsl1_in; // Residual backward
+
+        // Add Reg
+        grad_z = grad_z + grad_reg_z;
+
+        // Encoder
+        // Block 2
+        // z = Act2(res2)
+        Tensor<T> grad_res2 = enc_act_2_->backward(grad_z);
+        // res2 = h_enc + DSL2(h_enc)
+        Tensor<T> grad_dsl2_enc_in = dsl_enc_2_->backward(grad_res2);
+        Tensor<T> grad_h_enc = grad_res2 + grad_dsl2_enc_in;
+
+        // Block 1
+        // h_enc = Act1(res1_enc)
+        Tensor<T> grad_res1_enc = enc_act_1_->backward(grad_h_enc);
+        // res1_enc = x + DSL1(x)
+        Tensor<T> grad_dsl1_enc_in = dsl_enc_1_->backward(grad_res1_enc);
+        // grad_x = grad_res1_enc + grad_dsl1_enc_in
+        // We don't need grad_x unless chaining further.
     }
 
     std::vector<Tensor<T>*> parameters() {
@@ -434,17 +496,20 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
     size_t dim = 4096;
     size_t side = 64;
     WaveletAutoencoder<T> model(dim);
-    // Reduced LR to 0.1 to avoid divergence
-    optim::DiagonalNewton<T> optimizer(0.1, 1e-8, 1.0);
 
-    optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
-
+    // Check if checkpoint exists
     size_t start_epoch = 0;
-    if (model.load(checkpoint_file, start_epoch)) {
+    bool loaded = model.load(checkpoint_file, start_epoch);
+    if (loaded) {
         start_epoch += 1;
     } else {
-        std::cout << "No checkpoint found. Starting from scratch." << std::endl;
+        std::cout << "No checkpoint found. Starting from scratch with Identity Initialization." << std::endl;
+        model.init_scales(dim);
     }
+
+    // LR Schedule: 0.1 -> 0.01
+    optim::DiagonalNewton<T> optimizer(0.05, 1e-8, 1.0);
+    optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
 
     size_t end_epoch = start_epoch + epochs_to_run;
     std::cout << "Training from epoch " << start_epoch << " to " << end_epoch << std::endl;
@@ -482,7 +547,7 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
                 gr_ptr[k] += tv_weight * gtv_ptr[k];
             }
 
-            // Binary Regularization DISABLED as requested
+            // Binary Reg DISABLED
             Tensor<T> grad_reg_z({batch_size, dim});
             grad_reg_z.fill(0);
 
