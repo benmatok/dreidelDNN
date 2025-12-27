@@ -30,6 +30,12 @@ public:
     // Get curvatures (diagonal hessian approximation) for optimizer (optional)
     virtual std::vector<Tensor<T, B>*> curvatures() { return {}; }
 
+    // Get activations (inputs) for KFAC (optional)
+    virtual std::vector<Tensor<T, B>*> activations() { return {}; }
+
+    // Get output gradients for KFAC (optional)
+    virtual std::vector<Tensor<T, B>*> grad_outputs() { return {}; }
+
     virtual std::string name() const = 0;
 };
 

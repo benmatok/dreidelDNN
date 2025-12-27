@@ -44,6 +44,9 @@ public:
     Tensor<T, B> backward(const Tensor<T, B>& grad_output) override {
         // grad_output: (Batch, OutputDim) aka dL/dY
 
+        // Cache grad_output for KFAC
+        grad_output_ = grad_output;
+
         // dL/dW = X^T * dL/dY
         // (InputDim, Batch) * (Batch, OutputDim) = (InputDim, OutputDim)
         grad_weights_ = input_.transpose().matmul(grad_output);
@@ -67,6 +70,14 @@ public:
         return {&grad_weights_, &grad_bias_};
     }
 
+    std::vector<Tensor<T, B>*> activations() override {
+        return {&input_};
+    }
+
+    std::vector<Tensor<T, B>*> grad_outputs() override {
+        return {&grad_output_};
+    }
+
     std::string name() const override { return "Dense"; }
 
 private:
@@ -81,6 +92,7 @@ private:
 
     // Cache for backward
     Tensor<T, B> input_;
+    Tensor<T, B> grad_output_;
 };
 
 } // namespace layers
