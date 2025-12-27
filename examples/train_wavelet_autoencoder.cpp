@@ -15,8 +15,10 @@
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/layers/Layer.hpp"
 #include "../include/dreidel/layers/DeepSpectralLinear.hpp"
+#include "../include/dreidel/layers/alsh_dense.hpp"
 #include "../include/dreidel/layers/GELU.hpp"
 #include "../include/dreidel/optim/DiagonalNewton.hpp"
+#include "../include/dreidel/optim/kfac.hpp"
 
 using namespace dreidel;
 
@@ -49,8 +51,10 @@ class WaveletGenerator2D {
 public:
     static void generate(Tensor<T>& batch, size_t batch_size) {
         T* ptr = batch.data();
-        size_t dim = 4096;
-        size_t size = 64;
+        size_t dim = batch.shape()[1]; // Dynamic dim
+        size_t size = static_cast<size_t>(std::sqrt(dim)); // Approximate side
+        // Ensure we don't exceed bounds
+        if (size * size > dim) size--;
 
         #pragma omp parallel
         {
@@ -58,8 +62,12 @@ public:
             std::mt19937 gen(rd() + omp_get_thread_num());
 
             std::uniform_int_distribution<int> dist_type(0, 29);
-            std::uniform_real_distribution<T> dist_pos(20.0, 44.0);
-            std::uniform_real_distribution<T> dist_scale(3.0, 12.0);
+
+            // Scale distributions relative to size (assuming 64 as base)
+            T scale_factor = static_cast<T>(size) / 64.0f;
+
+            std::uniform_real_distribution<T> dist_pos(20.0f * scale_factor, 44.0f * scale_factor);
+            std::uniform_real_distribution<T> dist_scale(3.0f * scale_factor, 12.0f * scale_factor);
             std::uniform_real_distribution<T> dist_angle(0.0, 3.14159);
             std::uniform_real_distribution<T> dist_freq(0.1, 0.5);
             std::uniform_real_distribution<T> dist_phase(0.0, 6.28);
@@ -184,32 +192,68 @@ private:
 template <typename T>
 class WaveletAutoencoder {
 public:
-    WaveletAutoencoder(size_t dim) {
+    WaveletAutoencoder(size_t dim, bool use_alsh = false) : use_alsh_(use_alsh) {
         // Reduced depth to 4 for stability
-        dsl_enc_1_ = new layers::DeepSpectralLinear<T>(dim, 4);
+        if (use_alsh_) {
+             algo::ALSHParams params;
+             params.num_hashes = 4;
+             params.num_tables = 5;
+             params.seed = 42;
+
+             // Use ALSH Layers
+             alsh_enc_1_ = new layers::ALSHSparseDense<T>(dim, dim, params);
+             alsh_enc_2_ = new layers::ALSHSparseDense<T>(dim, dim, params);
+             alsh_dec_1_ = new layers::ALSHSparseDense<T>(dim, dim, params);
+             alsh_dec_2_ = new layers::ALSHSparseDense<T>(dim, dim, params);
+
+             layers_.push_back(alsh_enc_1_);
+        } else {
+             dsl_enc_1_ = new layers::DeepSpectralLinear<T>(dim, 4);
+             layers_.push_back(dsl_enc_1_);
+        }
+
         enc_act_1_ = new layers::GELU<T>();
-        dsl_enc_2_ = new layers::DeepSpectralLinear<T>(dim, 4);
-        enc_act_2_ = new Tanh<T>();
-
-        dsl_dec_1_ = new layers::DeepSpectralLinear<T>(dim, 4);
-        dec_act_1_ = new layers::GELU<T>();
-        dsl_dec_2_ = new layers::DeepSpectralLinear<T>(dim, 4);
-
-        layers_.push_back(dsl_enc_1_);
         layers_.push_back(enc_act_1_);
-        layers_.push_back(dsl_enc_2_);
+
+        if (use_alsh_) {
+             layers_.push_back(alsh_enc_2_);
+        } else {
+             dsl_enc_2_ = new layers::DeepSpectralLinear<T>(dim, 4);
+             layers_.push_back(dsl_enc_2_);
+        }
+
+        enc_act_2_ = new Tanh<T>();
         layers_.push_back(enc_act_2_);
-        layers_.push_back(dsl_dec_1_);
+
+        if (use_alsh_) {
+             layers_.push_back(alsh_dec_1_);
+        } else {
+             dsl_dec_1_ = new layers::DeepSpectralLinear<T>(dim, 4);
+             layers_.push_back(dsl_dec_1_);
+        }
+
+        dec_act_1_ = new layers::GELU<T>();
         layers_.push_back(dec_act_1_);
-        layers_.push_back(dsl_dec_2_);
+
+        if (use_alsh_) {
+             layers_.push_back(alsh_dec_2_);
+        } else {
+             dsl_dec_2_ = new layers::DeepSpectralLinear<T>(dim, 4);
+             layers_.push_back(dsl_dec_2_);
+        }
     }
 
     ~WaveletAutoencoder() {
         for(auto l : layers_) delete l;
     }
 
-    // Force initialization of scales to 1/sqrt(dim) to preserve variance
+    // Getter for layers for KFAC
+    const std::vector<layers::Layer<T>*>& get_layers() const { return layers_; }
+
+    // Force initialization of scales to 1/sqrt(dim) to preserve variance (only for DSL)
     void init_scales(size_t dim) {
+        if (use_alsh_) return; // ALSH initializes itself
+
         T scale_val = 1.0 / std::sqrt(static_cast<T>(dim));
         auto set_params = [&](layers::DeepSpectralLinear<T>* dsl) {
             auto params = dsl->parameters();
@@ -232,24 +276,36 @@ public:
 
     Tensor<T> encode(const Tensor<T>& x) {
         // ResNet Block 1
-        Tensor<T> h = dsl_enc_1_->forward(x);
+        Tensor<T> h;
+        if (use_alsh_) h = alsh_enc_1_->forward(x);
+        else h = dsl_enc_1_->forward(x);
+
         Tensor<T> res1 = x + h;
         h = enc_act_1_->forward(res1);
 
         // ResNet Block 2
-        Tensor<T> h2 = dsl_enc_2_->forward(h);
+        Tensor<T> h2;
+        if (use_alsh_) h2 = alsh_enc_2_->forward(h);
+        else h2 = dsl_enc_2_->forward(h);
+
         Tensor<T> res2 = h + h2;
         return enc_act_2_->forward(res2);
     }
 
     Tensor<T> decode(const Tensor<T>& z) {
         // ResNet Block 1
-        Tensor<T> h = dsl_dec_1_->forward(z);
+        Tensor<T> h;
+        if (use_alsh_) h = alsh_dec_1_->forward(z);
+        else h = dsl_dec_1_->forward(z);
+
         Tensor<T> res1 = z + h;
         h = dec_act_1_->forward(res1);
 
         // ResNet Block 2
-        Tensor<T> h2 = dsl_dec_2_->forward(h);
+        Tensor<T> h2;
+        if (use_alsh_) h2 = alsh_dec_2_->forward(h);
+        else h2 = dsl_dec_2_->forward(h);
+
         return h + h2;
     }
 
@@ -260,21 +316,27 @@ public:
 
     void backward_with_reg(const Tensor<T>& grad_recon, const Tensor<T>& grad_reg_z) {
         // Decoder
-        // h_out = h + DSL2(h)
+        // h_out = h + L2(h)
         // dL/dh_out = grad_recon
-        // dL/dh = dL/dh_out + DSL2_back(dL/dh_out)
+        // dL/dh = dL/dh_out + L2_back(dL/dh_out)
 
         // Block 2
         Tensor<T> grad_h2_out = grad_recon;
-        Tensor<T> grad_dsl2_in = dsl_dec_2_->backward(grad_h2_out);
-        Tensor<T> grad_h = grad_h2_out + grad_dsl2_in; // Residual backward
+        Tensor<T> grad_l2_in;
+        if (use_alsh_) grad_l2_in = alsh_dec_2_->backward(grad_h2_out);
+        else grad_l2_in = dsl_dec_2_->backward(grad_h2_out);
+
+        Tensor<T> grad_h = grad_h2_out + grad_l2_in; // Residual backward
 
         // Block 1
         // h = Act1(res1)
         Tensor<T> grad_res1 = dec_act_1_->backward(grad_h);
-        // res1 = z + DSL1(z)
-        Tensor<T> grad_dsl1_in = dsl_dec_1_->backward(grad_res1);
-        Tensor<T> grad_z = grad_res1 + grad_dsl1_in; // Residual backward
+        // res1 = z + L1(z)
+        Tensor<T> grad_l1_in;
+        if (use_alsh_) grad_l1_in = alsh_dec_1_->backward(grad_res1);
+        else grad_l1_in = dsl_dec_1_->backward(grad_res1);
+
+        Tensor<T> grad_z = grad_res1 + grad_l1_in; // Residual backward
 
         // Add Reg
         grad_z = grad_z + grad_reg_z;
@@ -283,16 +345,22 @@ public:
         // Block 2
         // z = Act2(res2)
         Tensor<T> grad_res2 = enc_act_2_->backward(grad_z);
-        // res2 = h_enc + DSL2(h_enc)
-        Tensor<T> grad_dsl2_enc_in = dsl_enc_2_->backward(grad_res2);
-        Tensor<T> grad_h_enc = grad_res2 + grad_dsl2_enc_in;
+        // res2 = h_enc + L2(h_enc)
+        Tensor<T> grad_l2_enc_in;
+        if (use_alsh_) grad_l2_enc_in = alsh_enc_2_->backward(grad_res2);
+        else grad_l2_enc_in = dsl_enc_2_->backward(grad_res2);
+
+        Tensor<T> grad_h_enc = grad_res2 + grad_l2_enc_in;
 
         // Block 1
         // h_enc = Act1(res1_enc)
         Tensor<T> grad_res1_enc = enc_act_1_->backward(grad_h_enc);
-        // res1_enc = x + DSL1(x)
-        Tensor<T> grad_dsl1_enc_in = dsl_enc_1_->backward(grad_res1_enc);
-        // grad_x = grad_res1_enc + grad_dsl1_enc_in
+        // res1_enc = x + L1(x)
+        Tensor<T> grad_l1_enc_in;
+        if (use_alsh_) grad_l1_enc_in = alsh_enc_1_->backward(grad_res1_enc);
+        else grad_l1_enc_in = dsl_enc_1_->backward(grad_res1_enc);
+
+        // grad_x = grad_res1_enc + grad_l1_enc_in
     }
 
     std::vector<Tensor<T>*> parameters() {
@@ -323,6 +391,10 @@ public:
     }
 
     void save(const std::string& filename, size_t epoch) {
+        if (use_alsh_) {
+             std::cout << "Saving ALSH model not implemented yet." << std::endl;
+             return;
+        }
         std::ofstream out(filename, std::ios::binary);
         if(!out) return;
 
@@ -356,6 +428,7 @@ public:
     }
 
     bool load(const std::string& filename, size_t& epoch) {
+        if (use_alsh_) return false;
         std::ifstream in(filename, std::ios::binary);
         if(!in) return false;
 
@@ -402,15 +475,24 @@ public:
     }
 
 private:
+    bool use_alsh_;
     std::vector<layers::Layer<T>*> layers_;
-    layers::DeepSpectralLinear<T>* dsl_enc_1_;
-    layers::Layer<T>* enc_act_1_;
-    layers::DeepSpectralLinear<T>* dsl_enc_2_;
-    layers::Layer<T>* enc_act_2_;
 
-    layers::DeepSpectralLinear<T>* dsl_dec_1_;
+    // DSL
+    layers::DeepSpectralLinear<T>* dsl_enc_1_ = nullptr;
+    layers::DeepSpectralLinear<T>* dsl_enc_2_ = nullptr;
+    layers::DeepSpectralLinear<T>* dsl_dec_1_ = nullptr;
+    layers::DeepSpectralLinear<T>* dsl_dec_2_ = nullptr;
+
+    // ALSH
+    layers::ALSHSparseDense<T>* alsh_enc_1_ = nullptr;
+    layers::ALSHSparseDense<T>* alsh_enc_2_ = nullptr;
+    layers::ALSHSparseDense<T>* alsh_dec_1_ = nullptr;
+    layers::ALSHSparseDense<T>* alsh_dec_2_ = nullptr;
+
+    layers::Layer<T>* enc_act_1_;
+    layers::Layer<T>* enc_act_2_;
     layers::Layer<T>* dec_act_1_;
-    layers::DeepSpectralLinear<T>* dsl_dec_2_;
 };
 
 void save_png_grid(const std::string& filename, const std::vector<std::vector<float>>& images, int rows, int cols, int size) {
@@ -508,10 +590,12 @@ T compute_tv_loss_and_grad(const Tensor<T>& img_batch, Tensor<T>& grad_tv, size_
 }
 
 template <typename T>
-void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, const std::string& checkpoint_file) {
-    size_t dim = 4096;
-    size_t side = 64;
-    WaveletAutoencoder<T> model(dim);
+void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, size_t dim, const std::string& checkpoint_file, bool use_alsh, bool use_kfac) {
+    size_t side = static_cast<size_t>(std::sqrt(dim));
+
+    std::cout << "Initializing Autoencoder. Dim=" << dim << ", ALSH=" << use_alsh << ", KFAC=" << use_kfac << std::endl;
+
+    WaveletAutoencoder<T> model(dim, use_alsh);
 
     struct stat buffer;
     bool exists = (stat(checkpoint_file.c_str(), &buffer) == 0);
@@ -529,8 +613,16 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
         model.init_scales(dim);
     }
 
-    optim::DiagonalNewton<T> optimizer(0.05, 1e-8, 1.0);
-    optimizer.add_parameters(model.parameters(), model.gradients(), model.curvatures());
+    // Optimizers
+    optim::DiagonalNewton<T>* dn_optimizer = nullptr;
+    optim::KFAC<T>* kfac_optimizer = nullptr;
+
+    if (use_kfac) {
+         kfac_optimizer = new optim::KFAC<T>(0.01);
+    } else {
+         dn_optimizer = new optim::DiagonalNewton<T>(0.05, 1e-8, 1.0);
+         dn_optimizer->add_parameters(model.parameters(), model.gradients(), model.curvatures());
+    }
 
     size_t end_epoch = start_epoch + epochs_to_run;
     std::cout << "Training from epoch " << start_epoch << " to " << end_epoch << std::endl;
@@ -544,7 +636,19 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
             Tensor<T> x({batch_size, dim});
             WaveletGenerator2D<T>::generate(x, batch_size);
 
-            optimizer.zero_grad();
+            if (dn_optimizer) dn_optimizer->zero_grad();
+            // KFAC doesn't need explicit zero_grad if step is manual, but if we used standard optimizer it would.
+            // My KFAC currently overwrites or accumulates?
+            // My KFAC implementation reads .gradients() from layers.
+            // Layer implementation overwrites gradients in backward usually?
+            // Dense::backward overwrites.
+            // ALSHSparseDense::backward overwrites.
+            // So we just need to ensure layers reset if needed.
+            // Actually, Dense::backward does: grad_weights_ = ... (assignment)
+            // But grad_bias_ = grad_output.sum(0) (assignment)
+            // So we are fine without zero_grad for these layers.
+            // However, standard API usually requires it.
+            // Let's rely on backward overwriting for now as per current layer impls.
 
             Tensor<T> z;
             Tensor<T> y = model.forward_train(x, z);
@@ -582,7 +686,11 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
 
             model.backward_with_reg(grad_recon, grad_reg_z);
 
-            optimizer.step();
+            if (use_kfac) {
+                kfac_optimizer->step(model.get_layers());
+            } else {
+                dn_optimizer->step();
+            }
 
             epoch_mse += mse;
             epoch_tv += batch_tv;
@@ -601,6 +709,9 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
     }
 
     model.save(checkpoint_file, end_epoch - 1);
+
+    if (dn_optimizer) delete dn_optimizer;
+    if (kfac_optimizer) delete kfac_optimizer;
 
     // Visualization
     std::cout << "Generating Visualization..." << std::endl;
@@ -630,7 +741,22 @@ void train(size_t epochs_to_run, size_t batches_per_epoch, size_t batch_size, co
 
 int main(int argc, char** argv) {
     size_t epochs = 5000;
+    size_t dim = 4096;
+
     if(argc > 1) epochs = std::atoi(argv[1]);
-    train<float>(epochs, 1, 64, "checkpoint.bin");
+
+    bool use_alsh = false;
+    bool use_kfac = false;
+
+    for(int i=2; i<argc; ++i) {
+        std::string arg = argv[i];
+        if(arg == "--alsh") use_alsh = true;
+        if(arg == "--kfac") use_kfac = true;
+        if(arg.rfind("--dim=", 0) == 0) {
+            dim = std::atoi(arg.substr(6).c_str());
+        }
+    }
+
+    train<float>(epochs, 1, 64, dim, "checkpoint.bin", use_alsh, use_kfac);
     return 0;
 }
