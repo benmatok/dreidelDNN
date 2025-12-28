@@ -248,6 +248,111 @@ struct AlienOps {
             high[i] = (input[i] >> 4) & 0x0F;
         }
     }
+
+    // --- 3. Branchless Gate (Phase 5) ---
+
+    /**
+     * @brief Branchless ReLU / Threshold.
+     * Sets values < 0 to 0.
+     * Uses bitwise masking to avoid branch misprediction.
+     */
+    static inline void branchless_relu(float* data, size_t n) {
+        size_t i = 0;
+#if defined(DREIDEL_ARCH_AVX2)
+        __m256 zero = _mm256_setzero_ps();
+        for(; i+8 <= n; i+=8) {
+            __m256 v = _mm256_loadu_ps(data + i);
+            v = _mm256_max_ps(v, zero);
+            _mm256_storeu_ps(data + i, v);
+        }
+#endif
+        for(; i < n; ++i) {
+            union { float f; uint32_t i; } u;
+            u.f = data[i];
+            // If sign bit (31) is 1, mask is 0xFFFFFFFF, else 0
+            // We want to keep x if x > 0.
+            // (x >> 31) gives 0 or 1.
+            // If we cast to int32, right shift arithmetic fills with sign bit?
+            // (int32_t)u.i >> 31 -> -1 (0xFFFFFFFF) if neg, 0 if pos.
+            // If neg, we want result 0.
+            // result = x & (~mask).
+            int32_t mask = (int32_t)u.i >> 31;
+            u.i = u.i & (~mask);
+            data[i] = u.f;
+        }
+    }
+
+    // --- 4. APoT Compression (Phase 6 Memory Footprint) ---
+
+    /**
+     * @brief Pack Float to 8-bit APoT Code.
+     * Format: [Sign:1] [Exponent+64:7]
+     * Exponent range: -63 to +63.
+     * Stored Exp 0 means Value 0.
+     */
+    static inline int8_t pack_apot(float val) {
+        if (val == 0.0f) return 0;
+
+        float abs_val = std::abs(val);
+        // k = round(log2(|val|))
+        // Fast approximation?
+        // float exponent is in bits 23-30.
+        // int exp_f = ((u.i >> 23) & 0xFF) - 127;
+        // This is floor(log2). Rounding might be better.
+        // Let's use std::log2 for now as packing is one-time (init).
+        int k = static_cast<int>(std::round(std::log2(abs_val)));
+
+        // Clamp to -63..63
+        if (k < -63) return 0; // Underflow to 0
+        if (k > 63) k = 63;
+
+        uint8_t stored = (k + 64) & 0x7F;
+        if (val < 0) stored |= 0x80;
+        return static_cast<int8_t>(stored);
+    }
+
+    /**
+     * @brief Unpack 8-bit APoT Code to Float.
+     * Uses bitwise manipulation to construct float from exponent index.
+     * k range -63..63 -> float exp range -63..63 (actual +127)
+     */
+    static inline float unpack_apot(int8_t code) {
+        uint8_t u_code = static_cast<uint8_t>(code);
+        uint8_t stored_exp = u_code & 0x7F;
+        if (stored_exp == 0) return 0.0f;
+
+        // Reconstruct float:
+        // Exponent bits (8 bits): stored_exp - 64 + 127 = stored_exp + 63
+        // Mantissa: 0 (implicit 1.0)
+        // Sign: MSB of code
+
+        uint32_t sign = (u_code & 0x80) << 24; // Bit 7 -> Bit 31
+        uint32_t exp = (static_cast<uint32_t>(stored_exp) + 63) << 23;
+
+        union { uint32_t i; float f; } u;
+        u.i = sign | exp;
+        return u.f;
+    }
+
+    // --- 5. Morton / Z-Curve Tools (Phase 6) ---
+
+    /**
+     * @brief Interleave bits for Z-Curve (Morton Code).
+     * Only supports up to 16-bit coordinates (32-bit result).
+     * "Magic Bit Shift" method.
+     */
+    static inline uint32_t morton_2d(uint16_t x, uint16_t y) {
+        auto part1by1 = [](uint16_t n) -> uint32_t {
+            uint32_t x = n;
+            x = (x | (x << 8)) & 0x00FF00FF;
+            x = (x | (x << 4)) & 0x0F0F0F0F;
+            x = (x | (x << 2)) & 0x33333333;
+            x = (x | (x << 1)) & 0x55555555;
+            return x;
+        };
+        return (part1by1(y) << 1) | part1by1(x);
+    }
+
 };
 
 } // namespace hal

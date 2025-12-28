@@ -68,6 +68,13 @@ public:
             sw_ptr[i] = quantize_apot(sw_ptr[i]);
         }
 
+        // Compress Weights for Phase 6
+        packed_weights_.resize(spatial_weights_.size());
+        for(size_t i=0; i<spatial_weights_.size(); ++i) {
+            // Only float supported for APoT pack currently in ops
+            packed_weights_[i] = hal::AlienOps::pack_apot(static_cast<float>(sw_ptr[i]));
+        }
+
         // Fix: Initialize scales to 1/N to counteract FWHT gain (which is N for unnormalized, or sqrt(N)?)
         // Standard WHT unnormalized has energy gain N^2, amplitude gain N?
         // Actually H*H = N*I. So x -> Hx scales L2 norm by sqrt(N).
@@ -156,87 +163,107 @@ public:
                 if (dist > (int)(C/2)) continue; // Sleep
             }
 
-            for(size_t h=0; h<H; ++h) {
-                for(size_t w=0; w<W; ++w) {
+            // Phase 6: Super-Block Tiling (Blocked Z-Curve Approximation)
+            // Iterate in 8x8 blocks to improve cache locality.
+            constexpr int BLOCK_H = 8;
+            constexpr int BLOCK_W = 8;
 
-                    // 2. The Teleporting Eyes (Spatial LUT & AVX)
-                    // Reset accumulator
-                    for(size_t c=0; c<C; ++c) pixel_buffer[c] = 0;
+            for(size_t by=0; by<H; by+=BLOCK_H) {
+                for(size_t bx=0; bx<W; bx+=BLOCK_W) {
 
-                    for(int ky=-k_rad; ky<=k_rad; ++ky) {
-                        for(int kx=-k_rad; kx<=k_rad; ++kx) {
-                            int ih = h + ky;
-                            int iw = w + kx;
-                            if (ih>=0 && ih<H && iw>=0 && iw<W) {
-                                const T* p_in = in_ptr + ((n*H + ih)*W + iw)*C;
-                                int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
-                                const T* p_w = sw_ptr + k_idx * channels_;
+                    // Iterate within block
+                    for(size_t dy=0; dy<BLOCK_H; ++dy) {
+                        for(size_t dx=0; dx<BLOCK_W; ++dx) {
+                            size_t h = by + dy;
+                            size_t w = bx + dx;
+                            if (h >= H || w >= W) continue;
 
-                                // Fallback to optimized float loop for correctness in this float model,
-                                // but acknowledge the Alien architecture via AlienOps usage elsewhere.
+                            // 2. The Teleporting Eyes (Spatial LUT & AVX)
+                            // Reset accumulator
+                            for(size_t c=0; c<C; ++c) pixel_buffer[c] = 0;
 
-                                for(size_t c=0; c<C; ++c) {
-                                    pixel_buffer[c] += lut_mul(p_in[c], p_w[c]);
+                            for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                                for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                                    int ih = h + ky;
+                                    int iw = w + kx;
+                                    if (ih>=0 && ih<H && iw>=0 && iw<W) {
+                                        const T* p_in = in_ptr + ((n*H + ih)*W + iw)*C;
+                                        int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
+
+                                        // Phase 6: Use packed weights to reduce bandwidth
+                                        const int8_t* p_w_packed = packed_weights_.data() + k_idx * channels_;
+
+                                        // Fallback to optimized float loop for correctness in this float model,
+                                        // but acknowledge the Alien architecture via AlienOps usage elsewhere.
+
+                                        for(size_t c=0; c<C; ++c) {
+                                            // Decode APoT on the fly
+                                            // In hardware, this is a LUT lookup or shift.
+                                            // Here we simulate the bandwidth saving by reading int8.
+                                            float w_val = hal::AlienOps::unpack_apot(p_w_packed[c]);
+                                            pixel_buffer[c] += p_in[c] * static_cast<T>(w_val);
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
 
-                    // 3. The Mixer (Spectral Engine) -> In-Place on pixel_buffer
+                            // 3. The Mixer (Spectral Engine) -> In-Place on pixel_buffer
 
-                    // a. Soft Permutation (Ghost Phase)
-                    // If float and C=64 on AVX2, use optimized gather
-                    if (std::is_same<T, float>::value && C == 64) {
+                            // a. Soft Permutation (Ghost Phase)
+                            // If float and C=64 on AVX2, use optimized gather
+                            if (std::is_same<T, float>::value && C == 64) {
 #if defined(DREIDEL_ARCH_AVX2)
-                        hal::sparse_gather((const float*)pixel_buffer, perm_indices_.data(), (float*)temp_perm_buffer, C);
-                        // Copy back? Or just ping-pong?
-                        // Zenith Pipeline: Eyes -> pixel_buffer
-                        // Permute: pixel_buffer -> temp_perm_buffer
-                        // Mixer: temp_perm_buffer -> temp_perm_buffer (inplace)
-                        // Scale: temp_perm_buffer -> temp_perm_buffer
-                        // Write: temp_perm_buffer -> Output
+                                hal::sparse_gather((const float*)pixel_buffer, perm_indices_.data(), (float*)temp_perm_buffer, C);
 
-                        // Let's just point pixel_buffer to temp for subsequent steps?
-                        // But pixel_buffer is allocated from arena.
-                        // We copy back for now to keep it simple, or execute mixing on temp.
-                        // Executing on temp is better.
+                                // b. In-Place FWHT (Register Mixer)
+                                hal::x86::fwht64_avx2((float*)temp_perm_buffer);
 
-                        // b. In-Place FWHT (Register Mixer)
-                        hal::x86::fwht64_avx2((float*)temp_perm_buffer);
+                                // c. Learnable APoT Scaling (Bit-Shifts)
+                                for(size_t i=0; i<C; ++i) {
+                                    temp_perm_buffer[i] = lut_mul(temp_perm_buffer[i], effective_scales[i]);
+                                }
 
-                        // c. Learnable APoT Scaling (Bit-Shifts)
-                        for(size_t i=0; i<C; ++i) {
-                            temp_perm_buffer[i] = lut_mul(temp_perm_buffer[i], effective_scales[i]);
-                        }
+                                // Phase 5: Branchless Gate
+                                hal::AlienOps::branchless_relu((float*)temp_perm_buffer, C);
 
-                        // Write to Output from temp_perm_buffer
-                        T* p_out = out_ptr + ((n*H + h)*W + w)*C;
-                        for(size_t c=0; c<C; ++c) {
-                            p_out[c] = temp_perm_buffer[c];
-                        }
+                                // Write to Output from temp_perm_buffer
+                                T* p_out = out_ptr + ((n*H + h)*W + w)*C;
+                                for(size_t c=0; c<C; ++c) {
+                                    p_out[c] = temp_perm_buffer[c];
+                                }
 
-                        continue; // Skip the standard path
+                                continue; // Skip the standard path
 #endif
-                    }
+                            }
 
-                    // Standard Path (Fallback)
-                    for(size_t i=0; i<C; ++i) temp_perm_buffer[i] = pixel_buffer[i];
-                    for(size_t i=0; i<C; ++i) {
-                        pixel_buffer[i] = temp_perm_buffer[perm_indices_[i]];
-                    }
+                            // Standard Path (Fallback)
+                            for(size_t i=0; i<C; ++i) temp_perm_buffer[i] = pixel_buffer[i];
+                            for(size_t i=0; i<C; ++i) {
+                                pixel_buffer[i] = temp_perm_buffer[perm_indices_[i]];
+                            }
 
-                    // b. In-Place FWHT
-                    algo::WHT::fwht_1d(pixel_buffer, C);
+                            // b. In-Place FWHT
+                            algo::WHT::fwht_1d(pixel_buffer, C);
 
-                    // c. Learnable APoT Scaling (Bit-Shifts)
-                    for(size_t i=0; i<C; ++i) {
-                        pixel_buffer[i] = lut_mul(pixel_buffer[i], effective_scales[i]);
-                    }
+                            // c. Learnable APoT Scaling (Bit-Shifts)
+                            for(size_t i=0; i<C; ++i) {
+                                pixel_buffer[i] = lut_mul(pixel_buffer[i], effective_scales[i]);
+                            }
 
-                    // Write to Output
-                    T* p_out = out_ptr + ((n*H + h)*W + w)*C;
-                    for(size_t c=0; c<C; ++c) {
-                        p_out[c] = pixel_buffer[c];
+                            // Phase 5: Branchless Gate (Standard Path)
+                            if (std::is_same<T, float>::value) {
+                                hal::AlienOps::branchless_relu((float*)pixel_buffer, C);
+                            } else {
+                                // Fallback
+                                for(size_t i=0; i<C; ++i) if (pixel_buffer[i] < 0) pixel_buffer[i] = 0;
+                            }
+
+                            // Write to Output
+                            T* p_out = out_ptr + ((n*H + h)*W + w)*C;
+                            for(size_t c=0; c<C; ++c) {
+                                p_out[c] = pixel_buffer[c];
+                            }
+                        }
                     }
                 }
             }
@@ -383,6 +410,9 @@ private:
     Tensor<T> spatial_weights_; // (C, 1, K, K)
     Tensor<T> spectral_scales_; // (1, C)
     std::vector<int> perm_indices_;
+
+    // Phase 6: Memory Footprint Reduction
+    std::vector<int8_t> packed_weights_; // Compressed Spatial Weights
 
     // Oracle
     std::vector<T> oracle_projection_;
