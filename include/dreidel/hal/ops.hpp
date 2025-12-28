@@ -284,6 +284,8 @@ struct AlienOps {
 
     // --- 4. APoT Compression (Phase 6 Memory Footprint) ---
 
+    // --- 4. APoT Compression (Phase 6 Memory Footprint) ---
+
     /**
      * @brief Pack Float to 8-bit APoT Code.
      * Format: [Sign:1] [Exponent+64:7]
@@ -310,6 +312,209 @@ struct AlienOps {
         if (val < 0) stored |= 0x80;
         return static_cast<int8_t>(stored);
     }
+
+    // --- 5. LNS Arithmetic Tables (LUT Trick) ---
+
+    // Helper to generate full MUL/ADD tables for APoT
+    struct ApotTables {
+        uint8_t mul[65536];
+        uint8_t add[65536];
+
+        ApotTables() {
+            // Re-use unpack/pack to generate tables
+            for(int i=0; i<256; ++i) {
+                for(int j=0; j<256; ++j) {
+                    float a = unpack_apot(static_cast<int8_t>(i));
+                    float b = unpack_apot(static_cast<int8_t>(j));
+
+                    // MUL
+                    mul[(i << 8) | j] = static_cast<uint8_t>(pack_apot(a * b));
+
+                    // ADD
+                    add[(i << 8) | j] = static_cast<uint8_t>(pack_apot(a + b));
+                }
+            }
+        }
+    };
+
+    static inline const ApotTables& get_apot_tables() {
+        static ApotTables tables;
+        return tables;
+    }
+
+    /**
+     * @brief Scalar APoT Multiplication using LUT.
+     */
+    static inline int8_t apot_mul_lut(int8_t a, int8_t b) {
+        const auto& t = get_apot_tables();
+        uint16_t idx = (static_cast<uint8_t>(a) << 8) | static_cast<uint8_t>(b);
+        return static_cast<int8_t>(t.mul[idx]);
+    }
+
+    /**
+     * @brief Scalar APoT Addition using LUT.
+     */
+    static inline int8_t apot_add_lut(int8_t a, int8_t b) {
+        const auto& t = get_apot_tables();
+        uint16_t idx = (static_cast<uint8_t>(a) << 8) | static_cast<uint8_t>(b);
+        return static_cast<int8_t>(t.add[idx]);
+    }
+
+    /**
+     * @brief Vectorized APoT Pack using AVX2 Intrinsics.
+     * Compresses 8x 32-bit floats to 8x 8-bit codes (packed into bottom of __m256i or memory).
+     * Since we usually store to int8 array, this writes 8 bytes.
+     */
+#if defined(DREIDEL_ARCH_AVX2)
+    static inline void vec_pack_apot_avx2(const float* src, int8_t* dst) {
+        // Load 8 floats
+        __m256 v = _mm256_loadu_ps(src);
+
+        // Convert to Int32 representation (reinterpretation)
+        __m256i vi = _mm256_castps_si256(v);
+
+        // Extract Sign: Bit 31 -> Bit 7
+        // (x >> 24) & 0x80
+        __m256i sign = _mm256_srli_epi32(vi, 24);
+        sign = _mm256_and_si256(sign, _mm256_set1_epi32(0x80));
+
+        // Extract Exponent: Bits 23-30
+        // (x >> 23) & 0xFF. This is (exp + 127).
+        __m256i exp = _mm256_srli_epi32(vi, 23);
+        exp = _mm256_and_si256(exp, _mm256_set1_epi32(0xFF));
+
+        // We want stored = (exp - 127 + 64) = exp - 63.
+        // Clamp handling:
+        // APoT range is k in -63..63. Stored in 1..127. 0 is zero.
+        // Float exp range 0..255.
+        // We want to map float exp to APoT exp.
+        // Target: Stored = (FloatExp - 127) + 64 = FloatExp - 63.
+
+        // Check for Zero/Denormal (FloatExp == 0)
+        __m256i zero_mask = _mm256_cmpeq_epi32(exp, _mm256_setzero_si256());
+
+        // Subtract 63
+        exp = _mm256_sub_epi32(exp, _mm256_set1_epi32(63));
+
+        // Clamp to 1..127 (using signed comparison/min/max)
+        // If exp < 1, set to 0 (underflow) -> Actually mapped to 0 via zero_mask later?
+        // Let's use max(1, min(127, exp)).
+        __m256i v_1 = _mm256_set1_epi32(1);
+        __m256i v_127 = _mm256_set1_epi32(127);
+        exp = _mm256_max_epi32(exp, v_1);
+        exp = _mm256_min_epi32(exp, v_127);
+
+        // If original input was 0.0f (or denorm), result should be 0.
+        // Also check if abs(val) is very small.
+        // But simply masking with zero_mask (if exp was 0) is good enough for now.
+        // Or check if FloatExp < 64 (underflow range).
+
+        // Combine Sign | Exp
+        __m256i result = _mm256_or_si256(sign, exp);
+
+        // Apply Zero Mask (if original exp was 0, or if we want to flush smalls)
+        // We set result to 0 if zero_mask is true.
+        // result = result & (~zero_mask)
+        result = _mm256_andnot_si256(zero_mask, result);
+
+        // Pack 32-bit integers to 8-bit bytes.
+        // AVX2 Packing is annoying.
+        // 32 -> 16 (_mm256_packus_epi32) -> 16 -> 8 (_mm256_packus_epi16).
+        // packus works on 128-bit lanes. Cross-lane permutation needed?
+        // _mm256_packus_epi32(a, b):
+        // [a0..a3] [b0..b3] -> [a0s..a3s b0s..b3s] (in each 128 lane).
+        // If we only have 1 input vector (8 floats), we pass it as 'a' and 'b'?
+        // result = pack(vi, vi).
+        // Then pack(res, res).
+        // Then extract low 64 bits?
+
+        // Safer/Simpler for just 8 values: _mm256_permutevar8x32_ps + _mm_store?
+        // Or just specialized pack sequence.
+
+        // Step 1: Pack 32->16 (Signed saturation? We know value is 0..255 unsigned).
+        // _mm256_packus_epi32.
+        __m256i p16 = _mm256_packus_epi32(result, result);
+        // Layout: [R0..R3 R0..R3] [R4..R7 R4..R7] (16-bit)
+
+        // Step 2: Pack 16->8
+        __m256i p8 = _mm256_packus_epi16(p16, p16);
+        // Layout: [R0..R3 R0..R3... ] [R4..R7 R4..R7... ] (8-bit)
+
+        // We need R0..R7.
+        // They are split across lanes.
+        // Lower 128: [R0..R3 R0..R3 R0..R3 R0..R3] (bytes)
+        // Upper 128: [R4..R7 R4..R7 R4..R7 R4..R7]
+        // We need to extract specific bytes.
+        // Actually, we can just extract 32 bits from low lane and 32 bits from high lane.
+
+        int32_t lower = _mm_cvtsi128_si32(_mm256_castsi256_si128(p8)); // Gets R0..R3
+        int32_t upper = _mm_cvtsi128_si32(_mm256_extracti128_si256(p8, 1)); // Gets R4..R7
+
+        ((int32_t*)dst)[0] = lower;
+        ((int32_t*)dst)[1] = upper;
+    }
+#endif
+
+    /**
+     * @brief Vectorized APoT Multiplication using Exponent Addition.
+     * Computes P = A * B in APoT domain.
+     * Logic:
+     *   Sign = Sign(A) XOR Sign(B)
+     *   Exp = Exp(A) + Exp(B) - Bias(64)
+     *   Zero Handling: If A=0 or B=0, result 0.
+     *
+     * @param a 128-bit vector of 16 APoT codes (or partially used)
+     * @param b 128-bit vector of 16 APoT codes
+     * @return 128-bit vector of Product codes
+     */
+#if defined(DREIDEL_ARCH_AVX2)
+    static inline __m128i vec_mul_apot_avx2(__m128i a, __m128i b) {
+        // Masks
+        __m128i sign_mask = _mm_set1_epi8(0x80);
+        __m128i exp_mask = _mm_set1_epi8(0x7F);
+        __m128i bias = _mm_set1_epi8(64);
+
+        // 1. Sign Calculation
+        __m128i sign_a = _mm_and_si128(a, sign_mask);
+        __m128i sign_b = _mm_and_si128(b, sign_mask);
+        __m128i sign_p = _mm_xor_si128(sign_a, sign_b);
+
+        // 2. Exponent Calculation
+        __m128i exp_a = _mm_and_si128(a, exp_mask);
+        __m128i exp_b = _mm_and_si128(b, exp_mask);
+
+        // Zero Check: If exp is 0, value is 0.
+        __m128i zero_a = _mm_cmpeq_epi8(exp_a, _mm_setzero_si128());
+        __m128i zero_b = _mm_cmpeq_epi8(exp_b, _mm_setzero_si128());
+        __m128i is_zero = _mm_or_si128(zero_a, zero_b);
+
+        // Add exponents: E_a + E_b using saturated add to detect overflow?
+        // Or standard add. Max exp is 127. 127+127 = 254. Fits in uint8.
+        __m128i exp_sum = _mm_add_epi8(exp_a, exp_b);
+
+        // Subtract Bias: E_p = Sum - 64.
+        // Use saturated subtraction to clamp underflow to 0?
+        // _mm_subs_epu8. If (Sum < 64), result 0 (which is effectively zero value).
+        __m128i exp_p = _mm_subs_epu8(exp_sum, bias);
+
+        // Check Overflow (if Sum > 127 + 64 = 191).
+        // Since we use 8-bit arithmetic, simple add might wrap?
+        // E.g. 120 + 120 = 240. 240 - 64 = 176.
+        // 176 > 127. It's technically valid (larger magnitude).
+        // But APoT format is 7-bit exp (0..127).
+        // We should clamp to 127.
+        __m128i max_exp = _mm_set1_epi8(127);
+        exp_p = _mm_min_epu8(exp_p, max_exp);
+
+        // Combine Sign | Exp
+        __m128i prod = _mm_or_si128(sign_p, exp_p);
+
+        // Apply Zero Mask
+        prod = _mm_andnot_si128(is_zero, prod);
+
+        return prod;
+    }
+#endif
 
     /**
      * @brief Unpack 8-bit APoT Code to Float using LUT.
