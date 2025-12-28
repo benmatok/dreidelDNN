@@ -188,7 +188,7 @@ public:
                     // If float and C=64 on AVX2, use optimized gather
                     if (std::is_same<T, float>::value && C == 64) {
 #if defined(DREIDEL_ARCH_AVX2)
-                        hal::sparse_gather((float*)pixel_buffer, perm_indices_.data(), (float*)temp_perm_buffer, C);
+                        hal::sparse_gather((const float*)pixel_buffer, perm_indices_.data(), (float*)temp_perm_buffer, C);
                         // Copy back? Or just ping-pong?
                         // Zenith Pipeline: Eyes -> pixel_buffer
                         // Permute: pixel_buffer -> temp_perm_buffer
