@@ -320,7 +320,7 @@ void run_benchmark(std::string name, size_t epochs, size_t batch_size, size_t ch
 int main() {
     size_t epochs = 50; // Short run for validation
     size_t batch_size = 4;
-    size_t channels = 16;
+    size_t channels = 64; // Increased from 16 to 64 to amplify performance gap
 
     std::cout << "Starting Zenith vs Conv2D Comparison..." << std::endl;
     std::cout << "Image Size: 64x64, Batch: " << batch_size << ", Channels: " << channels << std::endl;
