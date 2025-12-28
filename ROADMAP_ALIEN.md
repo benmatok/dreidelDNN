@@ -96,3 +96,62 @@
 
 ### Phase 3: Tooling
 - [ ] **`tools/Baker.cpp`**: Pre-processor for generating constexpr masks.
+
+---
+
+## 7. Benchmark Validation & Diagnostics
+
+**Goal:** Prove "Alien" superiority over Standard `Conv2D` (Im2Col + GEMM) and diagnose bottlenecks.
+
+### A. The "Why No Speedup?" Diagnosis
+
+If `vpermb` (Eyes) is fast but the overall block is slow, check these **Performance Killers**:
+
+1. **The Copy Penalty (Phase 4):** You mentioned using `std::vector` indices for permutation. **This is fatal.** Random memory reads (Scatter/Gather) are ~100x slower than the math you saved.
+* *Fix:* You **must** implement Phase 4 (Ghost Permutation) or at least a hard-coded pre-computed shuffle to see gains.
+
+
+2. **Cache Thrashing (Phase 3):** Iterative FWHT reads/writes the same array (N)$ times. If that array spills out of L1 Cache, you are memory-bound.
+* *Fix:* The Register-Resident Mixer is mandatory to hide this latency.
+
+
+3. **ALSH Overhead (Phase 1):** If the Oracle doesn't skip at least **80-90%** of blocks, the overhead of calculating the hash (`POPCNT`) might cost more than the savings.
+
+### B. Speedup Estimates (Target vs. Current)
+
+| Component | Standard Baseline | Current Implementation (Est.) | **Final "Alien" Target** | Why? |
+| --- | --- | --- | --- | --- |
+| **1. The Oracle** | N/A (Always Compute) | **0.8x (Slower)** | **5x - 20x** | Needs high sparsity (>90%) to pay off the `POPCNT` cost. |
+| **2. The Eyes** | `FMUL` Latency (4 cycles) | **10x (L1 Hit) / 1x (RAM)** | **~30x** | `vpermb` is instant, but only if inputs are already in registers (Phase 6 needed). |
+| **3. The Mixer** | `GEMM` (^2$) | **2x - 5x** | **50x** | Iterative FWHT is cache-heavy. Register FWHT is cache-free. |
+| **4. Permutation** | Free (Fixed topology) | **0.1x (Disaster)** | **100x (Instant)** | `std::vector` copies are the bottleneck right now. |
+| **TOTAL** | **1.0x** | **~0.9x - 1.5x** | **~25x** | **Memory movement is eating your math gains.** |
+
+### C. Validation Tests (Micro-Benchmarks)
+
+Add these specific tests to `tests/benchmark_alien.cpp`:
+
+**Test 1: The "L1 Resident" Eye Test**
+
+* **Setup:** Pre-load a small 32KB chunk of data (fits in L1). Run `ZenithBlock::Eyes` 1,000,000 times.
+* **Goal:** Verify `vpermb` throughput.
+* **Pass Criteria:** Should be >10x faster than standard float convolution loops.
+* **Fail?** If not, your compiler isn't generating `vpermb`. Check assembly (`objdump -d`).
+
+**Test 2: The "Memory Wall" Test**
+
+* **Setup:** Run `ZenithBlock` on a 100MB image (blows out L3 cache).
+* **Goal:** Measure the impact of **Phase 6 (Z-Curve)**.
+* **Expected:** Without Z-Curve, this will be slow. This baseline proves the need for Phase 6.
+
+**Test 3: The "Sparsity" Breakeven Analysis**
+
+* **Setup:** Run the Oracle with different "Active Block" percentages (10%, 50%, 100%).
+* **Goal:** Find the "Breakeven Point."
+* **Hypothesis:** You likely need < 20% active blocks for the overhead to make sense currently.
+
+### D. Immediate Action Plan
+
+1. **Kill the `std::vector` copy immediately.** Even a hard-coded, ugly manual shuffle loop is better than a generic vector copy.
+2. **Inspect Assembly:** Run `objdump -d -M intel your_binary | grep vpermb`. If you don't see it, `AlienOps::lut_lookup` is failing to vectorize.
+3. **Profile L1 Misses:** Use `perf stat -e L1-dcache-load-misses ./your_benchmark`. High misses = You need Phase 6 (Z-Curve) and Phase 3 (Register Mixer).
