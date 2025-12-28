@@ -103,15 +103,17 @@ public:
         // Reset Arena for this pass
         arena_.reset();
 
-        // Allocate buffers in Arena
-        // Buffer B: (W * C) elements
-        size_t row_size = W * C;
-        T* buffer_b = arena_.allocate<T>(row_size); // For Mixer output accumulation
+        // Allocate scratch buffers in Arena for single pixel operation
+        // Fused Pipeline requires just one buffer of size C for intermediate results
+        // Actually, we need 1 buffer for perm/fwht/scale.
+        T* pixel_buffer = arena_.allocate<T>(C);
         T* temp_perm_buffer = arena_.allocate<T>(C);
 
         // Helper wrappers
-        core::TensorView<T> input_view(const_cast<T*>(input.data()), shape);
-        core::TensorView<T> output_view(output.data(), shape);
+        // core::TensorView<T> input_view(const_cast<T*>(input.data()), shape);
+        // core::TensorView<T> output_view(output.data(), shape);
+        const T* in_ptr = input.data();
+        T* out_ptr = output.data();
 
         const T* sw_ptr = spatial_weights_.data();
         const T* scale_ptr = spectral_scales_.data();
@@ -130,61 +132,63 @@ public:
             // Simplified: Check dot product of center pixel with oracle projection
             if (use_gating_) {
                 T val = 0;
-                // Simple average pooling over spatial for robustness check? Or just center?
-                // Using center for speed.
                 size_t ch = H/2, cw = W/2;
-                for(size_t c=0; c<C; ++c) val += input_view.at(n, ch, cw, c) * oracle_projection_[c];
+                const T* p_center = in_ptr + ((n*H + ch)*W + cw)*C;
+                for(size_t c=0; c<C; ++c) val += p_center[c] * oracle_projection_[c];
                 int bucket = (val >= 0) ? 1 : 0;
                 if (bucket != active_bucket_) continue; // Sleep -> Output remains 0
             }
 
             for(size_t h=0; h<H; ++h) {
-                // 2. The Eyes (Spatial LUT & APoT) -> Write to Buffer B
-                // Depthwise Conv
                 for(size_t w=0; w<W; ++w) {
-                    for(size_t c=0; c<C; ++c) {
-                        T acc = 0;
-                        for(int ky=-k_rad; ky<=k_rad; ++ky) {
-                            for(int kx=-k_rad; kx<=k_rad; ++kx) {
-                                int ih = h + ky;
-                                int iw = w + kx;
-                                if (ih>=0 && ih<H && iw>=0 && iw<W) {
-                                    T pixel = input_view.at(n, ih, iw, c);
-                                    // Weight Index
-                                    int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
-                                    T w_apot = sw_ptr[k_idx*channels_ + c]; // Depthwise weights
-                                    acc += lut_mul(pixel, w_apot);
+
+                    // 2. The Eyes (Spatial LUT & APoT)
+                    // Fused Loop: Calculate Depthwise for all C channels
+
+                    // Reset accumulator
+                    for(size_t c=0; c<C; ++c) pixel_buffer[c] = 0;
+
+                    for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                        for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                            int ih = h + ky;
+                            int iw = w + kx;
+                            if (ih>=0 && ih<H && iw>=0 && iw<W) {
+                                // Pointer Arithmetic
+                                // Input offset: ((n*H + ih)*W + iw)*C
+                                // Weight offset: (k_idx*channels_)
+
+                                const T* p_in = in_ptr + ((n*H + ih)*W + iw)*C;
+                                int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
+                                const T* p_w = sw_ptr + k_idx * channels_;
+
+                                // Vectorizable Inner Loop over Channels
+                                for(size_t c=0; c<C; ++c) {
+                                    pixel_buffer[c] += lut_mul(p_in[c], p_w[c]);
                                 }
                             }
                         }
-                        buffer_b[w*C + c] = acc;
                     }
-                }
 
-                // 3. The Mixer (Spectral Engine) -> In-Place on Buffer B
-                for(size_t w=0; w<W; ++w) {
-                    T* pixel_vec = buffer_b + w*C;
+                    // 3. The Mixer (Spectral Engine) -> In-Place on pixel_buffer
 
                     // a. Soft Permutation
-                    // Use preallocated temp buffer
-                    for(size_t i=0; i<C; ++i) temp_perm_buffer[i] = pixel_vec[i];
+                    for(size_t i=0; i<C; ++i) temp_perm_buffer[i] = pixel_buffer[i];
                     for(size_t i=0; i<C; ++i) {
-                        pixel_vec[i] = temp_perm_buffer[perm_indices_[i]];
+                        pixel_buffer[i] = temp_perm_buffer[perm_indices_[i]];
                     }
 
                     // b. In-Place FWHT
-                    algo::WHT::fwht_1d(pixel_vec, C);
+                    algo::WHT::fwht_1d(pixel_buffer, C);
 
                     // c. Learnable APoT Scaling (Bit-Shifts)
                     for(size_t i=0; i<C; ++i) {
-                        pixel_vec[i] = lut_mul(pixel_vec[i], effective_scales[i]);
+                        pixel_buffer[i] = lut_mul(pixel_buffer[i], effective_scales[i]);
                     }
-                }
 
-                // Write Buffer B to Output
-                for(size_t w=0; w<W; ++w) {
+                    // Write to Output
+                    T* p_out = out_ptr + ((n*H + h)*W + w)*C;
                     for(size_t c=0; c<C; ++c) {
-                        output_view.at(n, h, w, c) = buffer_b[w*C + c];
+                        p_out[c] = pixel_buffer[c];
                     }
                 }
             }
@@ -196,8 +200,6 @@ public:
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
         // Simplified Backward for APoT/Spectral
-        // We propagate gradients using float math, but respect the structure.
-        // Gradient of APoT quantization is usually STE (Straight Through Estimator) -> Identity.
 
         auto shape = input_.shape();
         size_t batch = shape[0];
@@ -217,9 +219,9 @@ public:
         const T* scale_ptr = spectral_scales_.data();
         int k_rad = kernel_size_ / 2;
 
-        core::TensorView<T> go_view(const_cast<T*>(grad_output.data()), shape);
-        core::TensorView<T> gi_view(grad_input.data(), shape);
-        core::TensorView<T> in_view(input_.data(), shape);
+        const T* go_ptr = grad_output.data();
+        T* gi_ptr = grad_input.data();
+        const T* in_ptr = input_.data();
 
         // Preallocate scratch buffers in Arena (Resetting for backward reuse)
         arena_.reset();
@@ -230,33 +232,36 @@ public:
 
         for(size_t n=0; n<batch; ++n) {
 
-            // Should also check gating in backward: if skipped in forward, skip backward (grad is 0)
             if (use_gating_) {
                T val = 0;
                size_t ch = H/2, cw = W/2;
-               for(size_t c=0; c<C; ++c) val += in_view.at(n, ch, cw, c) * oracle_projection_[c];
+               const T* p_center = in_ptr + ((n*H + ch)*W + cw)*C;
+               for(size_t c=0; c<C; ++c) val += p_center[c] * oracle_projection_[c];
                int bucket = (val >= 0) ? 1 : 0;
                if (bucket != active_bucket_) continue;
             }
 
             for(size_t h=0; h<H; ++h) {
                 for(size_t w=0; w<W; ++w) {
-                    // Reverse Mixer
-                    for(size_t c=0; c<C; ++c) d_vec[c] = go_view.at(n, h, w, c);
+
+                    // Read Grad Output
+                    const T* p_go = go_ptr + ((n*H + h)*W + w)*C;
+                    for(size_t c=0; c<C; ++c) d_vec[c] = p_go[c];
 
                     // c. Scale Backward
-                    // Recompute forward part.
+                    // Recompute forward part (Eyes Output)
+                    for(size_t c=0; c<C; ++c) eyes_out[c] = 0;
 
-                    // Recompute 'The Eyes' output for this pixel
-                    std::fill(eyes_out, eyes_out + C, 0);
-                    for(size_t c=0; c<C; ++c) {
-                        for(int ky=-k_rad; ky<=k_rad; ++ky) {
-                            for(int kx=-k_rad; kx<=k_rad; ++kx) {
-                                int ih = h + ky;
-                                int iw = w + kx;
-                                if (ih>=0 && ih<H && iw>=0 && iw<W) {
-                                     int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
-                                     eyes_out[c] += lut_mul(in_view.at(n, ih, iw, c), sw_ptr[k_idx*channels_ + c]);
+                    for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                        for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                            int ih = h + ky;
+                            int iw = w + kx;
+                            if (ih>=0 && ih<H && iw>=0 && iw<W) {
+                                const T* p_in = in_ptr + ((n*H + ih)*W + iw)*C;
+                                int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
+                                const T* p_w = sw_ptr + k_idx * channels_;
+                                for(size_t c=0; c<C; ++c) {
+                                    eyes_out[c] += lut_mul(p_in[c], p_w[c]);
                                 }
                             }
                         }
@@ -281,21 +286,24 @@ public:
                     }
 
                     // Reverse Eyes (Depthwise Backward)
-                    for(size_t c=0; c<C; ++c) {
-                        T dy = d_unperm[c];
-                        for(int ky=-k_rad; ky<=k_rad; ++ky) {
-                            for(int kx=-k_rad; kx<=k_rad; ++kx) {
-                                int ih = h + ky;
-                                int iw = w + kx;
-                                if (ih>=0 && ih<H && iw>=0 && iw<W) {
-                                    int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
+                    for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                        for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                            int ih = h + ky;
+                            int iw = w + kx;
+                            if (ih>=0 && ih<H && iw>=0 && iw<W) {
+                                int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
 
+                                T* p_gs = gs_ptr + k_idx * channels_;
+                                const T* p_in = in_ptr + ((n*H + ih)*W + iw)*C;
+                                const T* p_w = sw_ptr + k_idx * channels_;
+                                T* p_gi = gi_ptr + ((n*H + ih)*W + iw)*C;
+
+                                for(size_t c=0; c<C; ++c) {
+                                    T dy = d_unperm[c];
                                     // Grad Weights
-                                    gs_ptr[k_idx*channels_ + c] += dy * in_view.at(n, ih, iw, c); // STE
-
+                                    p_gs[c] += dy * p_in[c]; // STE
                                     // Grad Input
-                                    size_t gi_idx = ((n*H + ih)*W + iw)*C + c;
-                                    grad_input.data()[gi_idx] += dy * sw_ptr[k_idx*channels_ + c];
+                                    p_gi[c] += dy * p_w[c];
                                 }
                             }
                         }
