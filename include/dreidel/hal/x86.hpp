@@ -31,6 +31,10 @@ struct Ops {
         return _mm512_sub_ps(a, b);
     }
 
+    static inline __m512 mul(__m512 a, __m512 b) {
+        return _mm512_mul_ps(a, b);
+    }
+
     // Butterfly on registers
     static inline void butterfly(__m512& a, __m512& b) {
         __m512 u = a;
@@ -65,6 +69,10 @@ struct Ops {
 
     static inline __m256 sub(__m256 a, __m256 b) {
         return _mm256_sub_ps(a, b);
+    }
+
+    static inline __m256 mul(__m256 a, __m256 b) {
+        return _mm256_mul_ps(a, b);
     }
 
     static inline void butterfly(__m256& a, __m256& b) {
