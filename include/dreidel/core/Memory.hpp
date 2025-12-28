@@ -35,11 +35,42 @@ public:
     }
 
     ~Arena() {
+        free_memory();
+    }
+
+    // Disable Copy
+    Arena(const Arena&) = delete;
+    Arena& operator=(const Arena&) = delete;
+
+    // Enable Move
+    Arena(Arena&& other) noexcept : size_(other.size_), offset_(other.offset_), data_(other.data_) {
+        other.data_ = nullptr;
+        other.size_ = 0;
+        other.offset_ = 0;
+    }
+
+    Arena& operator=(Arena&& other) noexcept {
+        if (this != &other) {
+            free_memory();
+            data_ = other.data_;
+            size_ = other.size_;
+            offset_ = other.offset_;
+            other.data_ = nullptr;
+            other.size_ = 0;
+            other.offset_ = 0;
+        }
+        return *this;
+    }
+
+    void free_memory() {
+        if (data_) {
 #if defined(_MSC_VER)
-        if (data_) _aligned_free(data_);
+            _aligned_free(data_);
 #else
-        if (data_) std::free(data_);
+            std::free(data_);
 #endif
+            data_ = nullptr;
+        }
     }
 
     // Allocate n elements of type T
