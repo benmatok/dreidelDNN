@@ -16,6 +16,7 @@
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/layers/Layer.hpp"
 #include "../include/dreidel/layers/ZenithBlock.hpp"
+#include "../include/dreidel/layers/ZenithVariants.hpp" // Added Variants
 #include "../include/dreidel/layers/Conv2D.hpp"
 #include "../include/dreidel/layers/Dense.hpp"
 #include "../include/dreidel/layers/GELU.hpp"
@@ -200,28 +201,35 @@ private:
     std::vector<layers::Layer<T>*> layers_;
 };
 
-// Zenith Autoencoder
-template <typename T>
-class ZenithAutoencoder {
+// Generic Zenith Autoencoder (Templated Block)
+template <typename T, typename BlockType>
+class ZenithLikeAutoencoder {
 public:
-    ZenithAutoencoder(size_t channels = 16) {
+    ZenithLikeAutoencoder(size_t channels = 16) {
         // Encoder
         layers_.push_back(new PointwiseLinear<T>(1, channels)); // Stem
 
-        layers_.push_back(new layers::ZenithBlock<T>(channels, 3, channels));
+        // BlockType constructor assumes (channels, kernel, spectral_dim) or (channels, kernel) for dense variant
+        // To be safe we pass 3 args and variants ignore extra or default.
+        // We need SFINAE or factory, but here let's assume constructors match or adapt manually.
+        // BlockType: ZenithBlock(C, K, C), ZenithFloatEyes(C, K, C), ZenithDenseMixer(C, K)
+
+        layers_.push_back(create_block(channels));
         layers_.push_back(new layers::GELU<T>());
 
-        layers_.push_back(new layers::ZenithBlock<T>(channels, 3, channels));
+        layers_.push_back(create_block(channels));
         layers_.push_back(new layers::GELU<T>());
 
         // Decoder
-        layers_.push_back(new layers::ZenithBlock<T>(channels, 3, channels));
+        layers_.push_back(create_block(channels));
         layers_.push_back(new layers::GELU<T>());
 
         layers_.push_back(new PointwiseLinear<T>(channels, 1)); // Head
     }
 
-    ~ZenithAutoencoder() { for(auto l : layers_) delete l; }
+    layers::Layer<T>* create_block(size_t channels); // Specialized below or helper
+
+    ~ZenithLikeAutoencoder() { for(auto l : layers_) delete l; }
 
     Tensor<T> forward(const Tensor<T>& x) {
         Tensor<T> h = x;
@@ -250,14 +258,24 @@ private:
     std::vector<layers::Layer<T>*> layers_;
 };
 
+// Specializations for create_block
+template<> layers::Layer<float>* ZenithLikeAutoencoder<float, layers::ZenithBlock<float>>::create_block(size_t c) {
+    return new layers::ZenithBlock<float>(c, 3, c);
+}
+template<> layers::Layer<float>* ZenithLikeAutoencoder<float, layers::ZenithDenseMixer<float>>::create_block(size_t c) {
+    return new layers::ZenithDenseMixer<float>(c, 3); // No spectral dim
+}
+template<> layers::Layer<float>* ZenithLikeAutoencoder<float, layers::ZenithFloatEyes<float>>::create_block(size_t c) {
+    return new layers::ZenithFloatEyes<float>(c, 3, c);
+}
+
+
 // ---- Benchmarking Logic ----
 
 template<typename Model>
 void run_benchmark(std::string name, size_t epochs, size_t batch_size, size_t channels) {
     std::cout << "\n--------------------------------------------------" << std::endl;
     std::cout << "Benchmarking: " << name << std::endl;
-    std::cout << "Note: For this benchmark, Conv2D is run serially to compare algorithmic efficiency" << std::endl;
-    std::cout << "      against the serial Zenith Block implementation." << std::endl;
 
     Model model(channels);
     optim::DiagonalNewton<float> optimizer(0.01);
@@ -279,7 +297,6 @@ void run_benchmark(std::string name, size_t epochs, size_t batch_size, size_t ch
         optimizer.zero_grad();
         Tensor<float> y = model.forward(x);
 
-        // MSE
         Tensor<float> diff = y - x;
         float mse = 0;
         const float* d = diff.data();
@@ -306,31 +323,28 @@ void run_benchmark(std::string name, size_t epochs, size_t batch_size, size_t ch
 
     // Save output image
     Tensor<float> y = model.forward(x);
-    // Extract first image
     Tensor<float> out_img({size, size});
     Tensor<float> in_img({size, size});
     for(size_t i=0; i<size*size; ++i) {
-        out_img.data()[i] = y.data()[i * 1]; // Batch 0, Channel 0
+        out_img.data()[i] = y.data()[i * 1];
         in_img.data()[i] = x.data()[i * 1];
     }
     save_png(name + "_output.png", out_img);
-    if (name.find("Conv") != std::string::npos) save_png("input_target.png", in_img); // Save input once
+    if (name.find("Conv") != std::string::npos) save_png("input_target.png", in_img);
 }
 
 int main() {
-    size_t epochs = 50; // Short run for validation
+    size_t epochs = 50;
     size_t batch_size = 4;
-    size_t channels = 64; // Increased from 16 to 64 to amplify performance gap
+    size_t channels = 64;
 
-    std::cout << "Starting Zenith vs Conv2D Comparison..." << std::endl;
+    std::cout << "Starting Zenith vs Conv2D Comparison (with Debug Variants)..." << std::endl;
     std::cout << "Image Size: 64x64, Batch: " << batch_size << ", Channels: " << channels << std::endl;
 
-    // We disable OpenMP at runtime via environment or just ensure single thread via simple way?
-    // Conv2D implementation currently uses '#pragma omp parallel for'.
-    // To ensure fair serial comparison, we can set OMP_NUM_THREADS=1 from shell when running.
-
     run_benchmark<ConvAutoencoder<float>>("Conv2D_Baseline", epochs, batch_size, channels);
-    run_benchmark<ZenithAutoencoder<float>>("Zenith_Model", epochs, batch_size, channels);
+    run_benchmark<ZenithLikeAutoencoder<float, layers::ZenithBlock<float>>>("Zenith_Standard", epochs, batch_size, channels);
+    run_benchmark<ZenithLikeAutoencoder<float, layers::ZenithDenseMixer<float>>>("Zenith_DenseMixer", epochs, batch_size, channels);
+    run_benchmark<ZenithLikeAutoencoder<float, layers::ZenithFloatEyes<float>>>("Zenith_FloatEyes", epochs, batch_size, channels);
 
     return 0;
 }
