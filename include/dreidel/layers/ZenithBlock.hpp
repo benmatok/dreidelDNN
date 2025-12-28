@@ -184,7 +184,42 @@ public:
 
                     // 3. The Mixer (Spectral Engine) -> In-Place on pixel_buffer
 
-                    // a. Soft Permutation
+                    // a. Soft Permutation (Ghost Phase)
+                    // If float and C=64 on AVX2, use optimized gather
+                    if (std::is_same<T, float>::value && C == 64) {
+#if defined(DREIDEL_ARCH_AVX2)
+                        hal::sparse_gather((float*)pixel_buffer, perm_indices_.data(), (float*)temp_perm_buffer, C);
+                        // Copy back? Or just ping-pong?
+                        // Zenith Pipeline: Eyes -> pixel_buffer
+                        // Permute: pixel_buffer -> temp_perm_buffer
+                        // Mixer: temp_perm_buffer -> temp_perm_buffer (inplace)
+                        // Scale: temp_perm_buffer -> temp_perm_buffer
+                        // Write: temp_perm_buffer -> Output
+
+                        // Let's just point pixel_buffer to temp for subsequent steps?
+                        // But pixel_buffer is allocated from arena.
+                        // We copy back for now to keep it simple, or execute mixing on temp.
+                        // Executing on temp is better.
+
+                        // b. In-Place FWHT (Register Mixer)
+                        hal::x86::fwht64_avx2((float*)temp_perm_buffer);
+
+                        // c. Learnable APoT Scaling (Bit-Shifts)
+                        for(size_t i=0; i<C; ++i) {
+                            temp_perm_buffer[i] = lut_mul(temp_perm_buffer[i], effective_scales[i]);
+                        }
+
+                        // Write to Output from temp_perm_buffer
+                        T* p_out = out_ptr + ((n*H + h)*W + w)*C;
+                        for(size_t c=0; c<C; ++c) {
+                            p_out[c] = temp_perm_buffer[c];
+                        }
+
+                        continue; // Skip the standard path
+#endif
+                    }
+
+                    // Standard Path (Fallback)
                     for(size_t i=0; i<C; ++i) temp_perm_buffer[i] = pixel_buffer[i];
                     for(size_t i=0; i<C; ++i) {
                         pixel_buffer[i] = temp_perm_buffer[perm_indices_[i]];
