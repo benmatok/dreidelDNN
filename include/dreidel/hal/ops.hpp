@@ -316,7 +316,8 @@ struct AlienOps {
      * Replaces bitwise unpacking with memory lookup (The LUT Trick).
      */
     static inline float unpack_apot(int8_t code) {
-        // Simpler initialization:
+        // Scalar LUT logic kept for reference/fallback
+        // We replicate logic here because vector unpack is preferred.
         static const auto LUT_wrapper = []() {
             struct Table { float data[256]; };
             Table t;
@@ -336,6 +337,76 @@ struct AlienOps {
         }();
 
         return LUT_wrapper.data[static_cast<uint8_t>(code)];
+    }
+
+    /**
+     * @brief Vectorized APoT Unpack using AVX2 Intrinsics.
+     * Decodes 8x 8-bit codes into 8x 32-bit floats.
+     */
+    static inline void vec_unpack_apot(const int8_t* codes, float* out) {
+#if defined(DREIDEL_ARCH_AVX2)
+        // Load 8 bytes (64 bits)
+        // Can use _mm_loadl_epi64 but need to cast pointer
+        __m128i raw = _mm_loadl_epi64((const __m128i*)codes);
+
+        // Expand int8 -> int32 (8 values -> YMM)
+        __m256i val = _mm256_cvtepi8_epi32(raw);
+
+        // Masks
+        __m256i sign_mask = _mm256_set1_epi32(0x80);
+        __m256i exp_mask = _mm256_set1_epi32(0x7F);
+
+        // Extract Sign and Exponent
+        __m256i signs = _mm256_and_si256(val, sign_mask);
+        __m256i exps = _mm256_and_si256(val, exp_mask);
+
+        // Check for Zero (Exp == 0)
+        __m256i zero_mask = _mm256_cmpeq_epi32(exps, _mm256_setzero_si256());
+
+        // Move Sign to Bit 31: (Sign << 24)
+        // sign bit in int8 is bit 7 (0x80). In int32 it is bit 7.
+        // We need it at bit 31. Shift left 24.
+        // Wait, _mm256_cvtepi8_epi32 sign-extends!
+        // So if bit 7 is 1, bits 8-31 are 1.
+        // So `val` is actually -128..127.
+        // If we want raw bits, we should use pmovzx (zero extend) instead of pmovsx (sign extend).
+        // cvtepi8_epi32 is pmovsx.
+        // Use _mm256_cvtepu8_epi32 for zero extension to treat as unsigned byte?
+        // Yes, codes are uint8 essentially.
+
+        val = _mm256_cvtepu8_epi32(raw); // Zero extend
+
+        signs = _mm256_and_si256(val, sign_mask); // 0x00000080 or 0
+        exps = _mm256_and_si256(val, exp_mask);   // 0x00..7F
+
+        // Shift sign to MSB (31)
+        // 7 -> 31 is shift 24
+        signs = _mm256_slli_epi32(signs, 24);
+
+        // Compute Exponent: (Stored + 63)
+        // We add 63 to the stored exponent.
+        __m256i offset = _mm256_set1_epi32(63);
+        exps = _mm256_add_epi32(exps, offset);
+
+        // Shift Exponent to position 23
+        exps = _mm256_slli_epi32(exps, 23);
+
+        // Combine
+        __m256i result_int = _mm256_or_si256(signs, exps);
+
+        // Mask out Zeros
+        // if zero_mask is set (FFFF), we want 0.
+        // AND NOT zero_mask
+        result_int = _mm256_andnot_si256(zero_mask, result_int);
+
+        // Cast to float
+        __m256 result_float = _mm256_castsi256_ps(result_int);
+
+        _mm256_storeu_ps(out, result_float);
+#else
+        // Scalar fallback
+        for(int i=0; i<8; ++i) out[i] = unpack_apot(codes[i]);
+#endif
     }
 
     // --- 5. Morton / Z-Curve Tools (Phase 6) ---

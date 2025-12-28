@@ -193,13 +193,32 @@ public:
                                         // Phase 6: Use packed weights to reduce bandwidth
                                         const int8_t* p_w_packed = packed_weights_.data() + k_idx * channels_;
 
-                                        // Fallback to optimized float loop for correctness in this float model,
-                                        // but acknowledge the Alien architecture via AlienOps usage elsewhere.
+                                        // Vectorized Unpack & FMA (AVX2 if available)
+                                        size_t c = 0;
+#if defined(DREIDEL_ARCH_AVX2) && defined(__AVX2__)
+                                        // Assuming T is float and channels aligned
+                                        if (std::is_same<T, float>::value) {
+                                            for(; c+8 <= C; c+=8) {
+                                                // 1. Unpack 8 weights
+                                                __m256 v_w;
+                                                hal::AlienOps::vec_unpack_apot(p_w_packed + c, (float*)&v_w);
 
-                                        for(size_t c=0; c<C; ++c) {
-                                            // Decode APoT on the fly
-                                            // In hardware, this is a LUT lookup or shift.
-                                            // Here we simulate the bandwidth saving by reading int8.
+                                                // 2. Load 8 pixels
+                                                __m256 v_in = _mm256_loadu_ps((const float*)(p_in + c));
+
+                                                // 3. Load accumulator
+                                                __m256 v_acc = _mm256_loadu_ps((const float*)(pixel_buffer + c));
+
+                                                // 4. FMA
+                                                v_acc = _mm256_fmadd_ps(v_in, v_w, v_acc);
+
+                                                // 5. Store back
+                                                _mm256_storeu_ps((float*)(pixel_buffer + c), v_acc);
+                                            }
+                                        }
+#endif
+                                        // Scalar Fallback
+                                        for(; c<C; ++c) {
                                             float w_val = hal::AlienOps::unpack_apot(p_w_packed[c]);
                                             pixel_buffer[c] += p_in[c] * static_cast<T>(w_val);
                                         }
