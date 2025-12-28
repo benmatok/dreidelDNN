@@ -41,13 +41,18 @@ T lut_mul(T pixel, T weight_apot) {
  * Replaces Standard Conv2D.
  * Pipeline: Oracle (ALSH) -> Eyes (Spatial APoT) -> Mixer (Spectral APoT).
  * Memory: Zero-Allocation via Arena.
+ *
+ * NOTE: This block is stateful due to the `Arena` allocator.
+ * It assumes serial execution within a single instance.
+ * For parallel processing, each thread must have its own instance or a thread-local Arena.
  */
 template <typename T>
 class ZenithBlock : public Layer<T> {
 public:
-    ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024)
+    ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024, bool use_gating = false)
         : channels_(channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
           arena_(arena_size), // 1MB Scratchpad default
+          use_gating_(use_gating),
           spatial_weights_({channels, 1, kernel_size, kernel_size}),
           spectral_scales_({1, spectral_dim}),
           perm_indices_(spectral_dim),
@@ -91,11 +96,6 @@ public:
         size_t W = shape[2];
         size_t C = shape[3]; // Must match channels_
 
-        // 1. The Oracle (ALSH Gating)
-        // Project average input channel vector to 1 bit
-        // For simplicity, we check per batch item? Or global?
-        // Let's do per-batch item check logic inside the loop.
-
         // Prepare Output
         Tensor<T> output(shape);
         output.fill(0); // If sleep, output 0
@@ -107,14 +107,6 @@ public:
         // Buffer B: (W * C) elements
         size_t row_size = W * C;
         T* buffer_b = arena_.allocate<T>(row_size); // For Mixer output accumulation
-
-        // Use Arena for temporary buffers in hot loop too?
-        // Allocating per pixel in hot loop is bad.
-        // We can allocate a scratchpad for the whole row.
-        // Temp perm buffer size C.
-        // We can't easily do it inside the loop without resetting arena ptr.
-        // But since we process sequentially in this thread, we can allocate one scratch buffer of size C
-        // and reuse it.
         T* temp_perm_buffer = arena_.allocate<T>(C);
 
         // Helper wrappers
@@ -134,14 +126,17 @@ public:
         // Execution
         for(size_t n=0; n<batch; ++n) {
 
-            // Oracle Check (Simplified: Check avg of center pixel?)
-            // T val = 0;
-            // for(size_t c=0; c<C; ++c) val += input_view.at(n, H/2, W/2, c) * oracle_projection_[c];
-            // int bucket = (val >= 0) ? 1 : 0;
-            // if (bucket != active_bucket_) continue; // Sleep -> Output remains 0
-
-            // Note: For Autoencoder test, we disable gating to ensure signal flow
-            // or we make sure it's always active.
+            // 1. The Oracle (ALSH Gating)
+            // Simplified: Check dot product of center pixel with oracle projection
+            if (use_gating_) {
+                T val = 0;
+                // Simple average pooling over spatial for robustness check? Or just center?
+                // Using center for speed.
+                size_t ch = H/2, cw = W/2;
+                for(size_t c=0; c<C; ++c) val += input_view.at(n, ch, cw, c) * oracle_projection_[c];
+                int bucket = (val >= 0) ? 1 : 0;
+                if (bucket != active_bucket_) continue; // Sleep -> Output remains 0
+            }
 
             for(size_t h=0; h<H; ++h) {
                 // 2. The Eyes (Spatial LUT & APoT) -> Write to Buffer B
@@ -226,10 +221,7 @@ public:
         core::TensorView<T> gi_view(grad_input.data(), shape);
         core::TensorView<T> in_view(input_.data(), shape);
 
-        // Preallocate scratch buffers
-        // We need: d_vec (C), eyes_out (C), mixer_in (C), d_unperm (C)
-        // Since we are not in Arena context here (backward usually allows heap or use arena if available)
-        // The ZenithBlock owns an Arena, we can reuse it if we reset it, assuming forward is done.
+        // Preallocate scratch buffers in Arena (Resetting for backward reuse)
         arena_.reset();
         T* d_vec = arena_.allocate<T>(C);
         T* eyes_out = arena_.allocate<T>(C);
@@ -237,17 +229,23 @@ public:
         T* d_unperm = arena_.allocate<T>(C);
 
         for(size_t n=0; n<batch; ++n) {
+
+            // Should also check gating in backward: if skipped in forward, skip backward (grad is 0)
+            if (use_gating_) {
+               T val = 0;
+               size_t ch = H/2, cw = W/2;
+               for(size_t c=0; c<C; ++c) val += in_view.at(n, ch, cw, c) * oracle_projection_[c];
+               int bucket = (val >= 0) ? 1 : 0;
+               if (bucket != active_bucket_) continue;
+            }
+
             for(size_t h=0; h<H; ++h) {
                 for(size_t w=0; w<W; ++w) {
                     // Reverse Mixer
                     for(size_t c=0; c<C; ++c) d_vec[c] = go_view.at(n, h, w, c);
 
                     // c. Scale Backward
-                    // dL/d_in = dL/d_out * scale
-                    // dL/d_scale = dL/d_out * in (Need 'in' from forward pass... recompute or cache?)
-                    // To save memory, we assume 'in' (output of FWHT) is recomputable or we simplify.
-                    // For exact gradient, we need the value before scaling.
-                    // Let's recompute forward part.
+                    // Recompute forward part.
 
                     // Recompute 'The Eyes' output for this pixel
                     std::fill(eyes_out, eyes_out + C, 0);
@@ -267,7 +265,6 @@ public:
                     // Recompute Perm + FWHT
                      for(size_t i=0; i<C; ++i) mixer_in[i] = eyes_out[perm_indices_[i]];
                     algo::WHT::fwht_1d(mixer_in, C);
-                    // Now mixer_in is the input to scaling.
 
                     // Grad Scales
                     for(size_t c=0; c<C; ++c) {
@@ -277,19 +274,11 @@ public:
 
                     // b. FWHT Backward (Symmetric)
                     algo::WHT::fwht_1d(d_vec, C);
-                    // Scale by 1/N? WHT is unnormalized usually, but check implementation.
-                    // algo::WHT::fwht_1d is unnormalized.
-                    // If forward did FWHT, backward does FWHT.
-                    // But usually we need 1/N somewhere if we want reconstruction?
-                    // The standard definition: FWHT(FWHT(x)) = N*x.
-                    // So we probably need to scale by 1/N if the forward didn't.
-                    // But let's stick to raw gradients.
 
                     // a. Permutation Backward (Inverse Permutation)
                     for(size_t i=0; i<C; ++i) {
                         d_unperm[perm_indices_[i]] = d_vec[i];
                     }
-                    // d_unperm is now gradient at output of 'The Eyes'.
 
                     // Reverse Eyes (Depthwise Backward)
                     for(size_t c=0; c<C; ++c) {
@@ -305,8 +294,6 @@ public:
                                     gs_ptr[k_idx*channels_ + c] += dy * in_view.at(n, ih, iw, c); // STE
 
                                     // Grad Input
-                                    // Need atomic or accumulation buffer if parallel. Serial here.
-                                    // Flatten index
                                     size_t gi_idx = ((n*H + ih)*W + iw)*C + c;
                                     grad_input.data()[gi_idx] += dy * sw_ptr[k_idx*channels_ + c];
                                 }
@@ -337,6 +324,9 @@ private:
 
     // Core Unit: Memory Arena
     core::Arena arena_;
+
+    // Config
+    bool use_gating_;
 
     // Parameters
     Tensor<T> spatial_weights_; // (C, 1, K, K)
