@@ -49,10 +49,11 @@ T lut_mul(T pixel, T weight_apot) {
 template <typename T>
 class ZenithBlock : public Layer<T> {
 public:
-    ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024, bool use_gating = false)
+    ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024, bool use_gating = false, bool use_apot = true)
         : channels_(channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
           arena_(arena_size), // 1MB Scratchpad default
           use_gating_(use_gating),
+          use_apot_(use_apot),
           spatial_weights_({channels, 1, kernel_size, kernel_size}),
           spectral_scales_({1, spectral_dim}),
           perm_indices_(spectral_dim),
@@ -190,37 +191,50 @@ public:
                                         const T* p_in = in_ptr + ((n*H + ih)*W + iw)*C;
                                         int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
 
-                                        // Phase 6: Use packed weights to reduce bandwidth
-                                        const int8_t* p_w_packed = packed_weights_.data() + k_idx * channels_;
+                                        if (use_apot_) {
+                                            // Phase 6: Use packed weights to reduce bandwidth
+                                            const int8_t* p_w_packed = packed_weights_.data() + k_idx * channels_;
 
-                                        // Vectorized Unpack & FMA (AVX2 if available)
-                                        size_t c = 0;
+                                            // Vectorized Unpack & FMA (AVX2 if available)
+                                            size_t c = 0;
 #if defined(DREIDEL_ARCH_AVX2) && defined(__AVX2__)
-                                        // Assuming T is float and channels aligned
-                                        if (std::is_same<T, float>::value) {
-                                            for(; c+8 <= C; c+=8) {
-                                                // 1. Unpack 8 weights
-                                                __m256 v_w;
-                                                hal::AlienOps::vec_unpack_apot(p_w_packed + c, (float*)&v_w);
+                                            // Assuming T is float and channels aligned
+                                            if (std::is_same<T, float>::value) {
+                                                for(; c+8 <= C; c+=8) {
+                                                    // 1. Unpack 8 weights (In Registers)
+                                                    __m256 v_w = hal::AlienOps::vec_unpack_apot_avx2(p_w_packed + c);
 
-                                                // 2. Load 8 pixels
-                                                __m256 v_in = _mm256_loadu_ps((const float*)(p_in + c));
+                                                    // 2. Load 8 pixels
+                                                    __m256 v_in = _mm256_loadu_ps((const float*)(p_in + c));
 
-                                                // 3. Load accumulator
-                                                __m256 v_acc = _mm256_loadu_ps((const float*)(pixel_buffer + c));
+                                                    // 3. Load accumulator
+                                                    __m256 v_acc = _mm256_loadu_ps((const float*)(pixel_buffer + c));
 
-                                                // 4. FMA
-                                                v_acc = _mm256_fmadd_ps(v_in, v_w, v_acc);
+                                                    // 4. FMA
+                                                    v_acc = _mm256_fmadd_ps(v_in, v_w, v_acc);
 
-                                                // 5. Store back
-                                                _mm256_storeu_ps((float*)(pixel_buffer + c), v_acc);
+                                                    // 5. Store back
+                                                    _mm256_storeu_ps((float*)(pixel_buffer + c), v_acc);
+                                                }
                                             }
-                                        }
 #endif
-                                        // Scalar Fallback
-                                        for(; c<C; ++c) {
-                                            float w_val = hal::AlienOps::unpack_apot(p_w_packed[c]);
-                                            pixel_buffer[c] += p_in[c] * static_cast<T>(w_val);
+                                            // Scalar Fallback
+                                            for(; c<C; ++c) {
+                                                float w_val = hal::AlienOps::unpack_apot(p_w_packed[c]);
+                                                pixel_buffer[c] += p_in[c] * static_cast<T>(w_val);
+                                            }
+                                        } else {
+                                            // Standard Float Path (Baseline)
+                                            // Directly read float weights (higher bandwidth)
+                                            const T* p_w = sw_ptr + k_idx * channels_;
+                                            for(size_t c=0; c<C; ++c) {
+                                                // Simulated standard convolution accumulation
+                                                // lut_mul check: In float baseline, it's just multiply.
+                                                // We use lut_mul here to keep logic consistent if it did something special,
+                                                // but for APoT comparison we want raw float multiply.
+                                                // Actually lut_mul is just multiply in current implementation.
+                                                pixel_buffer[c] += p_in[c] * p_w[c];
+                                            }
                                         }
                                     }
                                 }
@@ -424,6 +438,7 @@ private:
 
     // Config
     bool use_gating_;
+    bool use_apot_;
 
     // Parameters
     Tensor<T> spatial_weights_; // (C, 1, K, K)
