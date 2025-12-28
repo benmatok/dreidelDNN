@@ -312,26 +312,30 @@ struct AlienOps {
     }
 
     /**
-     * @brief Unpack 8-bit APoT Code to Float.
-     * Uses bitwise manipulation to construct float from exponent index.
-     * k range -63..63 -> float exp range -63..63 (actual +127)
+     * @brief Unpack 8-bit APoT Code to Float using LUT.
+     * Replaces bitwise unpacking with memory lookup (The LUT Trick).
      */
     static inline float unpack_apot(int8_t code) {
-        uint8_t u_code = static_cast<uint8_t>(code);
-        uint8_t stored_exp = u_code & 0x7F;
-        if (stored_exp == 0) return 0.0f;
+        // Simpler initialization:
+        static const auto LUT_wrapper = []() {
+            struct Table { float data[256]; };
+            Table t;
+            for (int i = 0; i < 256; ++i) {
+                uint8_t u = static_cast<uint8_t>(i);
+                uint8_t stored_exp = u & 0x7F;
+                if (stored_exp == 0) {
+                    t.data[i] = 0.0f;
+                } else {
+                    int k = static_cast<int>(stored_exp) - 64;
+                    float val = std::pow(2.0f, k);
+                    if (u & 0x80) val = -val;
+                    t.data[i] = val;
+                }
+            }
+            return t;
+        }();
 
-        // Reconstruct float:
-        // Exponent bits (8 bits): stored_exp - 64 + 127 = stored_exp + 63
-        // Mantissa: 0 (implicit 1.0)
-        // Sign: MSB of code
-
-        uint32_t sign = (u_code & 0x80) << 24; // Bit 7 -> Bit 31
-        uint32_t exp = (static_cast<uint32_t>(stored_exp) + 63) << 23;
-
-        union { uint32_t i; float f; } u;
-        u.i = sign | exp;
-        return u.f;
+        return LUT_wrapper.data[static_cast<uint8_t>(code)];
     }
 
     // --- 5. Morton / Z-Curve Tools (Phase 6) ---
