@@ -30,6 +30,12 @@ struct Ops {
         return a - b;
     }
 
+    // Missing MUL added
+    template <typename T>
+    static inline T mul(const T& a, const T& b) {
+        return a * b;
+    }
+
     // In-place butterfly: a, b -> a+b, a-b
     template <typename T>
     static inline void butterfly(T& a, T& b) {
@@ -40,10 +46,6 @@ struct Ops {
     }
 
     // Gather operation
-    // For generic/scalar, we just loop manually.
-    // This is not called directly in SIMD loop usually, but exposed for consistency.
-    // However, gather is usually Vector <- Base[Indices]
-    // Here we define a scalar version for completeness or helper
     static inline float gather_scalar(const float* base, int index) {
         return base[index];
     }
