@@ -8,210 +8,198 @@
 
 // Jules Architecture
 #include "dreidel/jules/Agent.hpp"
+#include "dreidel/jules/FusedJulesBlock.hpp" // New Block
 #include "dreidel/core/Arena.hpp"
 #include "dreidel/utils/WaveletGen.hpp"
 #include "dreidel/utils/MatrixOps.hpp"
 
-// Define static memory for the Agent (2MB)
-static uint8_t NETWORK_WORKSPACE[2 * 1024 * 1024];
+// Define static memory for the Agent (16MB to support 1024x1024 matrix ops)
+static uint8_t NETWORK_WORKSPACE[16 * 1024 * 1024];
 
 // Dimensions
 constexpr size_t INPUT_DIM = 1024;
+constexpr size_t HIDDEN_DIM = 1024;
 constexpr size_t LATENT_DIM = 64;
+constexpr size_t NUM_LAYERS = 2; // Depth of Encoder/Decoder
 
 namespace dreidel {
 namespace jules {
 
 template <size_t IN_DIM, size_t LATENT_DIM>
-class JulesAutoencoder : public Agent {
+class DeepJulesAutoencoder : public Agent {
 public:
-    SpectralBlock<IN_DIM> enc_spectral;
-    SparseBlock<IN_DIM, LATENT_DIM, 4> enc_sparse;
-    DenseLUT<LATENT_DIM, IN_DIM> dec_dense;
+    // Encoder Stack
+    FusedJulesBlock<IN_DIM, IN_DIM> enc_layer1;
+    FusedJulesBlock<IN_DIM, IN_DIM> enc_layer2;
+    DenseLUT<IN_DIM, LATENT_DIM> enc_bottleneck;
+
+    // Decoder Stack
+    DenseLUT<LATENT_DIM, IN_DIM> dec_proj;
+    FusedJulesBlock<IN_DIM, IN_DIM> dec_layer1;
+    FusedJulesBlock<IN_DIM, IN_DIM> dec_layer2;
+
+    // Final Readout (Calibrated)
+    DenseLUT<IN_DIM, IN_DIM> dec_readout;
 
     core::Arena* workspace_;
 
-    JulesAutoencoder(core::Arena* workspace) : workspace_(workspace) {}
+    DeepJulesAutoencoder(core::Arena* workspace) : workspace_(workspace) {}
 
     void init() override {
         quant::APoT::init();
     }
 
-    // Forward Pass (Inference) - Zero Alloc
+    // Forward Pass
     void step(const float* input_ptr, float* output_ptr) override {
         workspace_->reset();
 
-        // Input View
-        float* buf_in = workspace_->allocate<float>(IN_DIM);
-        std::copy(input_ptr, input_ptr + IN_DIM, buf_in);
-        core::TensorView<float> view_in(buf_in, IN_DIM);
+        // 1. Copy Input
+        float* buf_curr = workspace_->allocate<float>(IN_DIM);
+        std::copy(input_ptr, input_ptr + IN_DIM, buf_curr);
+        core::TensorView<float> curr(buf_curr, IN_DIM);
 
-        // 1. Encoder: Spectral
-        float* buf_spectral = workspace_->allocate<float>(IN_DIM);
-        core::TensorView<float> view_spectral(buf_spectral, IN_DIM);
-        enc_spectral.forward(view_in, view_spectral);
+        // 2. Encoder Layers (Ping Pong)
+        float* buf_next = workspace_->allocate<float>(IN_DIM);
+        core::TensorView<float> next(buf_next, IN_DIM);
 
-        // 2. Encoder: Sparse
-        float* buf_latent = workspace_->allocate<float>(LATENT_DIM);
-        core::TensorView<float> view_latent(buf_latent, LATENT_DIM);
-        enc_sparse.forward(view_spectral, view_latent);
+        // L1
+        enc_layer1.forward(curr, next, workspace_);
 
-        // 3. Decoder: DenseLUT
-        core::TensorView<float> view_out(output_ptr, IN_DIM);
-        dec_dense.forward(view_latent, view_out);
+        // L2 (Next -> Curr)
+        core::TensorView<float> next_out(buf_curr, IN_DIM);
+        enc_layer2.forward(next, next_out, workspace_);
+
+        // 3. Bottleneck
+        float* buf_lat = workspace_->allocate<float>(LATENT_DIM);
+        core::TensorView<float> lat(buf_lat, LATENT_DIM);
+        enc_bottleneck.forward(next_out, lat);
+
+        // 4. Decoder Projection
+        core::TensorView<float> dec_in(buf_next, IN_DIM);
+        dec_proj.forward(lat, dec_in);
+
+        // 5. Decoder Layers
+        core::TensorView<float> dec_l1_out(buf_curr, IN_DIM);
+        dec_layer1.forward(dec_in, dec_l1_out, workspace_);
+
+        core::TensorView<float> dec_l2_out(buf_next, IN_DIM);
+        dec_layer2.forward(dec_l1_out, dec_l2_out, workspace_);
+
+        // 6. Readout
+        core::TensorView<float> out_view(output_ptr, IN_DIM);
+        dec_readout.forward(dec_l2_out, out_view);
     }
 
-    // Calibration Helper (Offline Training) - Uses Arena
+    // Calibrate Readout
     void calibrate(const std::vector<float>& batch_X, size_t batch_size) {
-        std::cout << "Calibrating Decoder (Zero-Alloc)..." << std::endl;
-        workspace_->reset();
+        std::cout << "Calibrating Deep Decoder..." << std::endl;
 
-        // Allocate H and Matrix Ops workspace in Arena
-        // H: (B, L)
-        float* batch_H = workspace_->allocate<float>(batch_size * LATENT_DIM);
+        // Temporarily collect features in Heap vector to simplify Arena reuse logic
+        // for this demo.
+        std::vector<float> vec_F(batch_size * IN_DIM);
 
         for(size_t i=0; i<batch_size; ++i) {
-            // Re-use small buffers?
-            // We can't reset arena inside loop as batch_H is there.
-            // So we need small scratch for forward pass.
-            // Since Forward allocs ~1024 floats, we can afford it inside loop if Arena is big enough.
-            // 2MB is plenty for 500 samples * 64 floats (128KB) + scratch.
+             workspace_->reset();
 
-            // Wait, step() resets workspace! We can't use step().
-            // We must call layers manually and manage scratch carefully.
-            // Let's alloc scratch buffers ONCE at top of loop logic (conceptually).
-            // Actually, we can just alloc buffers after batch_H.
+             // Run forward to Dec L2
+             // Copy Input
+            float* buf_curr = workspace_->allocate<float>(IN_DIM);
+            std::copy(batch_X.begin() + i*IN_DIM, batch_X.begin() + (i+1)*IN_DIM, buf_curr);
+            core::TensorView<float> curr(buf_curr, IN_DIM);
 
-            float* input_buf = workspace_->allocate<float>(IN_DIM);
-            float* spectral_buf = workspace_->allocate<float>(IN_DIM);
-            float* latent_buf = workspace_->allocate<float>(LATENT_DIM);
+            float* buf_next = workspace_->allocate<float>(IN_DIM);
+            core::TensorView<float> next(buf_next, IN_DIM);
+            enc_layer1.forward(curr, next, workspace_);
 
-            // Copy input
-            std::copy(batch_X.begin() + i*IN_DIM, batch_X.begin() + (i+1)*IN_DIM, input_buf);
+            core::TensorView<float> next_out(buf_curr, IN_DIM);
+            enc_layer2.forward(next, next_out, workspace_);
 
-            core::TensorView<float> v_in(input_buf, IN_DIM);
-            core::TensorView<float> v_spec(spectral_buf, IN_DIM);
-            core::TensorView<float> v_lat(latent_buf, LATENT_DIM);
+            float* buf_lat = workspace_->allocate<float>(LATENT_DIM);
+            core::TensorView<float> lat(buf_lat, LATENT_DIM);
+            enc_bottleneck.forward(next_out, lat);
 
-            enc_spectral.forward(v_in, v_spec);
-            enc_sparse.forward(v_spec, v_lat);
+            core::TensorView<float> dec_in(buf_next, IN_DIM);
+            dec_proj.forward(lat, dec_in);
 
-            // Copy to Batch H
-            std::copy(latent_buf, latent_buf + LATENT_DIM, batch_H + i*LATENT_DIM);
+            core::TensorView<float> dec_l1_out(buf_curr, IN_DIM);
+            dec_layer1.forward(dec_in, dec_l1_out, workspace_);
 
-            // Note: We leak the scratch buffers here inside the arena.
-            // 500 * (1024+1024+64) * 4 bytes ~ 4MB.
-            // Arena is 2MB. Oops.
-            // We need to Reuse scratch buffers.
-            // But allocate gives linear pointer.
-            // Simple fix: Alloc scratch buffers ONCE before loop.
-            // But we can't 'free' them to use for next iter?
-            // We just overwrite them.
-            // So:
-            // 1. Alloc Batch H.
-            // 2. Alloc Scratch (Input, Spec, Latent).
-            // 3. Loop: Use Scratch -> Copy Latent to Batch H.
-            // Correct.
+            core::TensorView<float> dec_l2_out(buf_next, IN_DIM);
+            dec_layer2.forward(dec_l1_out, dec_l2_out, workspace_);
+
+            // Copy dec_l2_out to vec_F
+            std::copy(dec_l2_out.data(), dec_l2_out.data() + IN_DIM, vec_F.begin() + i*IN_DIM);
         }
 
-        // To implement "Reuse", we just use pointers.
-        // BUT wait, previous logic inside loop allocated NEW buffers.
-        // Let's refactor.
-    }
-
-    // Improved Calibrate with Scratch Reuse
-    void calibrate_optimized(const std::vector<float>& batch_X, size_t batch_size) {
-        std::cout << "Calibrating Decoder (Optimized Arena Usage)..." << std::endl;
+        // Now Solve on Arena
         workspace_->reset();
 
-        // 1. Alloc Permanent Storage for H
-        float* batch_H = workspace_->allocate<float>(batch_size * LATENT_DIM);
+        // F
+        float* A_mat = workspace_->allocate<float>(batch_size * IN_DIM);
+        std::copy(vec_F.begin(), vec_F.end(), A_mat);
 
-        // 2. Alloc Scratch Buffers (Reused)
-        float* input_buf = workspace_->allocate<float>(IN_DIM);
-        float* spectral_buf = workspace_->allocate<float>(IN_DIM);
-        float* latent_buf = workspace_->allocate<float>(LATENT_DIM);
+        // Cov = F^T F (D x D) = 4MB
+        float* Cov = workspace_->allocate<float>(IN_DIM * IN_DIM);
+        std::fill(Cov, Cov + IN_DIM * IN_DIM, 0.0f);
 
-        // 3. Collect H
-        for(size_t i=0; i<batch_size; ++i) {
-             std::copy(batch_X.begin() + i*IN_DIM, batch_X.begin() + (i+1)*IN_DIM, input_buf);
-
-             core::TensorView<float> v_in(input_buf, IN_DIM);
-             core::TensorView<float> v_spec(spectral_buf, IN_DIM);
-             core::TensorView<float> v_lat(latent_buf, LATENT_DIM);
-
-             enc_spectral.forward(v_in, v_spec);
-             enc_sparse.forward(v_spec, v_lat);
-
-             std::copy(latent_buf, latent_buf + LATENT_DIM, batch_H + i*LATENT_DIM);
-        }
-
-        // 4. Solve Ridge Regression using Arena for Matrices
-        // A = H^T H (L x L)
-        float* A = workspace_->allocate<float>(LATENT_DIM * LATENT_DIM);
-        std::fill(A, A + LATENT_DIM * LATENT_DIM, 0.0f);
-
-        // Compute A
-        for(size_t r=0; r<LATENT_DIM; ++r) {
-            for(size_t c=0; c<LATENT_DIM; ++c) {
-                float sum = 0.0f;
-                for(size_t k=0; k<batch_size; ++k) {
-                    sum += batch_H[k*LATENT_DIM + r] * batch_H[k*LATENT_DIM + c];
-                }
-                A[r*LATENT_DIM + c] = sum;
-            }
-        }
-
-        // Regularization
-        for(size_t i=0; i<LATENT_DIM; ++i) A[i*LATENT_DIM + i] += 1.0f;
-
-        // Workspace for Inversion (Augmented matrix 2*L*L)
-        float* inv_workspace = workspace_->allocate<float>(LATENT_DIM * 2 * LATENT_DIM);
-
-        // Invert
-        if (!utils::invert_matrix_ptr(A, (int)LATENT_DIM, inv_workspace)) {
-            std::cerr << "Inversion failed." << std::endl;
-            return;
-        }
-
-        // B = H^T X (L x D)
-        // Alloc B
-        float* B_mat = workspace_->allocate<float>(LATENT_DIM * IN_DIM);
-        // Note: Check arena capacity.
-        // H: 500*64*4 = 128KB
-        // A: 64*64*4 = 16KB
-        // Inv: 64*128*4 = 32KB
-        // B: 64*1024*4 = 256KB
-        // Total so far < 1MB. Safe.
-
-        for(size_t r=0; r<LATENT_DIM; ++r) {
+        for(size_t r=0; r<IN_DIM; ++r) {
             for(size_t c=0; c<IN_DIM; ++c) {
                 float sum = 0.0f;
                 for(size_t k=0; k<batch_size; ++k) {
-                    sum += batch_H[k*LATENT_DIM + r] * batch_X[k*IN_DIM + c];
+                    sum += A_mat[k*IN_DIM + r] * A_mat[k*IN_DIM + c];
                 }
-                B_mat[r*IN_DIM + c] = sum;
+                Cov[r*IN_DIM + c] = sum;
             }
         }
 
-        // W = A_inv * B (L x D)
-        // We can compute W row by row and quantize immediately to save memory if needed,
-        // but we have space.
-        float* W = workspace_->allocate<float>(LATENT_DIM * IN_DIM);
+        // Reg
+        for(size_t i=0; i<IN_DIM; ++i) Cov[i*IN_DIM + i] += 10.0f;
 
-        for(size_t r=0; r<LATENT_DIM; ++r) {
+        // Invert (needs 2*D*D workspace = 8MB)
+        float* inv_wk = workspace_->allocate<float>(IN_DIM * 2 * IN_DIM);
+        if (!utils::invert_matrix_ptr(Cov, (int)IN_DIM, inv_wk)) {
+             std::cerr << "Inversion failed" << std::endl;
+             return;
+        }
+
+        // Cross = F^T X (D x D) = 4MB
+        // NOTE: We might OOM with 16MB.
+        // 4 (Cov) + 8 (Inv) = 12.
+        // We need 4 for Cross and 4 for W_T. Total ~20MB?
+        // Let's compute Cross BEFORE Invert and store it?
+        // No, we need Cov and Cross to compute W.
+        // We can reuse A_mat buffer (batch_size*D = 500*1024*4 = 2MB).
+        // Total: 2 (A) + 4 (Cov) + 8 (Inv) + 4 (Cross) + 4 (W) = 22MB.
+        // We need bigger arena.
+        // Let's optimize: Compute Cross into A_mat space if Batch <= D?
+        // Batch=500, D=1024. A_mat is 2MB. Cross is 4MB. Can't fit.
+        // We will just increase Arena to 32MB for demo.
+
+        float* Cross = workspace_->allocate<float>(IN_DIM * IN_DIM);
+        for(size_t r=0; r<IN_DIM; ++r) {
             for(size_t c=0; c<IN_DIM; ++c) {
                 float sum = 0.0f;
-                for(size_t k=0; k<LATENT_DIM; ++k) {
-                    sum += A[r*LATENT_DIM + k] * B_mat[k*IN_DIM + c];
+                for(size_t k=0; k<batch_size; ++k) {
+                    sum += A_mat[k*IN_DIM + r] * batch_X[k*IN_DIM + c];
                 }
-                W[r*IN_DIM + c] = sum;
+                Cross[r*IN_DIM + c] = sum;
             }
         }
 
-        // Quantize
-        for(size_t i=0; i<LATENT_DIM * IN_DIM; ++i) {
-            dec_dense.weights[i] = quant::APoT::quantize(W[i]);
+        // W^T
+        float* W_T = workspace_->allocate<float>(IN_DIM * IN_DIM);
+        for(size_t r=0; r<IN_DIM; ++r) {
+            for(size_t c=0; c<IN_DIM; ++c) {
+                float sum = 0.0f;
+                for(size_t k=0; k<IN_DIM; ++k) {
+                    sum += Cov[r*IN_DIM + k] * Cross[k*IN_DIM + c];
+                }
+                W_T[r*IN_DIM + c] = sum;
+            }
+        }
+
+        for(size_t i=0; i<IN_DIM * IN_DIM; ++i) {
+            dec_readout.weights[i] = quant::APoT::quantize(W_T[i]);
         }
         std::cout << "Calibration Complete." << std::endl;
     }
@@ -220,49 +208,40 @@ public:
 } // namespace jules
 } // namespace dreidel
 
-// Define Global Agent
-static dreidel::core::Arena arena(NETWORK_WORKSPACE, sizeof(NETWORK_WORKSPACE));
-static dreidel::jules::JulesAutoencoder<1024, 64> agent(&arena);
+// Define Global Agent (32MB)
+static uint8_t ARENA_BUF[32 * 1024 * 1024];
+static dreidel::core::Arena arena(ARENA_BUF, sizeof(ARENA_BUF));
+static dreidel::jules::DeepJulesAutoencoder<1024, 64> agent(&arena);
 
 int main() {
-    std::cout << "=== Project Jules: Autoencoder Demo ===" << std::endl;
-    std::cout << "Architecture: Wavelet(1024) -> Spectral -> Sparse -> Latent(64) -> DenseLUT(APoT) -> Out(1024)" << std::endl;
+    std::cout << "=== Project Jules: Deep Autoencoder Demo ===" << std::endl;
+    std::cout << "Fused Blocks: [Sparse || FWHT+SoftPerm] x 2 Layers" << std::endl;
 
     // 1. Generate Training Data
     size_t train_size = 500;
-    std::cout << "Generating " << train_size << " wavelets for calibration..." << std::endl;
+    std::cout << "Generating " << train_size << " wavelets..." << std::endl;
 
     dreidel::Tensor<float> train_data({train_size, 1024});
     dreidel::utils::generate_mixed_wavelets(train_data, train_size, 1024);
-
     std::vector<float> train_vec(train_data.data(), train_data.data() + train_data.size());
 
     // 2. Init & Calibrate
     agent.init();
-    agent.calibrate_optimized(train_vec, train_size);
+    agent.calibrate(train_vec, train_size);
 
-    // 3. Inference & Validation
+    // 3. Inference
     size_t val_size = 1;
     dreidel::Tensor<float> val_data({val_size, 1024});
     dreidel::utils::generate_mixed_wavelets(val_data, val_size, 1024);
 
     float output_buf[1024];
-
     auto start = std::chrono::high_resolution_clock::now();
     agent.step(val_data.data(), output_buf);
     auto end = std::chrono::high_resolution_clock::now();
 
     std::cout << "Inference Time: " << std::chrono::duration<double>(end - start).count() * 1000.0 << " ms" << std::endl;
 
-    // 4. Export for Visualization
-    std::ofstream csv("jules_autoencoder_results.csv");
-    csv << "t,input,reconstructed\n";
-    for(size_t t=0; t<1024; ++t) {
-        csv << t << "," << val_data.data()[t] << "," << output_buf[t] << "\n";
-    }
-    csv.close();
-
-    // 5. Generate SVG
+    // 4. SVG Visualization
     std::cout << "Generating SVG..." << std::endl;
     std::ofstream svg("jules_reconstruction.svg");
     if(svg.is_open()) {
@@ -300,7 +279,6 @@ int main() {
 
         svg << "<text x=\"" << width-150 << "\" y=\"30\" fill=\"black\">Input (Black)</text>\n";
         svg << "<text x=\"" << width-150 << "\" y=\"50\" fill=\"red\">Recon (Red)</text>\n";
-
         svg << "</svg>\n";
     }
 
