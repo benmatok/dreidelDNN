@@ -19,20 +19,23 @@ class ZenithBlock;
  * @brief The Zenith Block (Strictly Optimized for APoT).
  *
  * Replaces Standard Conv2D.
- * Supports Channel Scaling (Depthwise Expansion/Reduction).
+ *
+ * Auto-Switching Connectivity:
+ * - Backbone (Cin == Cout): Uses Depthwise Spatial Conv (O(C) params) + Spectral Mixing. "Alien Speed".
+ * - Stem/Head (Cin != Cout): Uses Dense Spatial Conv (O(Cin*Cout) params) + Spectral Mixing.
  *
  * Pipeline:
  * 1. Oracle (Gating)
- * 2. Eyes (Spatial Grouped Conv)
+ * 2. Eyes (Spatial Conv)
  * 3. Mixer (Permute -> FWHT -> Scale -> Bias -> ReLU)
  */
 class ZenithBlock : public Layer<int8_t> {
 public:
-    // Legacy Constructor (Cin == Cout)
+    // Legacy Constructor (Cin == Cout -> Depthwise)
     ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024, bool use_gating = false)
         : ZenithBlock(channels, channels, kernel_size, spectral_dim, arena_size, use_gating) {}
 
-    // Scalable Constructor
+    // Scalable Constructor (Auto-Detect Mode)
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024, bool use_gating = false)
         : in_channels_(in_channels), out_channels_(out_channels),
           kernel_size_(kernel_size), spectral_dim_(spectral_dim),
@@ -42,20 +45,20 @@ public:
           bias_(out_channels),
           perm_indices_(out_channels)
     {
-        // Determine Mode
-        is_expansion_ = (out_channels_ >= in_channels_);
-        factor_ = is_expansion_ ? (out_channels_ / in_channels_) : (in_channels_ / out_channels_);
-        if (factor_ == 0) factor_ = 1;
+        // Auto-Detect Mode
+        // If dimensions match, we assume efficient backbone (Depthwise).
+        // If dimensions differ, we assume stem/projection (Dense).
+        is_depthwise_ = (in_channels_ == out_channels_);
 
-        if (out_channels_ >= in_channels_) {
-            if (out_channels_ % in_channels_ != 0)
-                std::cerr << "Warning: ZenithBlock Expansion should use integer multiplier." << std::endl;
-            packed_weights_.resize(out_channels_ * kernel_size * kernel_size);
+        size_t total_weights = 0;
+        if (is_depthwise_) {
+            // Depthwise: 1 kernel per channel pair (Diagonal)
+            total_weights = out_channels_ * kernel_size * kernel_size;
         } else {
-             if (in_channels_ % out_channels_ != 0)
-                std::cerr << "Warning: ZenithBlock Reduction should use integer factor." << std::endl;
-             packed_weights_.resize(in_channels_ * kernel_size * kernel_size);
+            // Dense: In kernels per Out channel
+            total_weights = out_channels_ * in_channels_ * kernel_size * kernel_size;
         }
+        packed_weights_.resize(total_weights);
 
         // Random Init
         std::mt19937 gen(42);
@@ -74,7 +77,6 @@ public:
 #if defined(DREIDEL_ARCH_AVX2)
     // Intra-Register FWHT for 32 elements (YMM) - Unchanged
     static inline __m256i fwht_avx2_intra(__m256i v) {
-        // ... (Strictly standard FWHT implementation)
         // Stride 1
         {
             __m256i shuf_a = _mm256_broadcastsi128_si256(_mm_setr_epi8(0,2,4,6,8,10,12,14, 0,2,4,6,8,10,12,14));
@@ -82,9 +84,7 @@ public:
             __m256i shuf_b = _mm256_broadcastsi128_si256(_mm_setr_epi8(1,3,5,7,9,11,13,15, 1,3,5,7,9,11,13,15));
             __m256i b = _mm256_shuffle_epi8(v, shuf_b);
             __m256i s = hal::AlienOps::vec_add_apot_avx2(a, b);
-            __m256i sign_mask = _mm256_set1_epi8(0x80);
-            __m256i neg_b = _mm256_xor_si256(b, sign_mask);
-            __m256i d = hal::AlienOps::vec_add_apot_avx2(a, neg_b);
+            __m256i d = hal::AlienOps::vec_add_apot_avx2(a, _mm256_xor_si256(b, _mm256_set1_epi8(0x80)));
             v = _mm256_unpacklo_epi8(s, d);
         }
         // Stride 2
@@ -193,8 +193,11 @@ public:
                             if (h >= H || w >= W) continue;
 
                             // 2. Eyes (Spatial)
-                            // RESTORED OPTIMIZATION: If Cin == Cout, use fast path
-                            if (in_channels_ == out_channels_) {
+
+                            // AUTO-MODE:
+                            if (is_depthwise_) {
+                                // DEPTHWISE PATH (Efficient O(C))
+                                // Requires Cin == Cout.
                                 size_t C = out_channels_;
                                 std::fill(pixel_buffer, pixel_buffer + C, 0);
 
@@ -231,37 +234,32 @@ public:
                                     }
                                 }
                             } else {
-                                // NEW PATH: Channel Scaling (Scalar Fallback)
+                                // DENSE PATH (Flexible O(Cin*Cout))
+                                // Used for Expansion/Reduction.
                                 std::fill(pixel_buffer, pixel_buffer + out_channels_, 0);
+                                size_t w_stride_filter = in_channels_ * kernel_size_ * kernel_size_;
+                                size_t w_stride_spatial = in_channels_;
 
                                 for(int ky=-k_rad; ky<=k_rad; ++ky) {
                                     for(int kx=-k_rad; kx<=k_rad; ++kx) {
                                         int ih = h + ky;
                                         int iw = w + kx;
                                         if (ih>=0 && ih<H && iw>=0 && iw<W) {
-                                            const int8_t* p_in = in_ptr + ((n*H + ih)*W + iw)*in_channels_;
-                                            int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
+                                            const int8_t* p_in_base = in_ptr + ((n*H + ih)*W + iw)*in_channels_;
+                                            int k_idx_offset = ((ky+k_rad)*kernel_size_ + (kx+k_rad)) * w_stride_spatial;
 
-                                            if (is_expansion_) {
-                                                const int8_t* p_w = w_ptr + k_idx * out_channels_;
-                                                for(size_t c=0; c<out_channels_; ++c) {
-                                                    size_t c_in_idx = c / factor_;
-                                                    if (c_in_idx >= in_channels_) c_in_idx = in_channels_ - 1;
-                                                    int8_t prod = hal::AlienOps::apot_mul_lut(p_in[c_in_idx], p_w[c]);
-                                                    pixel_buffer[c] = hal::AlienOps::apot_add_lut(pixel_buffer[c], prod);
+                                            for(size_t o=0; o<out_channels_; ++o) {
+                                                const int8_t* p_w = w_ptr + o * w_stride_filter + k_idx_offset;
+                                                int8_t acc = pixel_buffer[o];
+
+                                                // Dense Inner Loop: Reduce over Input Channels
+                                                for(size_t i=0; i<in_channels_; ++i) {
+                                                    int8_t val = p_in_base[i];
+                                                    int8_t w = p_w[i];
+                                                    int8_t prod = hal::AlienOps::apot_mul_lut(val, w);
+                                                    acc = hal::AlienOps::apot_add_lut(acc, prod);
                                                 }
-                                            } else {
-                                                const int8_t* p_w = w_ptr + k_idx * in_channels_;
-                                                for(size_t c=0; c<out_channels_; ++c) {
-                                                    size_t start_in = c * factor_;
-                                                    for(size_t k=0; k<factor_; ++k) {
-                                                        size_t c_in_idx = start_in + k;
-                                                        if(c_in_idx < in_channels_) {
-                                                            int8_t prod = hal::AlienOps::apot_mul_lut(p_in[c_in_idx], p_w[c_in_idx]);
-                                                            pixel_buffer[c] = hal::AlienOps::apot_add_lut(pixel_buffer[c], prod);
-                                                        }
-                                                    }
-                                                }
+                                                pixel_buffer[o] = acc;
                                             }
                                         }
                                     }
@@ -384,8 +382,7 @@ private:
     size_t spectral_dim_;
     core::Arena arena_;
     bool use_gating_;
-    bool is_expansion_;
-    size_t factor_;
+    bool is_depthwise_;
     std::vector<int8_t> packed_weights_;
     std::vector<int8_t> spectral_scales_;
     std::vector<int8_t> bias_;
