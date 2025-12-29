@@ -56,9 +56,11 @@ public:
           use_apot_(use_apot),
           spatial_weights_({channels, 1, kernel_size, kernel_size}),
           spectral_scales_({1, spectral_dim}),
+          bias_({1, spectral_dim}),
           perm_indices_(spectral_dim),
           grad_spatial_({channels, 1, kernel_size, kernel_size}),
-          grad_scales_({1, spectral_dim})
+          grad_scales_({1, spectral_dim}),
+          grad_bias_({1, spectral_dim})
     {
         // Initialization
         spatial_weights_.random(0.0, std::sqrt(2.0 / (kernel_size * kernel_size * channels)));
@@ -84,6 +86,9 @@ public:
         // Let's use 1.0 / sqrt(channels)
         T scale_init = 1.0 / std::sqrt(static_cast<T>(channels));
         spectral_scales_.fill(scale_init);
+
+        // Bias init
+        bias_.fill(0);
 
         // Permutation init
         std::iota(perm_indices_.begin(), perm_indices_.end(), 0);
@@ -123,14 +128,13 @@ public:
         T* pixel_buffer = arena_.allocate<T>(C);
         T* temp_perm_buffer = arena_.allocate<T>(C);
 
-        // Alien Buffers removed as per code review (they were unused in simulation)
-
         // Pointers
         const T* in_ptr = input.data();
         T* out_ptr = output.data();
 
         const T* sw_ptr = spatial_weights_.data();
         const T* scale_ptr = spectral_scales_.data();
+        const T* bias_ptr = bias_.data();
         int k_rad = kernel_size_ / 2;
 
         // Quantize scales for forward pass (APoT)
@@ -138,6 +142,14 @@ public:
         // Here we just quantize on the fly or use stored.
         std::vector<T> effective_scales(C);
         for(size_t i=0; i<C; ++i) effective_scales[i] = quantize_apot(scale_ptr[i]);
+
+        // Quantize Bias if needed
+        std::vector<T> effective_bias(C);
+        if (use_apot_) {
+             for(size_t i=0; i<C; ++i) effective_bias[i] = quantize_apot(bias_ptr[i]);
+        } else {
+             for(size_t i=0; i<C; ++i) effective_bias[i] = bias_ptr[i];
+        }
 
         // Pre-compute Oracle Sign Mask
         uint32_t oracle_mask = 0;
@@ -225,14 +237,8 @@ public:
                                             }
                                         } else {
                                             // Standard Float Path (Baseline)
-                                            // Directly read float weights (higher bandwidth)
                                             const T* p_w = sw_ptr + k_idx * channels_;
                                             for(size_t c=0; c<C; ++c) {
-                                                // Simulated standard convolution accumulation
-                                                // lut_mul check: In float baseline, it's just multiply.
-                                                // We use lut_mul here to keep logic consistent if it did something special,
-                                                // but for APoT comparison we want raw float multiply.
-                                                // Actually lut_mul is just multiply in current implementation.
                                                 pixel_buffer[c] += p_in[c] * p_w[c];
                                             }
                                         }
@@ -251,9 +257,10 @@ public:
                                 // b. In-Place FWHT (Register Mixer)
                                 hal::x86::fwht64_avx2((float*)temp_perm_buffer);
 
-                                // c. Learnable APoT Scaling (Bit-Shifts)
+                                // c. Learnable APoT Scaling (Bit-Shifts) + Bias
                                 for(size_t i=0; i<C; ++i) {
                                     temp_perm_buffer[i] = lut_mul(temp_perm_buffer[i], effective_scales[i]);
+                                    temp_perm_buffer[i] += effective_bias[i]; // Add Bias
                                 }
 
                                 // Phase 5: Branchless Gate
@@ -278,9 +285,10 @@ public:
                             // b. In-Place FWHT
                             algo::WHT::fwht_1d(pixel_buffer, C);
 
-                            // c. Learnable APoT Scaling (Bit-Shifts)
+                            // c. Learnable APoT Scaling (Bit-Shifts) + Bias
                             for(size_t i=0; i<C; ++i) {
                                 pixel_buffer[i] = lut_mul(pixel_buffer[i], effective_scales[i]);
+                                pixel_buffer[i] += effective_bias[i]; // Add Bias
                             }
 
                             // Phase 5: Branchless Gate (Standard Path)
@@ -321,11 +329,15 @@ public:
 
         grad_spatial_.fill(0);
         grad_scales_.fill(0);
+        grad_bias_.fill(0);
 
         T* gs_ptr = grad_spatial_.data();
         T* gscale_ptr = grad_scales_.data();
+        T* gbias_ptr = grad_bias_.data();
+
         const T* sw_ptr = spatial_weights_.data();
         const T* scale_ptr = spectral_scales_.data();
+        const T* bias_ptr = bias_.data();
         int k_rad = kernel_size_ / 2;
 
         const T* go_ptr = grad_output.data();
@@ -361,7 +373,8 @@ public:
                     const T* p_go = go_ptr + ((n*H + h)*W + w)*C;
                     for(size_t c=0; c<C; ++c) d_vec[c] = p_go[c];
 
-                    // Recompute forward (Eyes Output)
+                    // 1. Recompute Forward (up to ReLU) to determine active neurons
+                    // Recompute Eyes Output
                     for(size_t c=0; c<C; ++c) eyes_out[c] = 0;
                     for(int ky=-k_rad; ky<=k_rad; ++ky) {
                         for(int kx=-k_rad; kx<=k_rad; ++kx) {
@@ -378,20 +391,48 @@ public:
                         }
                     }
 
-                     for(size_t i=0; i<C; ++i) mixer_in[i] = eyes_out[perm_indices_[i]];
+                    // Recompute Mixer Output (Pre-ReLU)
+                    for(size_t i=0; i<C; ++i) mixer_in[i] = eyes_out[perm_indices_[i]];
                     algo::WHT::fwht_1d(mixer_in, C);
 
+                    // Apply Scale and Bias
+                    for(size_t i=0; i<C; ++i) {
+                        // mixer_in holds FWHT output here
+                        // val = scale * fwht_out + bias
+                        T val = lut_mul(mixer_in[i], scale_ptr[i]) + bias_ptr[i];
+
+                        // 2. ReLU Backward: Multiply gradient by step function
+                        if (val <= 0) {
+                            d_vec[i] = 0;
+                        }
+                    }
+
+                    // 3. Accumulate Bias Gradient
+                    for(size_t i=0; i<C; ++i) {
+                         gbias_ptr[i] += d_vec[i];
+                    }
+
+                    // 4. Accumulate Scale Gradient (d_vec * fwht_out)
                     for(size_t c=0; c<C; ++c) {
                         gscale_ptr[c] += d_vec[c] * mixer_in[c];
+                    }
+
+                    // 5. Backprop through Scale (d_vec = d_vec * scale)
+                    for(size_t c=0; c<C; ++c) {
                         d_vec[c] *= scale_ptr[c];
                     }
 
+                    // 6. Backprop through FWHT (Inverse FWHT = FWHT / N, or just FWHT if keeping symmetric unnormalized?)
+                    // The forward FWHT is unnormalized. Inverse is FWHT.
+                    // Note: If scale was used to normalize, we are fine.
                     algo::WHT::fwht_1d(d_vec, C);
 
+                    // 7. Backprop through Permutation
                     for(size_t i=0; i<C; ++i) {
                         d_unperm[perm_indices_[i]] = d_vec[i];
                     }
 
+                    // 8. Backprop through Spatial Weights
                     for(int ky=-k_rad; ky<=k_rad; ++ky) {
                         for(int kx=-k_rad; kx<=k_rad; ++kx) {
                             int ih = h + ky;
@@ -419,11 +460,11 @@ public:
     }
 
     std::vector<Tensor<T>*> parameters() override {
-        return {&spatial_weights_, &spectral_scales_};
+        return {&spatial_weights_, &spectral_scales_, &bias_};
     }
 
     std::vector<Tensor<T>*> gradients() override {
-        return {&grad_spatial_, &grad_scales_};
+        return {&grad_spatial_, &grad_scales_, &grad_bias_};
     }
 
     std::string name() const override { return "ZenithBlock"; }
@@ -443,6 +484,7 @@ private:
     // Parameters
     Tensor<T> spatial_weights_; // (C, 1, K, K)
     Tensor<T> spectral_scales_; // (1, C)
+    Tensor<T> bias_;            // (1, C) - Added Bias
     std::vector<int> perm_indices_;
 
     // Phase 6: Memory Footprint Reduction
@@ -455,6 +497,7 @@ private:
     // Gradients
     Tensor<T> grad_spatial_;
     Tensor<T> grad_scales_;
+    Tensor<T> grad_bias_;       // Added Bias Gradient
 
     // Cache
     Tensor<T> input_;
