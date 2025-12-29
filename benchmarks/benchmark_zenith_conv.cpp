@@ -13,17 +13,21 @@
 #include "../include/dreidel/layers/Conv2D.hpp"
 #include "../include/dreidel/layers/ZenithBlock.hpp"
 #include "../include/dreidel/layers/Quantization.hpp" // Pack/Unpack
+#include "../include/dreidel/layers/QuantizedStandard.hpp" // QPool, QUpscale, QDense
 
 using namespace dreidel;
 
-// Helpers
+// Helpers: We only need standard float layers for the Conv model now.
+// For Zenith model, we use QuantizedStandard.hpp layers.
+
 template <typename T>
 class AvgPool2D : public layers::Layer<T> {
 public:
     AvgPool2D(size_t stride) : stride_(stride) {}
     Tensor<T> forward(const Tensor<T>& input) override {
-        input_shape_ = input.shape();
-        size_t N = input_shape_[0]; size_t H = input_shape_[1]; size_t W = input_shape_[2]; size_t C = input_shape_[3];
+        // Assume NHWC
+        auto shape = input.shape();
+        size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
         size_t H_out = H / stride_; size_t W_out = W / stride_;
         Tensor<T> output({N, H_out, W_out, C});
         output.fill(0);
@@ -46,11 +50,10 @@ public:
         }
         return output;
     }
-    Tensor<T> backward(const Tensor<T>& grad_output) override { return Tensor<T>(); } // Dummy
+    Tensor<T> backward(const Tensor<T>& grad_output) override { return Tensor<T>(); }
     std::string name() const override { return "AvgPool2D"; }
 private:
     size_t stride_;
-    std::vector<size_t> input_shape_;
 };
 
 template <typename T>
@@ -58,8 +61,8 @@ class Upscale2D : public layers::Layer<T> {
 public:
     Upscale2D(size_t scale) : scale_(scale) {}
     Tensor<T> forward(const Tensor<T>& input) override {
-        input_shape_ = input.shape();
-        size_t N = input_shape_[0]; size_t H = input_shape_[1]; size_t W = input_shape_[2]; size_t C = input_shape_[3];
+        auto shape = input.shape();
+        size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
         size_t H_out = H * scale_; size_t W_out = W * scale_;
         Tensor<T> output({N, H_out, W_out, C});
         T* out_ptr = output.data(); const T* in_ptr = input.data();
@@ -80,17 +83,16 @@ public:
     std::string name() const override { return "Upscale2D"; }
 private:
     size_t scale_;
-    std::vector<size_t> input_shape_;
 };
 
 template <typename T>
 class Flatten : public layers::Layer<T> {
 public:
     Tensor<T> forward(const Tensor<T>& input) override {
-        input_shape_ = input.shape();
-        size_t batch = input_shape_[0];
+        auto shape = input.shape();
+        size_t batch = shape[0];
         size_t dim = 1;
-        for(size_t i=1; i<input_shape_.size(); ++i) dim *= input_shape_[i];
+        for(size_t i=1; i<shape.size(); ++i) dim *= shape[i];
         Tensor<T> output({batch, dim});
         const T* in_ptr = input.data(); T* out_ptr = output.data();
         std::copy(in_ptr, in_ptr + output.size(), out_ptr);
@@ -98,8 +100,6 @@ public:
     }
     Tensor<T> backward(const Tensor<T>& grad_output) override { return Tensor<T>(); }
     std::string name() const override { return "Flatten"; }
-private:
-    std::vector<size_t> input_shape_;
 };
 
 template <typename T>
@@ -107,8 +107,8 @@ class Reshape : public layers::Layer<T> {
 public:
     Reshape(std::vector<size_t> target_shape_suffix) : target_suffix_(target_shape_suffix) {}
     Tensor<T> forward(const Tensor<T>& input) override {
-        input_shape_ = input.shape();
-        size_t batch = input_shape_[0];
+        auto shape = input.shape();
+        size_t batch = shape[0];
         std::vector<size_t> new_shape = {batch};
         new_shape.insert(new_shape.end(), target_suffix_.begin(), target_suffix_.end());
         Tensor<T> output(new_shape);
@@ -119,33 +119,21 @@ public:
     Tensor<T> backward(const Tensor<T>& grad_output) override { return Tensor<T>(); }
     std::string name() const override { return "Reshape"; }
 private:
-    std::vector<size_t> input_shape_;
     std::vector<size_t> target_suffix_;
 };
 
-// 2D Wavelet Generator (Restored Rich Families)
+// 2D Wavelet Generator (Rich Families)
 template <typename T>
 void generate_wavelet_images(Tensor<T>& data) {
     auto shape = data.shape();
-    size_t batch = shape[0];
-    size_t H = shape[1];
-    size_t W = shape[2];
-    size_t C = shape[3];
-
-    // Use fixed seed for reproducibility
+    size_t batch = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
     static std::mt19937 gen(42);
-
     std::uniform_int_distribution<int> dist_type(0, 19);
     std::uniform_real_distribution<T> dist_param(0.5, 2.0);
     std::uniform_real_distribution<T> dist_pos(0.2, 0.8);
-
     T* ptr = data.data();
-
     auto get_wavelet_val = [&](int type, T t, T mu, T s, T w) -> T {
-        T x = t - mu;
-        T val = 0;
-        T s2 = s * 2.0;
-
+        T x = t - mu; T val = 0; T s2 = s * 2.0;
         switch(type) {
             case 0: val = std::cos(w*x) * std::exp(-x*x/(2*s*s)); break;
             case 1: { T x2 = (x*x)/(s*s); val = (1.0 - x2) * std::exp(-x2/2.0); } break;
@@ -170,21 +158,16 @@ void generate_wavelet_images(Tensor<T>& data) {
         }
         return val;
     };
-
     for(size_t n=0; n<batch; ++n) {
         for(size_t c=0; c<C; ++c) {
-            int type_x = dist_type(gen);
-            int type_y = dist_type(gen);
-            T s_x = dist_param(gen) * (W/10.0);
-            T s_y = dist_param(gen) * (H/10.0);
-            T mu_x = dist_pos(gen) * W;
-            T mu_y = dist_pos(gen) * H;
-            T w = dist_param(gen);
-
+            int type_x = dist_type(gen); int type_y = dist_type(gen);
+            T s_x = dist_param(gen) * (W/10.0); T s_y = dist_param(gen) * (H/10.0);
+            T mu_x = dist_pos(gen) * W; T mu_y = dist_pos(gen) * H;
+            T w_p = dist_param(gen);
             for(size_t h=0; h<H; ++h) {
                 for(size_t w_idx=0; w_idx<W; ++w_idx) {
-                     T wx = get_wavelet_val(type_x, (T)w_idx, mu_x, s_x, w);
-                     T wy = get_wavelet_val(type_y, (T)h, mu_y, s_y, w);
+                     T wx = get_wavelet_val(type_x, (T)w_idx, mu_x, s_x, w_p);
+                     T wy = get_wavelet_val(type_y, (T)h, mu_y, s_y, w_p);
                      ptr[((n*H + h)*W + w_idx)*C + c] = wx * wy;
                 }
             }
@@ -201,83 +184,74 @@ void run_benchmark_for_channel(size_t C) {
     std::cout << "\n--------------------------------------------------" << std::endl;
     std::cout << "Benchmarking Channel Count C=" << C << std::endl;
 
-    // --- Zenith Model (Manual Chain) ---
-    // Architecture: Pack -> Zenith -> Zenith -> Unpack -> Pool -> Pack -> Zenith -> Unpack ...
-    // Simplified per user request architecture: Zenith -> Pool -> Zenith -> Latent -> ...
-    // ZenithBlock is strictly int8 I/O. Pool/Dense are float.
-    // Chain:
-    // In(F) -> Pack -> Z(I8) -> Unpack -> Pool(F) -> Pack -> Z(I8) -> Unpack -> Flatten -> Dense -> Dense -> Reshape -> Pack -> Z(I8) -> Unpack -> Upscale -> Pack -> Z(I8) -> Unpack(Out)
-
+    // --- Zenith Model (Int8 Chain) ---
+    // In(F) -> Pack -> Z(I8) -> QPool -> Z(I8) -> Flatten(I8) -> QDense -> QDense -> Reshape(I8) -> Z(I8) -> QUpscale -> Z(I8) -> Unpack(Out)
     size_t arena_size = 4 * 1024 * 1024;
 
-    // Layers
     layers::PackAPoT pack;
     layers::UnpackAPoT unpack;
+
     layers::ZenithBlock z1(C, 3, C, arena_size);
-    AvgPool2D<float> pool(2); // In global namespace
+    layers::QuantizedAvgPool2D qpool(2); // Outputs Int8
     layers::ZenithBlock z2(C, 3, C, arena_size);
-    Flatten<float> flat;
-    layers::Dense<float> d1((H/2)*(W/2)*C, latent_dim);
-    layers::Dense<float> d2(latent_dim, (H/2)*(W/2)*C);
-    Reshape<float> reshape({H/2, W/2, C});
+
+    layers::FlattenInt8 flat_i8;
+    layers::QuantizedDense qd1((H/2)*(W/2)*C, latent_dim);
+    layers::QuantizedDense qd2(latent_dim, (H/2)*(W/2)*C);
+    layers::ReshapeInt8 reshape_i8({H/2, W/2, C});
+
     layers::ZenithBlock z3(C, 3, C, arena_size);
-    Upscale2D<float> upscale(2);
+    layers::QuantizedUpscale2D qupscale(2);
     layers::ZenithBlock z4(C, 3, C, arena_size);
 
-    // --- Conv Model (Standard Sequential) ---
+    // --- Conv Model (Standard Sequential Float) ---
     layers::Conv2D<float> c1(C, C, 3, 1, 1);
     layers::Conv2D<float> c2(C, C, 3, 1, 1);
     layers::Conv2D<float> c3(C, C, 3, 1, 1);
     layers::Conv2D<float> c4(C, C, 3, 1, 1);
 
+    AvgPool2D<float> pool_f(2);
+    Flatten<float> flat_f;
+    layers::Dense<float> d1_f((H/2)*(W/2)*C, latent_dim);
+    layers::Dense<float> d2_f(latent_dim, (H/2)*(W/2)*C);
+    Reshape<float> reshape_f({H/2, W/2, C});
+    Upscale2D<float> upscale_f(2);
+
     // Data
     Tensor<float> input({batch_size, H, W, C});
     generate_wavelet_images(input);
 
-    // Warmup Zenith Chain
+    // Warmup Zenith
     {
-        auto t_packed = pack.forward(input);
-        auto t_z1 = z1.forward(t_packed);
-        // Pool requires float
-        auto t_z1_f = unpack.forward(t_z1);
-        auto t_pool = pool.forward(t_z1_f);
-        auto t_pool_p = pack.forward(t_pool);
-        auto t_z2 = z2.forward(t_pool_p);
-        auto t_z2_f = unpack.forward(t_z2);
-        auto t_flat = flat.forward(t_z2_f);
-        auto t_d1 = d1.forward(t_flat);
-        auto t_d2 = d2.forward(t_d1);
-        auto t_resh = reshape.forward(t_d2);
-        auto t_resh_p = pack.forward(t_resh);
-        auto t_z3 = z3.forward(t_resh_p);
-        auto t_z3_f = unpack.forward(t_z3);
-        auto t_up = upscale.forward(t_z3_f);
-        auto t_up_p = pack.forward(t_up);
-        auto t_z4 = z4.forward(t_up_p);
-        auto t_out = unpack.forward(t_z4);
+        auto t0 = pack.forward(input);
+        auto t1 = z1.forward(t0);
+        auto t2 = qpool.forward(t1); // Int8 -> Int8
+        auto t3 = z2.forward(t2);
+        auto t4 = flat_i8.forward(t3);
+        auto t5 = qd1.forward(t4);
+        auto t6 = qd2.forward(t5);
+        auto t7 = reshape_i8.forward(t6);
+        auto t8 = z3.forward(t7);
+        auto t9 = qupscale.forward(t8); // Int8 -> Int8
+        auto t10 = z4.forward(t9);
+        auto out = unpack.forward(t10);
     }
 
     // Benchmark Zenith
     auto start_z = std::chrono::high_resolution_clock::now();
     for(size_t i=0; i<loops; ++i) {
-        auto t_packed = pack.forward(input);
-        auto t_z1 = z1.forward(t_packed);
-        auto t_z1_f = unpack.forward(t_z1); // Explicit Unpack for Pooling
-        auto t_pool = pool.forward(t_z1_f);
-        auto t_pool_p = pack.forward(t_pool); // Pack again
-        auto t_z2 = z2.forward(t_pool_p);
-        auto t_z2_f = unpack.forward(t_z2); // Unpack for Dense
-        auto t_flat = flat.forward(t_z2_f);
-        auto t_d1 = d1.forward(t_flat);
-        auto t_d2 = d2.forward(t_d1);
-        auto t_resh = reshape.forward(t_d2);
-        auto t_resh_p = pack.forward(t_resh); // Pack for Zenith
-        auto t_z3 = z3.forward(t_resh_p);
-        auto t_z3_f = unpack.forward(t_z3); // Unpack for Upscale
-        auto t_up = upscale.forward(t_z3_f);
-        auto t_up_p = pack.forward(t_up); // Pack for Zenith
-        auto t_z4 = z4.forward(t_up_p);
-        auto t_out = unpack.forward(t_z4); // Final Output
+        auto t0 = pack.forward(input);
+        auto t1 = z1.forward(t0);
+        auto t2 = qpool.forward(t1);
+        auto t3 = z2.forward(t2);
+        auto t4 = flat_i8.forward(t3);
+        auto t5 = qd1.forward(t4);
+        auto t6 = qd2.forward(t5);
+        auto t7 = reshape_i8.forward(t6);
+        auto t8 = z3.forward(t7);
+        auto t9 = qupscale.forward(t8);
+        auto t10 = z4.forward(t9);
+        auto out = unpack.forward(t10);
     }
     auto end_z = std::chrono::high_resolution_clock::now();
     double time_z = std::chrono::duration<double>(end_z - start_z).count();
@@ -286,14 +260,14 @@ void run_benchmark_for_channel(size_t C) {
     auto start_c = std::chrono::high_resolution_clock::now();
     for(size_t i=0; i<loops; ++i) {
         auto t1 = c1.forward(input);
-        auto t2 = pool.forward(t1);
+        auto t2 = pool_f.forward(t1);
         auto t3 = c2.forward(t2);
-        auto t4 = flat.forward(t3);
-        auto t5 = d1.forward(t4);
-        auto t6 = d2.forward(t5);
-        auto t7 = reshape.forward(t6);
+        auto t4 = flat_f.forward(t3);
+        auto t5 = d1_f.forward(t4);
+        auto t6 = d2_f.forward(t5);
+        auto t7 = reshape_f.forward(t6);
         auto t8 = c3.forward(t7);
-        auto t9 = upscale.forward(t8);
+        auto t9 = upscale_f.forward(t8);
         auto t10 = c4.forward(t9);
     }
     auto end_c = std::chrono::high_resolution_clock::now();
@@ -305,7 +279,7 @@ void run_benchmark_for_channel(size_t C) {
 }
 
 int main() {
-    std::cout << "=== ZenithBlock (APoT) vs Conv2D Benchmark ===" << std::endl;
+    std::cout << "=== ZenithBlock (Strict APoT Chain) vs Conv2D Benchmark ===" << std::endl;
     std::vector<size_t> channels_list = {16, 64, 128};
     for(size_t C : channels_list) {
         run_benchmark_for_channel(C);
