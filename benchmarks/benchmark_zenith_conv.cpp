@@ -85,43 +85,6 @@ private:
     size_t scale_;
 };
 
-template <typename T>
-class Flatten : public layers::Layer<T> {
-public:
-    Tensor<T> forward(const Tensor<T>& input) override {
-        auto shape = input.shape();
-        size_t batch = shape[0];
-        size_t dim = 1;
-        for(size_t i=1; i<shape.size(); ++i) dim *= shape[i];
-        Tensor<T> output({batch, dim});
-        const T* in_ptr = input.data(); T* out_ptr = output.data();
-        std::copy(in_ptr, in_ptr + output.size(), out_ptr);
-        return output;
-    }
-    Tensor<T> backward(const Tensor<T>& grad_output) override { return Tensor<T>(); }
-    std::string name() const override { return "Flatten"; }
-};
-
-template <typename T>
-class Reshape : public layers::Layer<T> {
-public:
-    Reshape(std::vector<size_t> target_shape_suffix) : target_suffix_(target_shape_suffix) {}
-    Tensor<T> forward(const Tensor<T>& input) override {
-        auto shape = input.shape();
-        size_t batch = shape[0];
-        std::vector<size_t> new_shape = {batch};
-        new_shape.insert(new_shape.end(), target_suffix_.begin(), target_suffix_.end());
-        Tensor<T> output(new_shape);
-        const T* in_ptr = input.data(); T* out_ptr = output.data();
-        std::copy(in_ptr, in_ptr + output.size(), out_ptr);
-        return output;
-    }
-    Tensor<T> backward(const Tensor<T>& grad_output) override { return Tensor<T>(); }
-    std::string name() const override { return "Reshape"; }
-private:
-    std::vector<size_t> target_suffix_;
-};
-
 // 2D Wavelet Generator (Rich Families)
 template <typename T>
 void generate_wavelet_images(Tensor<T>& data) {
@@ -178,14 +141,14 @@ void generate_wavelet_images(Tensor<T>& data) {
 void run_benchmark_for_channel(size_t C) {
     size_t batch_size = 8;
     size_t H = 64, W = 64;
-    size_t latent_dim = 64;
+    size_t latent_dim = 64; // Unused for dense, but maybe useful context
     size_t loops = 10;
 
     std::cout << "\n--------------------------------------------------" << std::endl;
     std::cout << "Benchmarking Channel Count C=" << C << std::endl;
 
-    // --- Zenith Model (Int8 Chain) ---
-    // In(F) -> Pack -> Z(I8) -> QPool -> Z(I8) -> Flatten(I8) -> QDense -> QDense -> Reshape(I8) -> Z(I8) -> QUpscale -> Z(I8) -> Unpack(Out)
+    // --- Zenith Model (Int8 Chain - No Dense) ---
+    // In(F) -> Pack -> Z1 -> QPool -> Z2 -> Z3 (Bottleneck) -> QUpscale -> Z4 -> Unpack(Out)
     size_t arena_size = 4 * 1024 * 1024;
 
     layers::PackAPoT pack;
@@ -194,27 +157,18 @@ void run_benchmark_for_channel(size_t C) {
     layers::ZenithBlock z1(C, 3, C, arena_size);
     layers::QuantizedAvgPool2D qpool(2); // Outputs Int8
     layers::ZenithBlock z2(C, 3, C, arena_size);
-
-    layers::FlattenInt8 flat_i8;
-    layers::QuantizedDense qd1((H/2)*(W/2)*C, latent_dim);
-    layers::QuantizedDense qd2(latent_dim, (H/2)*(W/2)*C);
-    layers::ReshapeInt8 reshape_i8({H/2, W/2, C});
-
-    layers::ZenithBlock z3(C, 3, C, arena_size);
+    layers::ZenithBlock z3(C, 3, C, arena_size); // Replaces dense bottleneck logic
     layers::QuantizedUpscale2D qupscale(2);
     layers::ZenithBlock z4(C, 3, C, arena_size);
 
-    // --- Conv Model (Standard Sequential Float) ---
+    // --- Conv Model (Standard Sequential Float - No Dense) ---
+    // C1 -> Pool -> C2 -> C3 -> Upscale -> C4
     layers::Conv2D<float> c1(C, C, 3, 1, 1);
     layers::Conv2D<float> c2(C, C, 3, 1, 1);
     layers::Conv2D<float> c3(C, C, 3, 1, 1);
     layers::Conv2D<float> c4(C, C, 3, 1, 1);
 
     AvgPool2D<float> pool_f(2);
-    Flatten<float> flat_f;
-    layers::Dense<float> d1_f((H/2)*(W/2)*C, latent_dim);
-    layers::Dense<float> d2_f(latent_dim, (H/2)*(W/2)*C);
-    Reshape<float> reshape_f({H/2, W/2, C});
     Upscale2D<float> upscale_f(2);
 
     // Data
@@ -225,16 +179,12 @@ void run_benchmark_for_channel(size_t C) {
     {
         auto t0 = pack.forward(input);
         auto t1 = z1.forward(t0);
-        auto t2 = qpool.forward(t1); // Int8 -> Int8
+        auto t2 = qpool.forward(t1);
         auto t3 = z2.forward(t2);
-        auto t4 = flat_i8.forward(t3);
-        auto t5 = qd1.forward(t4);
-        auto t6 = qd2.forward(t5);
-        auto t7 = reshape_i8.forward(t6);
-        auto t8 = z3.forward(t7);
-        auto t9 = qupscale.forward(t8); // Int8 -> Int8
-        auto t10 = z4.forward(t9);
-        auto out = unpack.forward(t10);
+        auto t4 = z3.forward(t3);
+        auto t5 = qupscale.forward(t4);
+        auto t6 = z4.forward(t5);
+        auto out = unpack.forward(t6);
     }
 
     // Benchmark Zenith
@@ -244,14 +194,10 @@ void run_benchmark_for_channel(size_t C) {
         auto t1 = z1.forward(t0);
         auto t2 = qpool.forward(t1);
         auto t3 = z2.forward(t2);
-        auto t4 = flat_i8.forward(t3);
-        auto t5 = qd1.forward(t4);
-        auto t6 = qd2.forward(t5);
-        auto t7 = reshape_i8.forward(t6);
-        auto t8 = z3.forward(t7);
-        auto t9 = qupscale.forward(t8);
-        auto t10 = z4.forward(t9);
-        auto out = unpack.forward(t10);
+        auto t4 = z3.forward(t3);
+        auto t5 = qupscale.forward(t4);
+        auto t6 = z4.forward(t5);
+        auto out = unpack.forward(t6);
     }
     auto end_z = std::chrono::high_resolution_clock::now();
     double time_z = std::chrono::duration<double>(end_z - start_z).count();
@@ -262,13 +208,9 @@ void run_benchmark_for_channel(size_t C) {
         auto t1 = c1.forward(input);
         auto t2 = pool_f.forward(t1);
         auto t3 = c2.forward(t2);
-        auto t4 = flat_f.forward(t3);
-        auto t5 = d1_f.forward(t4);
-        auto t6 = d2_f.forward(t5);
-        auto t7 = reshape_f.forward(t6);
-        auto t8 = c3.forward(t7);
-        auto t9 = upscale_f.forward(t8);
-        auto t10 = c4.forward(t9);
+        auto t4 = c3.forward(t3);
+        auto t5 = upscale_f.forward(t4);
+        auto t6 = c4.forward(t5);
     }
     auto end_c = std::chrono::high_resolution_clock::now();
     double time_c = std::chrono::duration<double>(end_c - start_c).count();
@@ -279,7 +221,7 @@ void run_benchmark_for_channel(size_t C) {
 }
 
 int main() {
-    std::cout << "=== ZenithBlock (Strict APoT Chain) vs Conv2D Benchmark ===" << std::endl;
+    std::cout << "=== ZenithBlock (Strict APoT Chain) vs Conv2D Benchmark (No Dense) ===" << std::endl;
     std::vector<size_t> channels_list = {16, 64, 128};
     for(size_t C : channels_list) {
         run_benchmark_for_channel(C);
