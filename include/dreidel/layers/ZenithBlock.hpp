@@ -2,7 +2,6 @@
 
 #include "Layer.hpp"
 #include "../core/Memory.hpp"
-#include "../algo/WHT.hpp"
 #include "../hal/ops.hpp"
 #include <vector>
 #include <cmath>
