@@ -45,15 +45,16 @@ T lut_mul(T pixel, T weight_apot) {
  * NOTE: This block is stateful due to the `Arena` allocator.
  * It assumes serial execution within a single instance.
  * For parallel processing, each thread must have its own instance or a thread-local Arena.
+ *
+ * STRICT APoT MODE: This block only supports optimized APoT execution.
  */
 template <typename T>
 class ZenithBlock : public Layer<T> {
 public:
-    ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024, bool use_gating = false, bool use_apot = true)
+    ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024, bool use_gating = false)
         : channels_(channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
           arena_(arena_size), // 1MB Scratchpad default
           use_gating_(use_gating),
-          use_apot_(use_apot),
           training_(true),
           spatial_weights_({channels, 1, kernel_size, kernel_size}),
           spectral_scales_({1, spectral_dim}),
@@ -128,7 +129,7 @@ public:
         const T* in_ptr = input.data();
         T* out_ptr = output.data();
 
-        const T* sw_ptr = spatial_weights_.data();
+        // const T* sw_ptr = spatial_weights_.data(); // Unused in APoT packed mode
         const T* scale_ptr = spectral_scales_.data();
         const T* bias_ptr = bias_.data();
         int k_rad = kernel_size_ / 2;
@@ -138,13 +139,9 @@ public:
         std::vector<T> effective_scales(C);
         for(size_t i=0; i<C; ++i) effective_scales[i] = quantize_apot(scale_ptr[i]);
 
-        // Quantize Bias if needed
+        // Quantize Bias
         std::vector<T> effective_bias(C);
-        if (use_apot_) {
-             for(size_t i=0; i<C; ++i) effective_bias[i] = quantize_apot(bias_ptr[i]);
-        } else {
-             for(size_t i=0; i<C; ++i) effective_bias[i] = bias_ptr[i];
-        }
+        for(size_t i=0; i<C; ++i) effective_bias[i] = quantize_apot(bias_ptr[i]);
 
         // Pre-compute Oracle Sign Mask
         uint32_t oracle_mask = 0;
@@ -197,39 +194,31 @@ public:
                                         const T* p_in = in_ptr + ((n*H + ih)*W + iw)*C;
                                         int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
 
-                                        if (use_apot_) {
-                                            // Phase 6: Use packed weights to reduce bandwidth
-                                            const int8_t* p_w_packed = packed_weights_.data() + k_idx * channels_;
+                                        // Phase 6: Use packed weights to reduce bandwidth
+                                        const int8_t* p_w_packed = packed_weights_.data() + k_idx * channels_;
 
-                                            // Vectorized Unpack & FMA (AVX2 if available)
-                                            size_t c = 0;
+                                        // Vectorized Unpack & FMA (AVX2 if available)
+                                        size_t c = 0;
 #if defined(DREIDEL_ARCH_AVX2) && defined(__AVX2__)
-                                            if (std::is_same<T, float>::value) {
-                                                for(; c+8 <= C; c+=8) {
-                                                    // 1. Unpack 8 weights
-                                                    __m256 v_w = hal::AlienOps::vec_unpack_apot_avx2(p_w_packed + c);
-                                                    // 2. Load 8 pixels
-                                                    __m256 v_in = _mm256_loadu_ps((const float*)(p_in + c));
-                                                    // 3. Load accumulator
-                                                    __m256 v_acc = _mm256_loadu_ps((const float*)(pixel_buffer + c));
-                                                    // 4. FMA
-                                                    v_acc = _mm256_fmadd_ps(v_in, v_w, v_acc);
-                                                    // 5. Store back
-                                                    _mm256_storeu_ps((float*)(pixel_buffer + c), v_acc);
-                                                }
+                                        if (std::is_same<T, float>::value) {
+                                            for(; c+8 <= C; c+=8) {
+                                                // 1. Unpack 8 weights
+                                                __m256 v_w = hal::AlienOps::vec_unpack_apot_avx2(p_w_packed + c);
+                                                // 2. Load 8 pixels
+                                                __m256 v_in = _mm256_loadu_ps((const float*)(p_in + c));
+                                                // 3. Load accumulator
+                                                __m256 v_acc = _mm256_loadu_ps((const float*)(pixel_buffer + c));
+                                                // 4. FMA
+                                                v_acc = _mm256_fmadd_ps(v_in, v_w, v_acc);
+                                                // 5. Store back
+                                                _mm256_storeu_ps((float*)(pixel_buffer + c), v_acc);
                                             }
+                                        }
 #endif
-                                            // Scalar Fallback
-                                            for(; c<C; ++c) {
-                                                float w_val = hal::AlienOps::unpack_apot(p_w_packed[c]);
-                                                pixel_buffer[c] += p_in[c] * static_cast<T>(w_val);
-                                            }
-                                        } else {
-                                            // Standard Float Path (Baseline)
-                                            const T* p_w = sw_ptr + k_idx * channels_;
-                                            for(size_t c=0; c<C; ++c) {
-                                                pixel_buffer[c] += p_in[c] * p_w[c];
-                                            }
+                                        // Scalar Fallback
+                                        for(; c<C; ++c) {
+                                            float w_val = hal::AlienOps::unpack_apot(p_w_packed[c]);
+                                            pixel_buffer[c] += p_in[c] * static_cast<T>(w_val);
                                         }
                                     }
                                 }
@@ -494,7 +483,7 @@ private:
 
     // Config
     bool use_gating_;
-    bool use_apot_;
+    // bool use_apot_; // Removed: Always TRUE
     bool training_;
 
     // Parameters
