@@ -46,7 +46,10 @@ public:
 
         std::fill(bias_.begin(), bias_.end(), 0);
         std::iota(perm_indices_.begin(), perm_indices_.end(), 0);
-        oracle_projection_.resize(channels, 0);
+
+        // Init Oracle Projection (Random Hyperplane)
+        oracle_projection_.resize(channels);
+        for(auto& p : oracle_projection_) p = static_cast<int8_t>(dist_code(gen));
     }
 
     Tensor<int8_t> forward(const Tensor<int8_t>& input) override {
@@ -64,6 +67,7 @@ public:
         const int8_t* scale_ptr = spectral_scales_.data();
         const int8_t* bias_ptr = bias_.data();
         const int* perm_ptr = perm_indices_.data();
+        const int8_t* oracle_ptr = oracle_projection_.data();
 
         int k_rad = kernel_size_ / 2;
 
@@ -74,10 +78,36 @@ public:
         constexpr int BLOCK_H = 8;
         constexpr int BLOCK_W = 8;
 
+        // Oracle Mask: Sign of projection vector
+        uint32_t oracle_mask = 0;
+        if(use_gating_) {
+            for(size_t i=0; i<C; ++i) {
+                if (oracle_ptr[i] & 0x80) oracle_mask |= (1u << i);
+            }
+        }
+
         for(size_t n=0; n<batch; ++n) {
 
             if (use_gating_) {
-                // (Stub)
+                size_t ch = H/2, cw = W/2;
+                const int8_t* p_center = in_ptr + ((n*H + ch)*W + cw)*C;
+
+                uint32_t input_mask = 0;
+#if defined(DREIDEL_ARCH_AVX2)
+                __m256i v = _mm256_loadu_si256((const __m256i*)p_center);
+                input_mask = _mm256_movemask_epi8(v);
+#else
+                for(size_t i=0; i<std::min(C, (size_t)32); ++i) {
+                    if (p_center[i] & 0x80) input_mask |= (1u << i);
+                }
+#endif
+                int dist = hal::AlienOps::popcnt32(input_mask ^ oracle_mask);
+                if (dist > 16) {
+                    // Zero out output block for this sample to avoid garbage
+                    int8_t* p_out_start = out_ptr + n * H * W * C;
+                    std::fill(p_out_start, p_out_start + H * W * C, 0);
+                    continue;
+                }
             }
 
             for(size_t by=0; by<H; by+=BLOCK_H) {
@@ -219,12 +249,7 @@ public:
         return Tensor<int8_t>();
     }
 
-    // Return dummy parameters to satisfy Layer contract (pointers to internal buffers)
-    // Note: These are int8 tensors, casting pointer might be unsafe if Layer expects Tensor<float>.
-    // But Layer<int8_t> expects Tensor<int8_t>.
     std::vector<Tensor<int8_t>*> parameters() override {
-        // We don't expose packed weights as mutable tensors easily in this layout,
-        // but for API compliance we return empty.
         return {};
     }
 
