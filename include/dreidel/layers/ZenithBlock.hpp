@@ -54,6 +54,7 @@ public:
           arena_(arena_size), // 1MB Scratchpad default
           use_gating_(use_gating),
           use_apot_(use_apot),
+          training_(true),
           spatial_weights_({channels, 1, kernel_size, kernel_size}),
           spectral_scales_({1, spectral_dim}),
           bias_({1, spectral_dim}),
@@ -78,12 +79,7 @@ public:
             packed_weights_[i] = hal::AlienOps::pack_apot(static_cast<float>(sw_ptr[i]));
         }
 
-        // Fix: Initialize scales to 1/N to counteract FWHT gain (which is N for unnormalized, or sqrt(N)?)
-        // Standard WHT unnormalized has energy gain N^2, amplitude gain N?
-        // Actually H*H = N*I. So x -> Hx scales L2 norm by sqrt(N).
-        // To preserve variance, we should scale by 1/sqrt(N).
-        // If we want range preservation, maybe 1/N.
-        // Let's use 1.0 / sqrt(channels)
+        // Fix: Initialize scales to 1/N to counteract FWHT gain
         T scale_init = 1.0 / std::sqrt(static_cast<T>(channels));
         spectral_scales_.fill(scale_init);
 
@@ -97,15 +93,15 @@ public:
         std::shuffle(perm_indices_.begin(), perm_indices_.end(), g);
 
         // Oracle Init (Simplified ALSH)
-        // Random projection vector for hashing
         oracle_projection_.resize(channels);
         std::uniform_real_distribution<T> dist(-1.0, 1.0);
         for(auto& v : oracle_projection_) v = dist(g);
 
-        // Assign Active Bucket (0 or 1)
-        active_bucket_ = 1; // We only run if hash(input) == 1.
-        // For simulation, we want it to run most of the time unless we really have many blocks.
-        // Let's assume a 1-bit hash for now (Sign of projection).
+        active_bucket_ = 1;
+    }
+
+    void set_training(bool mode) {
+        training_ = mode;
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
@@ -139,7 +135,6 @@ public:
 
         // Quantize scales for forward pass (APoT)
         // In real training we'd keep float weights and quantize on forward.
-        // Here we just quantize on the fly or use stored.
         std::vector<T> effective_scales(C);
         for(size_t i=0; i<C; ++i) effective_scales[i] = quantize_apot(scale_ptr[i]);
 
@@ -177,7 +172,6 @@ public:
             }
 
             // Phase 6: Super-Block Tiling (Blocked Z-Curve Approximation)
-            // Iterate in 8x8 blocks to improve cache locality.
             constexpr int BLOCK_H = 8;
             constexpr int BLOCK_W = 8;
 
@@ -210,21 +204,16 @@ public:
                                             // Vectorized Unpack & FMA (AVX2 if available)
                                             size_t c = 0;
 #if defined(DREIDEL_ARCH_AVX2) && defined(__AVX2__)
-                                            // Assuming T is float and channels aligned
                                             if (std::is_same<T, float>::value) {
                                                 for(; c+8 <= C; c+=8) {
-                                                    // 1. Unpack 8 weights (In Registers)
+                                                    // 1. Unpack 8 weights
                                                     __m256 v_w = hal::AlienOps::vec_unpack_apot_avx2(p_w_packed + c);
-
                                                     // 2. Load 8 pixels
                                                     __m256 v_in = _mm256_loadu_ps((const float*)(p_in + c));
-
                                                     // 3. Load accumulator
                                                     __m256 v_acc = _mm256_loadu_ps((const float*)(pixel_buffer + c));
-
                                                     // 4. FMA
                                                     v_acc = _mm256_fmadd_ps(v_in, v_w, v_acc);
-
                                                     // 5. Store back
                                                     _mm256_storeu_ps((float*)(pixel_buffer + c), v_acc);
                                                 }
@@ -249,30 +238,49 @@ public:
                             // 3. The Mixer (Spectral Engine) -> In-Place on pixel_buffer
 
                             // a. Soft Permutation (Ghost Phase)
-                            // If float and C=64 on AVX2, use optimized gather
-                            if (std::is_same<T, float>::value && C == 64) {
+                            // If float and C on AVX2, use optimized path
+                            if (std::is_same<T, float>::value) {
 #if defined(DREIDEL_ARCH_AVX2)
-                                hal::sparse_gather((const float*)pixel_buffer, perm_indices_.data(), (float*)temp_perm_buffer, C);
+                                bool handled = false;
+                                if (C == 16 || C == 32 || C == 64 || C == 128) {
+                                     // Common Optimized Pipeline
+                                    hal::sparse_gather((const float*)pixel_buffer, perm_indices_.data(), (float*)temp_perm_buffer, C);
 
-                                // b. In-Place FWHT (Register Mixer)
-                                hal::x86::fwht64_avx2((float*)temp_perm_buffer);
+                                    // b. In-Place FWHT (Register Mixer)
+                                    if (C == 16) hal::x86::fwht16_avx2((float*)temp_perm_buffer);
+                                    else if (C == 32) hal::x86::fwht32_avx2((float*)temp_perm_buffer);
+                                    else if (C == 64) hal::x86::fwht64_avx2((float*)temp_perm_buffer);
+                                    else if (C == 128) hal::x86::fwht128_avx2((float*)temp_perm_buffer);
 
-                                // c. Learnable APoT Scaling (Bit-Shifts) + Bias
-                                for(size_t i=0; i<C; ++i) {
-                                    temp_perm_buffer[i] = lut_mul(temp_perm_buffer[i], effective_scales[i]);
-                                    temp_perm_buffer[i] += effective_bias[i]; // Add Bias
+                                    // c. Learnable APoT Scaling (Bit-Shifts) + Bias (Vectorized)
+                                    float* t_ptr = (float*)temp_perm_buffer;
+                                    const float* s_ptr = (const float*)effective_scales.data();
+                                    const float* b_ptr = (const float*)effective_bias.data();
+
+                                    // Vectorized FMA/Add
+                                    for(size_t i=0; i<C; i+=8) {
+                                        __m256 v_val = _mm256_loadu_ps(t_ptr + i);
+                                        __m256 v_scale = _mm256_loadu_ps(s_ptr + i);
+                                        __m256 v_bias = _mm256_loadu_ps(b_ptr + i);
+
+                                        // val = val * scale + bias
+                                        v_val = _mm256_fmadd_ps(v_val, v_scale, v_bias);
+
+                                        _mm256_storeu_ps(t_ptr + i, v_val);
+                                    }
+
+                                    // Phase 5: Branchless Gate
+                                    hal::AlienOps::branchless_relu((float*)temp_perm_buffer, C);
+
+                                    // Write to Output from temp_perm_buffer
+                                    T* p_out = out_ptr + ((n*H + h)*W + w)*C;
+                                    for(size_t c=0; c<C; ++c) {
+                                        p_out[c] = temp_perm_buffer[c];
+                                    }
+                                    handled = true;
                                 }
 
-                                // Phase 5: Branchless Gate
-                                hal::AlienOps::branchless_relu((float*)temp_perm_buffer, C);
-
-                                // Write to Output from temp_perm_buffer
-                                T* p_out = out_ptr + ((n*H + h)*W + w)*C;
-                                for(size_t c=0; c<C; ++c) {
-                                    p_out[c] = temp_perm_buffer[c];
-                                }
-
-                                continue; // Skip the standard path
+                                if (handled) continue; // Skip the standard path
 #endif
                             }
 
@@ -310,13 +318,20 @@ public:
             }
         }
 
-        input_ = input; // Cache for backward
+        if (training_) {
+            input_ = input; // Cache for backward
+        }
         return output;
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
         // Simplified Backward for APoT/Spectral
-        // Same as optimized implementation before
+
+        // Ensure input_ is valid before accessing shape
+        if (input_.size() == 0) {
+            std::cerr << "Error: Backward called but input was not cached (training mode disabled?)" << std::endl;
+            return Tensor<T>(); // Return empty tensor
+        }
 
         auto shape = input_.shape();
         size_t batch = shape[0];
@@ -480,6 +495,7 @@ private:
     // Config
     bool use_gating_;
     bool use_apot_;
+    bool training_;
 
     // Parameters
     Tensor<T> spatial_weights_; // (C, 1, K, K)

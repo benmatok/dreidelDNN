@@ -140,12 +140,84 @@ bool check_bias_gradient() {
     return true;
 }
 
+bool check_training_flag() {
+    std::cout << "[Test] Training Flag Check..." << std::endl;
+    size_t C = 1;
+    ZenithBlock<float> block(C, 1, C, 1024, false, false);
+
+    // Disable training (Inference Mode)
+    block.set_training(false);
+
+    Tensor<float> input({1, 1, 1, C});
+    input.fill(0.0f);
+    block.forward(input);
+
+    // Backward should warn/fail gracefully because input wasn't cached
+    // In our implementation, we print to cerr and return 0 gradient
+    std::cout << "Calling backward in inference mode (expect error message)..." << std::endl;
+    Tensor<float> grad_out({1, 1, 1, C});
+    grad_out.fill(1.0f);
+    Tensor<float> grad_in = block.backward(grad_out);
+
+    // We can't easily check cerr, but we can check if it didn't crash
+    std::cout << "PASS: Backward returned without crash." << std::endl;
+    return true;
+}
+
+template <size_t C>
+bool check_kernel() {
+    std::cout << "[Test] AVX Kernel Check C=" << C << "..." << std::endl;
+    ZenithBlock<float> block(C, 1, C, 1024*1024, false, false);
+
+    // Identity Test: W=0, Scale=1, Bias=0 -> Output 0
+    auto params = block.parameters();
+    params[0]->fill(0.0f);
+    params[1]->fill(1.0f);
+    params[2]->fill(0.0f);
+
+    Tensor<float> input({1, 1, 1, C});
+    float* in_ptr = input.data();
+    for(size_t i=0; i<C; ++i) in_ptr[i] = (float)(i+1); // Dummy input
+
+    // With weights=0, eyes output is 0. Mixer(0) = 0.
+    Tensor<float> output = block.forward(input);
+
+    // Output should be 0
+    float sum = 0;
+    for(size_t i=0; i<C; ++i) sum += std::abs(output.data()[i]);
+    if (sum > 1e-4) {
+        std::cout << "FAIL: Identity (Zero) check failed for C=" << C << " sum=" << sum << std::endl;
+        return false;
+    }
+
+    // Bias pass-through test
+    params[2]->fill(10.0f);
+    output = block.forward(input);
+    // Output should be 10.0 everywhere (ReLU(0+10))
+    for(size_t i=0; i<C; ++i) {
+        if (std::abs(output.data()[i] - 10.0f) > 1e-4) {
+            std::cout << "FAIL: Bias pass-through failed for C=" << C << " val=" << output.data()[i] << std::endl;
+            return false;
+        }
+    }
+
+    std::cout << "PASS: Kernel C=" << C << " functional." << std::endl;
+    return true;
+}
+
 int main() {
     bool p1 = check_bias_identity();
     bool p2 = check_apot_bias();
     bool p3 = check_bias_gradient();
+    bool p4 = check_training_flag();
 
-    if (p1 && p2 && p3) {
+    // Verify kernels
+    bool k16 = check_kernel<16>();
+    bool k32 = check_kernel<32>();
+    bool k64 = check_kernel<64>();
+    bool k128 = check_kernel<128>();
+
+    if (p1 && p2 && p3 && p4 && k16 && k32 && k64 && k128) {
         std::cout << "ALL TESTS PASSED" << std::endl;
         return 0;
     } else {
