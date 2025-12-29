@@ -28,14 +28,23 @@ class ZenithBlock;
  */
 class ZenithBlock : public Layer<int8_t> {
 public:
-    ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024, bool use_gating = false)
-        : channels_(channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
+    // Single constructor with Cin != Cout
+    // We remove the old constructor and handle single-channel usage here by making out_channels mandatory.
+    // However, existing code might pass 4 args assuming `ZenithBlock(C, K, S, Arena)`.
+    // Our new signature is `ZenithBlock(Cin, Cout, K, S, Arena)`.
+    // If we want backward compatibility without ambiguity, we can't overload with defaults easily.
+    // BUT we can use a factory method or just fix the call sites.
+    // There is only ONE call site in `benchmarks/benchmark_zenith_conv.cpp` (and my test).
+
+    ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024, bool use_gating = false)
+        : in_channels_(in_channels), out_channels_(out_channels),
+          kernel_size_(kernel_size), spectral_dim_(spectral_dim),
           arena_(arena_size),
           use_gating_(use_gating),
-          packed_weights_(channels * kernel_size * kernel_size),
-          spectral_scales_(channels),
-          bias_(channels),
-          perm_indices_(channels)
+          packed_weights_(in_channels * kernel_size * kernel_size), // Depthwise: 1 filter per input channel
+          spectral_scales_(std::max(in_channels, out_channels)), // Scaled in spectral domain
+          bias_(out_channels),
+          perm_indices_(std::max(in_channels, out_channels))
     {
         // Random Init Weights
         std::mt19937 gen(42);
@@ -47,7 +56,7 @@ public:
         std::fill(bias_.begin(), bias_.end(), 0);
         std::iota(perm_indices_.begin(), perm_indices_.end(), 0);
 
-        oracle_projection_.resize(channels);
+        oracle_projection_.resize(in_channels);
         for(auto& p : oracle_projection_) p = static_cast<int8_t>(dist_code(gen));
     }
 
@@ -125,9 +134,15 @@ public:
         size_t batch = shape[0];
         size_t H = shape[1];
         size_t W = shape[2];
-        size_t C = shape[3];
+        size_t C_in = shape[3];
 
-        Tensor<int8_t> output(shape);
+        if (C_in != in_channels_) {
+            std::cerr << "Warning: Input channels mismatch (" << C_in << " vs " << in_channels_ << ")\n";
+        }
+
+        // Output shape
+        std::vector<size_t> out_shape = {batch, H, W, out_channels_};
+        Tensor<int8_t> output(out_shape);
 
         const int8_t* in_ptr = input.data();
         int8_t* out_ptr = output.data();
@@ -139,9 +154,11 @@ public:
 
         int k_rad = kernel_size_ / 2;
 
+        size_t mix_dim = std::max(in_channels_, out_channels_);
+
         arena_.reset();
-        int8_t* pixel_buffer = arena_.allocate<int8_t>(C);
-        int8_t* mixer_buffer = arena_.allocate<int8_t>(C);
+        int8_t* pixel_buffer = arena_.allocate<int8_t>(in_channels_);
+        int8_t* mixer_buffer = arena_.allocate<int8_t>(mix_dim);
 
         constexpr int BLOCK_H = 8;
         constexpr int BLOCK_W = 8;
@@ -151,12 +168,12 @@ public:
             // Fixed Gating Logic (No Shift UB for large C)
             if (use_gating_) {
                 size_t ch = H/2, cw = W/2;
-                const int8_t* p_center = in_ptr + ((n*H + ch)*W + cw)*C;
+                const int8_t* p_center = in_ptr + ((n*H + ch)*W + cw)*C_in;
 
                 int dist = 0;
                 size_t i = 0;
 #if defined(DREIDEL_ARCH_AVX2)
-                for(; i + 32 <= C; i += 32) {
+                for(; i + 32 <= C_in; i += 32) {
                     __m256i v_in = _mm256_loadu_si256((const __m256i*)(p_center + i));
                     __m256i v_proj = _mm256_loadu_si256((const __m256i*)(oracle_ptr + i));
 
@@ -166,15 +183,15 @@ public:
                     dist += hal::AlienOps::popcnt32(mask_in ^ mask_proj);
                 }
 #endif
-                for(; i < C; ++i) {
+                for(; i < C_in; ++i) {
                     bool s1 = (p_center[i] & 0x80);
                     bool s2 = (oracle_ptr[i] & 0x80);
                     if (s1 != s2) dist++;
                 }
 
                 if (dist > 16) { // Heuristic
-                    int8_t* p_out_start = out_ptr + n * H * W * C;
-                    std::fill(p_out_start, p_out_start + H * W * C, 0);
+                    int8_t* p_out_start = out_ptr + n * H * W * out_channels_;
+                    std::fill(p_out_start, p_out_start + H * W * out_channels_, 0);
                     continue;
                 }
             }
@@ -188,19 +205,19 @@ public:
                             if (h >= H || w >= W) continue;
 
                             // 2. Eyes (Spatial Convolution)
-                            for(size_t c=0; c<C; ++c) pixel_buffer[c] = 0;
+                            for(size_t c=0; c<C_in; ++c) pixel_buffer[c] = 0;
 
                             for(int ky=-k_rad; ky<=k_rad; ++ky) {
                                 for(int kx=-k_rad; kx<=k_rad; ++kx) {
                                     int ih = h + ky;
                                     int iw = w + kx;
                                     if (ih>=0 && ih<H && iw>=0 && iw<W) {
-                                        const int8_t* p_in = in_ptr + ((n*H + ih)*W + iw)*C;
+                                        const int8_t* p_in = in_ptr + ((n*H + ih)*W + iw)*C_in;
                                         int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
-                                        const int8_t* p_w = w_ptr + k_idx * channels_;
+                                        const int8_t* p_w = w_ptr + k_idx * in_channels_;
                                         size_t c = 0;
 #if defined(DREIDEL_ARCH_AVX2)
-                                        for(; c+32 <= C; c+=32) {
+                                        for(; c+32 <= C_in; c+=32) {
                                             __m256i v_in = _mm256_loadu_si256((const __m256i*)(p_in + c));
                                             __m256i v_w  = _mm256_loadu_si256((const __m256i*)(p_w + c));
                                             __m128i in_lo = _mm256_castsi256_si128(v_in);
@@ -215,7 +232,7 @@ public:
                                             _mm256_storeu_si256((__m256i*)(pixel_buffer + c), v_acc);
                                         }
 #endif
-                                        for(; c<C; ++c) {
+                                        for(; c<C_in; ++c) {
                                             int8_t prod = hal::AlienOps::apot_mul_lut(p_in[c], p_w[c]);
                                             pixel_buffer[c] = hal::AlienOps::apot_add_lut(pixel_buffer[c], prod);
                                         }
@@ -224,25 +241,28 @@ public:
                             }
 
                             // 3. Mixer (Spectral)
-                            for(size_t c=0; c<C; ++c) mixer_buffer[c] = pixel_buffer[perm_ptr[c]];
+                            // Populate mixer buffer
+                            for(size_t c=0; c<mix_dim; ++c) {
+                                if (c < C_in) mixer_buffer[c] = pixel_buffer[perm_ptr[c]]; // Apply permutation
+                                else mixer_buffer[c] = 0; // Padding
+                            }
 
                             // FWHT: Hybrid Strategy
-                            // A. Intra-Register Pass (Strides 1, 2, 4, 8, 16)
                             size_t c = 0;
 #if defined(DREIDEL_ARCH_AVX2)
-                            for (; c + 32 <= C; c += 32) {
+                            for (; c + 32 <= mix_dim; c += 32) {
                                 __m256i v = _mm256_loadu_si256((const __m256i*)(mixer_buffer + c));
                                 v = fwht_avx2_intra(v);
                                 _mm256_storeu_si256((__m256i*)(mixer_buffer + c), v);
                             }
 #endif
-                            if (c < C) {
-                                size_t limit = C - c; // e.g. 16
+                            if (c < mix_dim) {
+                                size_t limit = mix_dim - c;
                                 size_t sub_h = 1;
                                 while (sub_h < 32 && sub_h < limit) {
-                                    for(size_t i=c; i<C; i+=sub_h*2) {
+                                    for(size_t i=c; i<mix_dim; i+=sub_h*2) {
                                         for(size_t j=i; j<i+sub_h; ++j) {
-                                            if (j+sub_h < C) {
+                                            if (j+sub_h < mix_dim) {
                                                 int8_t x = mixer_buffer[j];
                                                 int8_t y = mixer_buffer[j + sub_h];
                                                 mixer_buffer[j] = hal::AlienOps::apot_add_lut(x, y);
@@ -254,32 +274,41 @@ public:
                                 }
                             }
 
-                            // B. Inter-Register Pass (Strides 32, 64...)
+                            // B. Inter-Register Pass
                             size_t h_len = 32;
-                            while (h_len < C) {
+                            while (h_len < mix_dim) {
                                 bool handled = false;
 #if defined(DREIDEL_ARCH_AVX2)
-                                for (size_t i = 0; i < C; i += h_len * 2) {
+                                for (size_t i = 0; i < mix_dim; i += h_len * 2) {
                                     for (size_t j = i; j < i + h_len; j += 32) {
-                                        __m256i x = _mm256_loadu_si256((const __m256i*)(mixer_buffer + j));
-                                        __m256i y = _mm256_loadu_si256((const __m256i*)(mixer_buffer + j + h_len));
-                                        __m256i sum = hal::AlienOps::vec_add_apot_avx2(x, y);
-                                        __m256i sign_mask = _mm256_set1_epi8(0x80);
-                                        __m256i neg_y = _mm256_xor_si256(y, sign_mask);
-                                        __m256i sub = hal::AlienOps::vec_add_apot_avx2(x, neg_y);
-                                        _mm256_storeu_si256((__m256i*)(mixer_buffer + j), sum);
-                                        _mm256_storeu_si256((__m256i*)(mixer_buffer + j + h_len), sub);
+                                        if (j + 32 <= mix_dim && j + h_len + 32 <= mix_dim) {
+                                            __m256i x = _mm256_loadu_si256((const __m256i*)(mixer_buffer + j));
+                                            __m256i y = _mm256_loadu_si256((const __m256i*)(mixer_buffer + j + h_len));
+                                            __m256i sum = hal::AlienOps::vec_add_apot_avx2(x, y);
+                                            __m256i sign_mask = _mm256_set1_epi8(0x80);
+                                            __m256i neg_y = _mm256_xor_si256(y, sign_mask);
+                                            __m256i sub = hal::AlienOps::vec_add_apot_avx2(x, neg_y);
+                                            _mm256_storeu_si256((__m256i*)(mixer_buffer + j), sum);
+                                            _mm256_storeu_si256((__m256i*)(mixer_buffer + j + h_len), sub);
+                                        }
                                     }
                                 }
                                 handled = true;
 #endif
-                                if (!handled) {
-                                    for (size_t i = 0; i < C; i += h_len * 2) {
-                                        for (size_t j = i; j < i + h_len; ++j) {
-                                            int8_t x = mixer_buffer[j];
-                                            int8_t y = mixer_buffer[j + h_len];
-                                            mixer_buffer[j] = hal::AlienOps::apot_add_lut(x, y);
-                                            mixer_buffer[j + h_len] = hal::AlienOps::apot_add_lut(x, y ^ 0x80);
+                                for (size_t i = 0; i < mix_dim; i += h_len * 2) {
+                                    for (size_t j = i; j < i + h_len; ++j) {
+                                        bool use_avx = false;
+                                        #if defined(DREIDEL_ARCH_AVX2)
+                                        if (mix_dim % 32 == 0) use_avx = true;
+                                        #endif
+
+                                        if (!use_avx) {
+                                            if (j + h_len < mix_dim) {
+                                                 int8_t x = mixer_buffer[j];
+                                                 int8_t y = mixer_buffer[j + h_len];
+                                                 mixer_buffer[j] = hal::AlienOps::apot_add_lut(x, y);
+                                                 mixer_buffer[j + h_len] = hal::AlienOps::apot_add_lut(x, y ^ 0x80);
+                                            }
                                         }
                                     }
                                 }
@@ -289,7 +318,7 @@ public:
                             // c. Scale & Bias & ReLU
                             c = 0;
 #if defined(DREIDEL_ARCH_AVX2)
-                            for(; c+32 <= C; c+=32) {
+                            for(; c+32 <= out_channels_; c+=32) {
                                 __m256i v_val = _mm256_loadu_si256((const __m256i*)(mixer_buffer + c));
                                 __m256i v_scale = _mm256_loadu_si256((const __m256i*)(scale_ptr + c));
                                 __m256i v_bias = _mm256_loadu_si256((const __m256i*)(bias_ptr + c));
@@ -302,21 +331,13 @@ public:
                                 __m256i v_res = _mm256_set_m128i(res_hi, res_lo);
                                 v_res = hal::AlienOps::vec_add_apot_avx2(v_res, v_bias);
 
-                                // Branchless ReLU: if (v & 0x80) -> set to 0.
-                                // If 0x80 set, sign is neg. We want to AND with 0x7F? No, 0.
-                                // If 0x80 clear, we want to keep it.
-                                // Use blendv_epi8. If 0x80 set, blend in zero.
                                 __m256i zero = _mm256_setzero_si256();
-                                // blendv checks MSB of mask. So passing v_res as mask works directly!
-                                // If MSB(v_res) is 1 (neg), it selects 'b'. If 0 (pos), selects 'a'.
-                                // _mm256_blendv_epi8(a, b, mask).
-                                // We want 'zero' if mask=1. 'v_res' if mask=0.
                                 v_res = _mm256_blendv_epi8(v_res, zero, v_res);
 
                                 _mm256_storeu_si256((__m256i*)(mixer_buffer + c), v_res);
                             }
 #endif
-                            for(; c<C; ++c) {
+                            for(; c<out_channels_; ++c) {
                                 int8_t val = mixer_buffer[c];
                                 val = hal::AlienOps::apot_mul_lut(val, scale_ptr[c]);
                                 val = hal::AlienOps::apot_add_lut(val, bias_ptr[c]);
@@ -324,8 +345,8 @@ public:
                                 mixer_buffer[c] = val;
                             }
 
-                            int8_t* p_out = out_ptr + ((n*H + h)*W + w)*C;
-                            for(size_t c=0; c<C; ++c) p_out[c] = mixer_buffer[c];
+                            int8_t* p_out = out_ptr + ((n*H + h)*W + w)*out_channels_;
+                            for(size_t c=0; c<out_channels_; ++c) p_out[c] = mixer_buffer[c];
                         }
                     }
                 }
@@ -345,7 +366,8 @@ public:
     std::string name() const override { return "ZenithBlock"; }
 
 private:
-    size_t channels_;
+    size_t in_channels_;
+    size_t out_channels_;
     size_t kernel_size_;
     size_t spectral_dim_;
     core::Arena arena_;

@@ -19,9 +19,7 @@ template <typename T>
 class ZenithDenseMixer : public Layer<T> {
 public:
     ZenithDenseMixer(size_t channels, size_t kernel_size)
-        : eyes_(channels, kernel_size, channels), // Reuse Zenith logic but we will hack it or reimplement?
-          // Reimplementing simplified version to swap mixer is cleaner.
-          channels_(channels), kernel_size_(kernel_size),
+        : channels_(channels), kernel_size_(kernel_size),
           spatial_weights_({channels, 1, kernel_size, kernel_size}),
           mixer_weights_({channels, channels}), // Dense mixing
           grad_spatial_({channels, 1, kernel_size, kernel_size}),
@@ -170,7 +168,6 @@ public:
     std::string name() const override { return "ZenithDenseMixer"; }
 
 private:
-    ZenithBlock<T> eyes_; // unused wrapper
     size_t channels_, kernel_size_;
     Tensor<T> spatial_weights_, mixer_weights_;
     Tensor<T> grad_spatial_, grad_mixer_;

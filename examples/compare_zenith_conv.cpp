@@ -21,9 +21,39 @@
 #include "../include/dreidel/layers/Dense.hpp"
 #include "../include/dreidel/layers/GELU.hpp"
 #include "../include/dreidel/layers/ReLU.hpp"
+#include "../include/dreidel/layers/Quantization.hpp"
 #include "../include/dreidel/optim/DiagonalNewton.hpp"
 
 using namespace dreidel;
+
+// Wrapper to adapt ZenithBlock (int8) to Layer<float> interface
+class ZenithBlockInt8Wrapper : public layers::Layer<float> {
+public:
+    ZenithBlockInt8Wrapper(size_t channels, size_t spectral_dim)
+        : block_(channels, channels, 3, spectral_dim), // Cin=Cout=channels
+          pack_(), unpack_() {}
+
+    Tensor<float> forward(const Tensor<float>& input) override {
+        // Float -> Int8 -> Zenith -> Int8 -> Float
+        Tensor<int8_t> q_in = pack_.forward(input);
+        Tensor<int8_t> q_out = block_.forward(q_in);
+        return unpack_.forward(q_out);
+    }
+
+    Tensor<float> backward(const Tensor<float>& grad_output) override {
+        // Gradient not supported in ZenithBlock currently
+        return Tensor<float>();
+    }
+
+    std::vector<Tensor<float>*> parameters() override { return {}; } // No float params
+    std::vector<Tensor<float>*> gradients() override { return {}; }
+    std::string name() const override { return "ZenithBlockInt8Wrapper"; }
+
+private:
+    layers::ZenithBlock block_;
+    layers::PackAPoT pack_;
+    layers::UnpackAPoT unpack_;
+};
 
 // ---- Utilities ----
 
@@ -259,8 +289,14 @@ private:
 };
 
 // Specializations for create_block
-template<> layers::Layer<float>* ZenithLikeAutoencoder<float, layers::ZenithBlock<float>>::create_block(size_t c) {
-    return new layers::ZenithBlock<float>(c, 3, c);
+// We use a dummy type tag or just specialize based on what we want.
+// Since ZenithBlock is not a template, we can't use ZenithBlock<float>.
+// We will use ZenithBlockInt8Wrapper as the type for the first specialization.
+// But the class ZenithLikeAutoencoder is templated on BlockType.
+// So we instantiate ZenithLikeAutoencoder<float, ZenithBlockInt8Wrapper>.
+
+template<> layers::Layer<float>* ZenithLikeAutoencoder<float, ZenithBlockInt8Wrapper>::create_block(size_t c) {
+    return new ZenithBlockInt8Wrapper(c, c);
 }
 template<> layers::Layer<float>* ZenithLikeAutoencoder<float, layers::ZenithDenseMixer<float>>::create_block(size_t c) {
     return new layers::ZenithDenseMixer<float>(c, 3); // No spectral dim
@@ -342,7 +378,7 @@ int main() {
     std::cout << "Image Size: 64x64, Batch: " << batch_size << ", Channels: " << channels << std::endl;
 
     run_benchmark<ConvAutoencoder<float>>("Conv2D_Baseline", epochs, batch_size, channels);
-    run_benchmark<ZenithLikeAutoencoder<float, layers::ZenithBlock<float>>>("Zenith_Standard", epochs, batch_size, channels);
+    run_benchmark<ZenithLikeAutoencoder<float, ZenithBlockInt8Wrapper>>("Zenith_Standard", epochs, batch_size, channels);
     run_benchmark<ZenithLikeAutoencoder<float, layers::ZenithDenseMixer<float>>>("Zenith_DenseMixer", epochs, batch_size, channels);
     run_benchmark<ZenithLikeAutoencoder<float, layers::ZenithFloatEyes<float>>>("Zenith_FloatEyes", epochs, batch_size, channels);
 

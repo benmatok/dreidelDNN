@@ -154,12 +154,12 @@ void run_benchmark_for_channel(size_t C) {
     layers::PackAPoT pack;
     layers::UnpackAPoT unpack;
 
-    layers::ZenithBlock z1(C, 3, C, arena_size);
+    layers::ZenithBlock z1(C, C, 3, C, arena_size);
     layers::QuantizedAvgPool2D qpool(2); // Outputs Int8
-    layers::ZenithBlock z2(C, 3, C, arena_size);
-    layers::ZenithBlock z3(C, 3, C, arena_size); // Replaces dense bottleneck logic
+    layers::ZenithBlock z2(C, C, 3, C, arena_size);
+    layers::ZenithBlock z3(C, C, 3, C, arena_size); // Replaces dense bottleneck logic
     layers::QuantizedUpscale2D qupscale(2);
-    layers::ZenithBlock z4(C, 3, C, arena_size);
+    layers::ZenithBlock z4(C, C, 3, C, arena_size);
 
     // --- Conv Model (Standard Sequential Float - No Dense) ---
     // C1 -> Pool -> C2 -> C3 -> Upscale -> C4
