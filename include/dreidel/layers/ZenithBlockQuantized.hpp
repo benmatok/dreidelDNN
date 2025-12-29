@@ -75,8 +75,33 @@ public:
                                         int k_idx = (ky+k_rad)*kernel_size_ + (kx+k_rad);
                                         const int8_t* p_w = w_ptr + k_idx * channels_;
 
-                                        // Full LNS Pipeline via LUT (Never Unpack)
-                                        for(size_t c=0; c<C; ++c) {
+                                        size_t c = 0;
+#if defined(DREIDEL_ARCH_AVX2)
+                                        // Vectorized 32-wide integer pipeline using Parallel Shuffle LUT
+                                        for(; c+32 <= C; c+=32) {
+                                            // 1. Load 32 values (256-bit)
+                                            __m256i v_in = _mm256_loadu_si256((const __m256i*)(p_in + c));
+                                            __m256i v_w  = _mm256_loadu_si256((const __m256i*)(p_w + c));
+
+                                            // 2. MUL: Process 128-bit lanes (16 bytes)
+                                            __m128i in_lo = _mm256_castsi256_si128(v_in);
+                                            __m128i in_hi = _mm256_extracti128_si256(v_in, 1);
+                                            __m128i w_lo  = _mm256_castsi256_si128(v_w);
+                                            __m128i w_hi  = _mm256_extracti128_si256(v_w, 1);
+
+                                            __m128i prod_lo = hal::AlienOps::vec_mul_apot_avx2(in_lo, w_lo);
+                                            __m128i prod_hi = hal::AlienOps::vec_mul_apot_avx2(in_hi, w_hi);
+
+                                            __m256i v_prod = _mm256_set_m128i(prod_hi, prod_lo);
+
+                                            // 3. ADD: Process 256-bit with Shuffle LUT
+                                            __m256i v_acc = _mm256_loadu_si256((const __m256i*)(pixel_buffer + c));
+                                            v_acc = hal::AlienOps::vec_add_apot_avx2(v_acc, v_prod);
+                                            _mm256_storeu_si256((__m256i*)(pixel_buffer + c), v_acc);
+                                        }
+#endif
+                                        // Scalar Fallback
+                                        for(; c<C; ++c) {
                                             int8_t prod = hal::AlienOps::apot_mul_lut(p_in[c], p_w[c]);
                                             pixel_buffer[c] = hal::AlienOps::apot_add_lut(pixel_buffer[c], prod);
                                         }
