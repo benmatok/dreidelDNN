@@ -406,23 +406,24 @@ void generate_wavelet_images(Tensor<T>& data) {
     }
 }
 
-int main() {
-    // Config
+void run_benchmark_for_channel(size_t C) {
     size_t batch_size = 8;
-    size_t H = 64, W = 64, C = 16;
+    size_t H = 64, W = 64;
     size_t latent_dim = 64;
     size_t loops = 10;
 
-    std::cout << "=== ZenithBlock vs Conv2D Benchmark ===" << std::endl;
+    std::cout << "\n--------------------------------------------------" << std::endl;
+    std::cout << "Benchmarking Channel Count C=" << C << std::endl;
     std::cout << "Input: (" << batch_size << ", " << H << ", " << W << ", " << C << ")" << std::endl;
-    std::cout << "Architecture: Block -> Pooling -> Block -> Latent(64) -> Block -> Upscale -> Block" << std::endl;
 
     // --- Zenith Model ---
     Sequential<float> zenith_net;
     // Zenith -> Pooling -> Zenith
-    zenith_net.add(new layers::ZenithBlock<float>(C, 3, C));
+    // Increase arena size for larger channels just in case (e.g. 4MB)
+    size_t arena_size = 4 * 1024 * 1024;
+    zenith_net.add(new layers::ZenithBlock<float>(C, 3, C, arena_size));
     zenith_net.add(new AvgPool2D<float>(2)); // 32x32
-    zenith_net.add(new layers::ZenithBlock<float>(C, 3, C));
+    zenith_net.add(new layers::ZenithBlock<float>(C, 3, C, arena_size));
 
     // -> Latent 64
     zenith_net.add(new Flatten<float>());
@@ -432,13 +433,13 @@ int main() {
     // -> Transpose Zenith (Decoder)
     zenith_net.add(new layers::Dense<float>(latent_dim, flat_dim));
     zenith_net.add(new Reshape<float>({H/2, W/2, C}));
-    zenith_net.add(new layers::ZenithBlock<float>(C, 3, C));
+    zenith_net.add(new layers::ZenithBlock<float>(C, 3, C, arena_size));
     zenith_net.add(new Upscale2D<float>(2)); // 64x64
-    zenith_net.add(new layers::ZenithBlock<float>(C, 3, C));
+    zenith_net.add(new layers::ZenithBlock<float>(C, 3, C, arena_size));
 
     // --- Conv Model ---
     Sequential<float> conv_net;
-    conv_net.add(new layers::Conv2D<float>(C, C, 3, 1, 1)); // Padding 1 to keep size
+    conv_net.add(new layers::Conv2D<float>(C, C, 3, 1, 1));
     conv_net.add(new AvgPool2D<float>(2));
     conv_net.add(new layers::Conv2D<float>(C, C, 3, 1, 1));
 
@@ -466,7 +467,6 @@ int main() {
     auto start_z = std::chrono::high_resolution_clock::now();
     for(size_t i=0; i<loops; ++i) {
         Tensor<float> out = zenith_net.forward(input);
-        // Force sync? CPU is sync.
     }
     auto end_z = std::chrono::high_resolution_clock::now();
     double time_z = std::chrono::duration<double>(end_z - start_z).count();
@@ -479,17 +479,20 @@ int main() {
     auto end_c = std::chrono::high_resolution_clock::now();
     double time_c = std::chrono::duration<double>(end_c - start_c).count();
 
-    std::cout << "\nResults (" << loops << " loops):" << std::endl;
-    std::cout << "Zenith Time: " << time_z << " s (" << (loops/time_z) << " iter/s)" << std::endl;
-    std::cout << "Conv2D Time: " << time_c << " s (" << (loops/time_c) << " iter/s)" << std::endl;
+    std::cout << "Zenith Time: " << time_z << " s" << std::endl;
+    std::cout << "Conv2D Time: " << time_c << " s" << std::endl;
 
     double speedup = time_c / time_z;
     std::cout << "Speedup (Zenith vs Conv2D): " << speedup << "x" << std::endl;
+}
 
-    if (speedup > 1.0) {
-        std::cout << "SUCCESS: ZenithBlock is faster!" << std::endl;
-    } else {
-        std::cout << "NOTE: ZenithBlock is slower. This might be due to OMP in Conv2D vs Serial Zenith." << std::endl;
+int main() {
+    std::cout << "=== ZenithBlock vs Conv2D Benchmark (Multi-Channel) ===" << std::endl;
+    std::cout << "Architecture: Block -> Pooling -> Block -> Latent(64) -> Block -> Upscale -> Block" << std::endl;
+
+    std::vector<size_t> channels_list = {16, 64, 128};
+    for(size_t C : channels_list) {
+        run_benchmark_for_channel(C);
     }
 
     return 0;
