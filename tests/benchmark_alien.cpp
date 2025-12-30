@@ -33,17 +33,18 @@ void test_l1_resident_eye() {
 
     size_t C = 64; // Small channel count to fit in registers
     size_t K = 3;
-    size_t H = 8, W = 8; // Small spatial to fit in L1 (8*8*64*4 = 16KB)
+    size_t H = 8, W = 8; // Small spatial to fit in L1 (8*8*64*1 = 4KB for int8)
 
-    // Create Zenith Block
-    layers::ZenithBlock<float> zenith(C, K, C, 1024*1024, false); // No gating
+    // Create Zenith Block (Int8)
+    // C, C, K, C (Cin=C, Cout=C, K=K, Spec=C)
+    layers::ZenithBlock zenith(C, C, K, C, 1024*1024, false);
 
-    // Input Tensor (Random)
-    Tensor<float> input({1, H, W, C});
-    input.random(-1.0, 1.0);
+    // Input Tensor (Random Int8)
+    Tensor<int8_t> input({1, H, W, C});
+    input.fill(1); // Dummy data
 
     // Run Loop
-    int iterations = 10000; // reduced for quicker feedback loop, original plan said 1M but that might take too long if unoptimized
+    int iterations = 10000;
 
     double duration = time_execution([&]() {
         zenith.forward(input); // Forward only
@@ -75,10 +76,10 @@ void test_memory_wall() {
     size_t W = 512;
     size_t K = 3;
 
-    layers::ZenithBlock<float> zenith(C, K, C, 10*1024*1024, false); // Larger arena
+    layers::ZenithBlock zenith(C, C, K, C, 10*1024*1024, false); // Larger arena
 
-    Tensor<float> input({1, H, W, C});
-    input.random(-1.0, 1.0);
+    Tensor<int8_t> input({1, H, W, C});
+    input.fill(1);
 
     int iterations = 10;
 
@@ -86,9 +87,9 @@ void test_memory_wall() {
         zenith.forward(input);
     }, iterations);
 
-    double throughput_mb = (double)(input.size() * sizeof(float) * iterations) / (1024.0*1024.0) / duration;
+    double throughput_mb = (double)(input.size() * sizeof(int8_t) * iterations) / (1024.0*1024.0) / duration;
 
-    std::cout << "  - Input Size: " << (input.size() * sizeof(float) / (1024.0*1024.0)) << " MB" << std::endl;
+    std::cout << "  - Input Size: " << (input.size() * sizeof(int8_t) / (1024.0*1024.0)) << " MB" << std::endl;
     std::cout << "  - Time: " << duration << "s" << std::endl;
     std::cout << "  - Bandwidth: " << throughput_mb << " MB/s (Read)" << std::endl; // Rough estimate
 }
@@ -117,15 +118,16 @@ void test_sparsity_breakeven() {
 
     std::cout << "  Comparing Gating ON vs OFF on Random Noise (Approx 50% sparsity)" << std::endl;
 
-    Tensor<float> input({1, H, W, C});
-    input.random(-1.0, 1.0);
+    Tensor<int8_t> input({1, H, W, C});
+    // Fill with random int8
+    for(size_t i=0; i<input.size(); ++i) input.data()[i] = (rand() % 256) - 128;
 
     // Gating OFF
-    layers::ZenithBlock<float> zenith_off(C, K, C, 1024*1024, false);
+    layers::ZenithBlock zenith_off(C, C, K, C, 1024*1024, false);
     double t_off = time_execution([&]() { zenith_off.forward(input); }, 100);
 
     // Gating ON
-    layers::ZenithBlock<float> zenith_on(C, K, C, 1024*1024, true);
+    layers::ZenithBlock zenith_on(C, C, K, C, 1024*1024, true);
     double t_on = time_execution([&]() { zenith_on.forward(input); }, 100);
 
     std::cout << "  - Gating OFF Time: " << t_off << "s" << std::endl;

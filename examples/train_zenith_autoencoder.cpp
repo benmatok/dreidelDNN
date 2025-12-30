@@ -15,6 +15,7 @@
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/layers/Layer.hpp"
 #include "../include/dreidel/layers/ZenithBlock.hpp"
+#include "../include/dreidel/layers/ZenithVariants.hpp"
 #include "../include/dreidel/layers/Dense.hpp"
 #include "../include/dreidel/layers/GELU.hpp"
 #include "../include/dreidel/optim/DiagonalNewton.hpp"
@@ -180,15 +181,15 @@ public:
         stem_ = new PointwiseLinear<T>(1, channels);
         layers_.push_back(stem_);
 
-        // Zenith Block 1
-        z1_ = new layers::ZenithBlock<T>(channels, 3, channels);
+        // Zenith Block 1 (Use ZenithFloatEyes for training in float)
+        z1_ = new layers::ZenithFloatEyes<T>(channels, 3, channels);
         layers_.push_back(z1_);
 
         act1_ = new layers::GELU<T>();
         layers_.push_back(act1_);
 
         // Zenith Block 2
-        z2_ = new layers::ZenithBlock<T>(channels, 3, channels);
+        z2_ = new layers::ZenithFloatEyes<T>(channels, 3, channels);
         layers_.push_back(z2_);
 
         act2_ = new layers::GELU<T>();
@@ -196,7 +197,7 @@ public:
 
         // Decoder
         // Zenith Block 3
-        z3_ = new layers::ZenithBlock<T>(channels, 3, channels);
+        z3_ = new layers::ZenithFloatEyes<T>(channels, 3, channels);
         layers_.push_back(z3_);
 
         act3_ = new layers::GELU<T>();
@@ -275,11 +276,11 @@ public:
 private:
     std::vector<layers::Layer<T>*> layers_;
     PointwiseLinear<T>* stem_;
-    layers::ZenithBlock<T>* z1_;
+    layers::ZenithFloatEyes<T>* z1_;
     layers::GELU<T>* act1_;
-    layers::ZenithBlock<T>* z2_;
+    layers::ZenithFloatEyes<T>* z2_;
     layers::GELU<T>* act2_;
-    layers::ZenithBlock<T>* z3_;
+    layers::ZenithFloatEyes<T>* z3_;
     layers::GELU<T>* act3_;
     PointwiseLinear<T>* head_;
 };
