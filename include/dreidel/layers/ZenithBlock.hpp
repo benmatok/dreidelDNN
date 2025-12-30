@@ -41,10 +41,11 @@ public:
           grad_spectral_scales_({1, in_channels}),
           grad_soft_perm_weights_({1, 3}),
           grad_dilated_perm_weights_({1, 3}),
-          grad_bias_({1, out_channels})
+          grad_bias_({1, out_channels}),
+          grad_oracle_projection_({1, in_channels})
     {
         // Init
-        T stddev = std::sqrt(static_cast<T>(2.0) / (kernel_size * kernel_size * in_channels));
+        T stddev = std::sqrt(static_cast<T>(2.0) / (kernel_size * kernel_size));
         packed_weights_.random(0, stddev);
         spectral_scales_.fill(1.0);
         soft_perm_weights_.fill(0); soft_perm_weights_.data()[1] = 1.0;
@@ -57,6 +58,7 @@ public:
         grad_soft_perm_weights_.fill(0);
         grad_dilated_perm_weights_.fill(0);
         grad_bias_.fill(0);
+        grad_oracle_projection_.fill(0);
     }
 
     // Compatibility constructor (in == out, stride=1)
@@ -259,6 +261,7 @@ public:
         grad_soft_perm_weights_.fill(0);
         grad_dilated_perm_weights_.fill(0);
         grad_bias_.fill(0);
+        // grad_oracle_projection_ is not updated
 
         const T* go_ptr = grad_output.data();
         const T* eyes_ptr = eyes_out_cached_.data();
@@ -499,7 +502,7 @@ public:
     }
 
     std::vector<Tensor<T>*> gradients() override {
-        return {&grad_packed_weights_, &grad_spectral_scales_, &grad_soft_perm_weights_, &grad_dilated_perm_weights_, &grad_bias_};
+        return {&grad_packed_weights_, &grad_spectral_scales_, &grad_soft_perm_weights_, &grad_dilated_perm_weights_, &grad_bias_, &grad_oracle_projection_};
     }
 
     std::string name() const override { return "ZenithBlock"; }
@@ -526,6 +529,7 @@ private:
     Tensor<T> grad_soft_perm_weights_;
     Tensor<T> grad_dilated_perm_weights_;
     Tensor<T> grad_bias_;
+    Tensor<T> grad_oracle_projection_;
 
     Tensor<T> input_cached_;
     Tensor<T> eyes_out_cached_;
