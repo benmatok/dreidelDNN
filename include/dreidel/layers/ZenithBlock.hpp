@@ -65,6 +65,9 @@ public:
         grad_dilated_perm_weights_.fill(0);
         grad_bias_.fill(0);
         grad_oracle_projection_.fill(0);
+
+        // Allocate cache for repacked weights
+        optimized_weights_cache_.resize(in_channels * kernel_size * kernel_size);
     }
 
     // Compatibility constructor (in == out, stride=1)
@@ -111,39 +114,7 @@ public:
         const T* w_ptr = packed_weights_.data();
         T* eyes_ptr = eyes_out_cached_.data();
 
-        #pragma omp parallel for collapse(3)
-        for(size_t n=0; n<N; ++n) {
-            for(size_t h_out=0; h_out<H_out; ++h_out) {
-                for(size_t w_out=0; w_out<W_out; ++w_out) {
-                    if (!active_mask[n]) {
-                         for(size_t c=0; c<C; ++c) {
-                             eyes_ptr[((n*H_out + h_out)*W_out + w_out)*C + c] = 0;
-                         }
-                         continue;
-                    }
-
-                    int h_in_center = h_out * stride_;
-                    int w_in_center = w_out * stride_;
-
-                    for(size_t c=0; c<C; ++c) {
-                        T val = 0;
-                        for(int ky=-k_rad; ky<=k_rad; ++ky) {
-                            for(int kx=-k_rad; kx<=k_rad; ++kx) {
-                                int ih = h_in_center + ky;
-                                int iw = w_in_center + kx;
-                                if(ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                                    T pixel = in_ptr[((n*H + ih)*W + iw)*C + c];
-                                    T weight = w_ptr[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
-                                    val += pixel * weight;
-                                }
-                            }
-                        }
-                        eyes_ptr[((n*H_out + h_out)*W_out + w_out)*C + c] = val;
-                    }
-                }
-            }
-        }
-
+        // Declare pointers used by both paths
         const T* scale_ptr = spectral_scales_.data();
         const T* bias_ptr = bias_.data();
         const T* sp_w = soft_perm_weights_.data();
@@ -152,9 +123,77 @@ public:
         bool is_downsample = (out_channels_ == in_channels_ / 2);
         bool is_upsample = (out_channels_ == in_channels_ * 2);
 
+        // --- AVX2 Optimized Path ---
 #ifdef __AVX2__
         if constexpr (std::is_same_v<T, float>) {
-            if (in_channels_ == 64 && out_channels_ == 64 && !is_downsample && !is_upsample) {
+            if (in_channels_ == 64 && out_channels_ == 64 && !is_downsample && !is_upsample && kernel_size_ == 3 && stride_ == 1) {
+                repack_weights();
+
+                #pragma omp parallel for collapse(2)
+                for(size_t n=0; n<N; ++n) {
+                    for(size_t h_out=0; h_out<H_out; ++h_out) {
+                        if (!active_mask[n]) {
+                            std::fill(eyes_ptr + ((n*H_out + h_out)*W_out)*in_channels_,
+                                      eyes_ptr + ((n*H_out + h_out + 1)*W_out)*in_channels_, 0.0f);
+                            continue;
+                        }
+
+                        size_t w_out = 0;
+
+                        // Left Boundary
+                        {
+                            int h_in_center = h_out;
+                            int w_in_center = w_out;
+                            for(size_t c=0; c<64; ++c) {
+                                float val = 0;
+                                for(int ky=-1; ky<=1; ++ky) {
+                                    for(int kx=-1; kx<=1; ++kx) {
+                                        int ih = h_in_center + ky;
+                                        int iw = w_in_center + kx;
+                                        if(ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                                            float pixel = in_ptr[((n*H + ih)*W + iw)*64 + c];
+                                            float weight = w_ptr[c*9 + (ky+1)*3 + (kx+1)];
+                                            val += pixel * weight;
+                                        }
+                                    }
+                                }
+                                eyes_ptr[((n*H_out + h_out)*W_out + w_out)*64 + c] = val;
+                            }
+                            w_out++;
+                        }
+
+                        // Center (Sliding Window)
+                        if (h_out >= 1 && h_out < H_out - 1) {
+                            for (; w_out + 4 < W_out; w_out += 4) {
+                                float* out_p = eyes_ptr + ((n*H_out + h_out)*W_out + w_out)*64;
+                                const float* in_base = in_ptr + ((n*H + (h_out-1))*W + (w_out-1))*64;
+                                forward_avx2_eyes_sliding_window(in_base, out_p, W);
+                            }
+                        }
+
+                        // Right Boundary
+                        for (; w_out < W_out; ++w_out) {
+                            int h_in_center = h_out;
+                            int w_in_center = w_out;
+                            for(size_t c=0; c<64; ++c) {
+                                float val = 0;
+                                for(int ky=-1; ky<=1; ++ky) {
+                                    for(int kx=-1; kx<=1; ++kx) {
+                                        int ih = h_in_center + ky;
+                                        int iw = w_in_center + kx;
+                                        if(ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                                            float pixel = in_ptr[((n*H + ih)*W + iw)*64 + c];
+                                            float weight = w_ptr[c*9 + (ky+1)*3 + (kx+1)];
+                                            val += pixel * weight;
+                                        }
+                                    }
+                                }
+                                eyes_ptr[((n*H_out + h_out)*W_out + w_out)*64 + c] = val;
+                            }
+                        }
+                    }
+                }
+
                 forward_avx2_c64_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
                 return output;
             }
@@ -166,6 +205,41 @@ public:
 
         #pragma omp parallel
         {
+            // Generic Eyes Loop
+            #pragma omp for collapse(3)
+            for(size_t n=0; n<N; ++n) {
+                for(size_t h_out=0; h_out<H_out; ++h_out) {
+                    for(size_t w_out=0; w_out<W_out; ++w_out) {
+                        if (!active_mask[n]) {
+                             for(size_t c=0; c<C; ++c) {
+                                 eyes_ptr[((n*H_out + h_out)*W_out + w_out)*C + c] = 0;
+                             }
+                             continue;
+                        }
+
+                        int h_in_center = h_out * stride_;
+                        int w_in_center = w_out * stride_;
+
+                        for(size_t c=0; c<C; ++c) {
+                            T val = 0;
+                            for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                                for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                                    int ih = h_in_center + ky;
+                                    int iw = w_in_center + kx;
+                                    if(ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                                        T pixel = in_ptr[((n*H + ih)*W + iw)*C + c];
+                                        T weight = w_ptr[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
+                                        val += pixel * weight;
+                                    }
+                                }
+                            }
+                            eyes_ptr[((n*H_out + h_out)*W_out + w_out)*C + c] = val;
+                        }
+                    }
+                }
+            }
+
+            // Generic Mixer Loop
             std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_);
             std::vector<T, core::AlignedAllocator<T>> buf_out(out_channels_);
 
@@ -186,8 +260,20 @@ public:
                         algo::WHT::fwht_1d(buf_in.data(), in_channels_);
                         for(size_t c=0; c<in_channels_; ++c) buf_in[c] *= scale_ptr[c];
 
-                        if (is_downsample) {
-                            for(size_t c=0; c<out_channels_; ++c) {
+                        if (in_channels_ == out_channels_) {
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
+                                size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
+                                T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[c] + sp_w[2] * buf_in[next];
+                                if (use_dilated_) {
+                                    size_t prev_d = (c < (size_t)dilation_in) ? in_channels_ - dilation_in + c : c - dilation_in;
+                                    size_t next_d = (c + dilation_in >= in_channels_) ? c + dilation_in - in_channels_ : c + dilation_in;
+                                    val += dp_w[0] * buf_in[prev_d] + dp_w[1] * buf_in[c] + dp_w[2] * buf_in[next_d];
+                                }
+                                buf_out[c] = val;
+                            }
+                        } else if (is_downsample) {
+                             for(size_t c=0; c<out_channels_; ++c) {
                                 size_t ci = c * 2;
                                 size_t prev = (ci == 0) ? in_channels_ - 1 : ci - 1;
                                 size_t next = (ci == in_channels_ - 1) ? 0 : ci + 1;
@@ -218,27 +304,14 @@ public:
                                 }
                             }
                         } else {
-                            if (in_channels_ == out_channels_) {
-                                for(size_t c=0; c<in_channels_; ++c) {
-                                    size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
-                                    size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
-                                    T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[c] + sp_w[2] * buf_in[next];
-                                    if (use_dilated_) {
-                                        size_t prev_d = (c < (size_t)dilation_in) ? in_channels_ - dilation_in + c : c - dilation_in;
-                                        size_t next_d = (c + dilation_in >= in_channels_) ? c + dilation_in - in_channels_ : c + dilation_in;
-                                        val += dp_w[0] * buf_in[prev_d] + dp_w[1] * buf_in[c] + dp_w[2] * buf_in[next_d];
-                                    }
-                                    buf_out[c] = val;
-                                }
-                            } else {
-                                std::fill(buf_out.begin(), buf_out.end(), 0);
-                                size_t min_c = std::min(in_channels_, out_channels_);
-                                for(size_t c=0; c<min_c; ++c) {
-                                    size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
-                                    size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
-                                    T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[c] + sp_w[2] * buf_in[next];
-                                    buf_out[c] = val;
-                                }
+                            // Fallback
+                            std::fill(buf_out.begin(), buf_out.end(), 0);
+                            size_t min_c = std::min(in_channels_, out_channels_);
+                            for(size_t c=0; c<min_c; ++c) {
+                                size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
+                                size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
+                                T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[c] + sp_w[2] * buf_in[next];
+                                buf_out[c] = val;
                             }
                         }
 
@@ -261,10 +334,10 @@ public:
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
+        // ... (Full implementation from prior step, ensuring generic support) ...
         auto g_shape = grad_output.shape();
         size_t H_out = g_shape[1];
         size_t W_out = g_shape[2];
-
         auto shape = input_cached_.shape();
         size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
 
@@ -286,7 +359,6 @@ public:
 
         int dilation_in = static_cast<int>(std::sqrt(in_channels_));
         int dilation_out = static_cast<int>(std::sqrt(out_channels_));
-
         bool is_downsample = (out_channels_ == in_channels_ / 2);
         bool is_upsample = (out_channels_ == in_channels_ * 2);
 
@@ -350,7 +422,30 @@ public:
 
                         std::fill(dL_dScaled.begin(), dL_dScaled.end(), 0);
 
-                        if (is_downsample) {
+                        if (in_channels_ == out_channels_) {
+                             for(size_t c=0; c<in_channels_; ++c) {
+                                size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
+                                size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
+                                T grad = dL_dPerm[c];
+                                dL_dScaled[prev] += grad * sp_w[0];
+                                dL_dScaled[c]    += grad * sp_w[1];
+                                dL_dScaled[next] += grad * sp_w[2];
+                                t_grad_sp[0] += grad * buf_scaled[prev];
+                                t_grad_sp[1] += grad * buf_scaled[c];
+                                t_grad_sp[2] += grad * buf_scaled[next];
+
+                                if (use_dilated_) {
+                                    size_t prev_d = (c < (size_t)dilation_in) ? in_channels_ - dilation_in + c : c - dilation_in;
+                                    size_t next_d = (c + dilation_in >= in_channels_) ? c + dilation_in - in_channels_ : c + dilation_in;
+                                    dL_dScaled[prev_d] += grad * dp_w[0];
+                                    dL_dScaled[c]      += grad * dp_w[1];
+                                    dL_dScaled[next_d] += grad * dp_w[2];
+                                    t_grad_dp[0] += grad * buf_scaled[prev_d];
+                                    t_grad_dp[1] += grad * buf_scaled[c];
+                                    t_grad_dp[2] += grad * buf_scaled[next_d];
+                                }
+                            }
+                        } else if (is_downsample) {
                              for(size_t c=0; c<out_channels_; ++c) {
                                 T grad = dL_dPerm[c];
                                 size_t ci = c * 2;
@@ -359,11 +454,9 @@ public:
                                 dL_dScaled[prev] += grad * sp_w[0];
                                 dL_dScaled[ci]   += grad * sp_w[1];
                                 dL_dScaled[next] += grad * sp_w[2];
-
                                 t_grad_sp[0] += grad * buf_scaled[prev];
                                 t_grad_sp[1] += grad * buf_scaled[ci];
                                 t_grad_sp[2] += grad * buf_scaled[next];
-
                                 if (use_dilated_) {
                                     size_t prev_d = (ci < (size_t)dilation_in) ? in_channels_ - dilation_in + ci : ci - dilation_in;
                                     size_t next_d = (ci + dilation_in >= in_channels_) ? ci + dilation_in - in_channels_ : ci + dilation_in;
@@ -380,16 +473,13 @@ public:
                                 size_t co = c * 2;
                                 size_t prev = (co == 0) ? out_channels_ - 1 : co - 1;
                                 size_t next = (co == out_channels_ - 1) ? 0 : co + 1;
-
                                 T grad = 0;
                                 grad += dL_dPerm[prev] * sp_w[0];
                                 grad += dL_dPerm[co]   * sp_w[1];
                                 grad += dL_dPerm[next] * sp_w[2];
-
                                 t_grad_sp[0] += dL_dPerm[prev] * buf_scaled[c];
                                 t_grad_sp[1] += dL_dPerm[co]   * buf_scaled[c];
                                 t_grad_sp[2] += dL_dPerm[next] * buf_scaled[c];
-
                                 if (use_dilated_) {
                                     size_t prev_d = (co < (size_t)dilation_out) ? out_channels_ - dilation_out + co : co - dilation_out;
                                     size_t next_d = (co + dilation_out >= out_channels_) ? co + dilation_out - out_channels_ : co + dilation_out;
@@ -403,45 +493,17 @@ public:
                                 dL_dScaled[c] = grad;
                             }
                         } else {
-                            if (in_channels_ == out_channels_) {
-                                 for(size_t c=0; c<in_channels_; ++c) {
-                                    size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
-                                    size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
-                                    T grad = dL_dPerm[c];
-                                    dL_dScaled[prev] += grad * sp_w[0];
-                                    dL_dScaled[c]    += grad * sp_w[1];
-                                    dL_dScaled[next] += grad * sp_w[2];
-
-                                    t_grad_sp[0] += grad * buf_scaled[prev];
-                                    t_grad_sp[1] += grad * buf_scaled[c];
-                                    t_grad_sp[2] += grad * buf_scaled[next];
-
-                                    if (use_dilated_) {
-                                        size_t prev_d = (c < (size_t)dilation_in) ? in_channels_ - dilation_in + c : c - dilation_in;
-                                        size_t next_d = (c + dilation_in >= in_channels_) ? c + dilation_in - in_channels_ : c + dilation_in;
-                                        dL_dScaled[prev_d] += grad * dp_w[0];
-                                        dL_dScaled[c]      += grad * dp_w[1];
-                                        dL_dScaled[next_d] += grad * dp_w[2];
-                                        t_grad_dp[0] += grad * buf_scaled[prev_d];
-                                        t_grad_dp[1] += grad * buf_scaled[c];
-                                        t_grad_dp[2] += grad * buf_scaled[next_d];
-                                    }
-                                }
-                            } else {
-                                size_t min_c = std::min(in_channels_, out_channels_);
-                                for(size_t c=0; c<min_c; ++c) {
-                                    size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
-                                    size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
-                                    T grad = dL_dPerm[c];
-
-                                    dL_dScaled[prev] += grad * sp_w[0];
-                                    dL_dScaled[c]    += grad * sp_w[1];
-                                    dL_dScaled[next] += grad * sp_w[2];
-
-                                    t_grad_sp[0] += grad * buf_scaled[prev];
-                                    t_grad_sp[1] += grad * buf_scaled[c];
-                                    t_grad_sp[2] += grad * buf_scaled[next];
-                                }
+                            size_t min_c = std::min(in_channels_, out_channels_);
+                            for(size_t c=0; c<min_c; ++c) {
+                                size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
+                                size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
+                                T grad = dL_dPerm[c];
+                                dL_dScaled[prev] += grad * sp_w[0];
+                                dL_dScaled[c]    += grad * sp_w[1];
+                                dL_dScaled[next] += grad * sp_w[2];
+                                t_grad_sp[0] += grad * buf_scaled[prev];
+                                t_grad_sp[1] += grad * buf_scaled[c];
+                                t_grad_sp[2] += grad * buf_scaled[next];
                             }
                         }
 
@@ -456,7 +518,6 @@ public:
                         for(size_t c=0; c<in_channels_; ++c) t_grad_eyes[c] = dL_dEyes[c];
 
                         int k_rad = kernel_size_ / 2;
-
                         int h_in_center = h * stride_;
                         int w_in_center = w * stride_;
 
@@ -537,6 +598,76 @@ private:
         return _mm256_castsi256_ps(res);
     }
 
+    void repack_weights() {
+        if (packed_weights_.size() != optimized_weights_cache_.size()) {
+             optimized_weights_cache_.resize(packed_weights_.size());
+        }
+
+        const float* src = packed_weights_.data();
+        float* dst = optimized_weights_cache_.data();
+        size_t C = in_channels_;
+        size_t K = kernel_size_;
+
+        for (size_t ky = 0; ky < K; ++ky) {
+            for (size_t kx = 0; kx < K; ++kx) {
+                for (size_t c = 0; c < C; ++c) {
+                    dst[(ky * K + kx) * C + c] = src[c * K * K + ky * K + kx];
+                }
+            }
+        }
+    }
+
+    void forward_avx2_eyes_sliding_window(const float* in_base, float* out_p, size_t input_stride_w) {
+        using namespace dreidel::hal::x86;
+
+        const float* w_base = optimized_weights_cache_.data();
+
+        for (size_t c = 0; c < 64; c += 8) {
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+
+            for (int ky = 0; ky < 3; ++ky) {
+                const float* row_ptr = in_base + ky * input_stride_w * 64 + c;
+
+                __m256 v0 = _mm256_loadu_ps(row_ptr + 0*64);
+                __m256 v1 = _mm256_loadu_ps(row_ptr + 1*64);
+                __m256 v2 = _mm256_loadu_ps(row_ptr + 2*64);
+                __m256 v3 = _mm256_loadu_ps(row_ptr + 3*64);
+                __m256 v4 = _mm256_loadu_ps(row_ptr + 4*64);
+                __m256 v5 = _mm256_loadu_ps(row_ptr + 5*64);
+
+                const float* w_row = w_base + (ky * 3 + 0) * 64 + c;
+
+                __m256 w0 = _mm256_load_ps(w_row + 0*64);
+                __m256 w1 = _mm256_load_ps(w_row + 1*64);
+                __m256 w2 = _mm256_load_ps(w_row + 2*64);
+
+                acc0 = _mm256_fmadd_ps(v0, w0, acc0);
+                acc0 = _mm256_fmadd_ps(v1, w1, acc0);
+                acc0 = _mm256_fmadd_ps(v2, w2, acc0);
+
+                acc1 = _mm256_fmadd_ps(v1, w0, acc1);
+                acc1 = _mm256_fmadd_ps(v2, w1, acc1);
+                acc1 = _mm256_fmadd_ps(v3, w2, acc1);
+
+                acc2 = _mm256_fmadd_ps(v2, w0, acc2);
+                acc2 = _mm256_fmadd_ps(v3, w1, acc2);
+                acc2 = _mm256_fmadd_ps(v4, w2, acc2);
+
+                acc3 = _mm256_fmadd_ps(v3, w0, acc3);
+                acc3 = _mm256_fmadd_ps(v4, w1, acc3);
+                acc3 = _mm256_fmadd_ps(v5, w2, acc3);
+            }
+
+            _mm256_storeu_ps(out_p + 0*64 + c, acc0);
+            _mm256_storeu_ps(out_p + 1*64 + c, acc1);
+            _mm256_storeu_ps(out_p + 2*64 + c, acc2);
+            _mm256_storeu_ps(out_p + 3*64 + c, acc3);
+        }
+    }
+
     void forward_avx2_c64_mixer(
         size_t N, size_t H_out, size_t W_out,
         float* out_ptr, const float* eyes_ptr,
@@ -544,15 +675,12 @@ private:
         const std::vector<bool>& active_mask
     ) {
         using namespace dreidel::hal::x86;
-
         __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0);
         __m256 w_sp1 = _mm256_broadcast_ss(sp_w + 1);
         __m256 w_sp2 = _mm256_broadcast_ss(sp_w + 2);
-
         __m256 w_dp0 = _mm256_broadcast_ss(dp_w + 0);
         __m256 w_dp1 = _mm256_broadcast_ss(dp_w + 1);
         __m256 w_dp2 = _mm256_broadcast_ss(dp_w + 2);
-
         __m256 bias_r0 = _mm256_loadu_ps(bias_ptr + 0);
         __m256 bias_r1 = _mm256_loadu_ps(bias_ptr + 8);
         __m256 bias_r2 = _mm256_loadu_ps(bias_ptr + 16);
@@ -561,7 +689,6 @@ private:
         __m256 bias_r5 = _mm256_loadu_ps(bias_ptr + 40);
         __m256 bias_r6 = _mm256_loadu_ps(bias_ptr + 48);
         __m256 bias_r7 = _mm256_loadu_ps(bias_ptr + 56);
-
         __m256 scale_r0 = _mm256_loadu_ps(scale_ptr + 0);
         __m256 scale_r1 = _mm256_loadu_ps(scale_ptr + 8);
         __m256 scale_r2 = _mm256_loadu_ps(scale_ptr + 16);
@@ -570,7 +697,6 @@ private:
         __m256 scale_r5 = _mm256_loadu_ps(scale_ptr + 40);
         __m256 scale_r6 = _mm256_loadu_ps(scale_ptr + 48);
         __m256 scale_r7 = _mm256_loadu_ps(scale_ptr + 56);
-
         __m256 norm = _mm256_set1_ps(1.0f/64.0f);
         __m256 zero = _mm256_setzero_ps();
 
@@ -579,7 +705,6 @@ private:
             for(size_t h=0; h<H_out; ++h) {
                 for(size_t w=0; w<W_out; ++w) {
                     size_t out_idx = ((n*H_out + h)*W_out + w)*64;
-
                     if (!active_mask[n]) {
                         _mm256_storeu_ps(out_ptr + out_idx + 0, zero);
                         _mm256_storeu_ps(out_ptr + out_idx + 8, zero);
@@ -591,10 +716,8 @@ private:
                         _mm256_storeu_ps(out_ptr + out_idx + 56, zero);
                         continue;
                     }
-
                     size_t eyes_idx = ((n*H_out + h)*W_out + w)*64;
                     const float* ptr = eyes_ptr + eyes_idx;
-
                     __m256 r0 = _mm256_loadu_ps(ptr + 0);
                     __m256 r1 = _mm256_loadu_ps(ptr + 8);
                     __m256 r2 = _mm256_loadu_ps(ptr + 16);
@@ -603,13 +726,11 @@ private:
                     __m256 r5 = _mm256_loadu_ps(ptr + 40);
                     __m256 r6 = _mm256_loadu_ps(ptr + 48);
                     __m256 r7 = _mm256_loadu_ps(ptr + 56);
-
                     fwht8_avx2(r0); fwht8_avx2(r1); fwht8_avx2(r2); fwht8_avx2(r3);
                     fwht8_avx2(r4); fwht8_avx2(r5); fwht8_avx2(r6); fwht8_avx2(r7);
                     Ops::butterfly(r0, r1); Ops::butterfly(r2, r3); Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
                     Ops::butterfly(r0, r2); Ops::butterfly(r1, r3); Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
                     Ops::butterfly(r0, r4); Ops::butterfly(r1, r5); Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
-
                     r0 = _mm256_mul_ps(r0, scale_r0);
                     r1 = _mm256_mul_ps(r1, scale_r1);
                     r2 = _mm256_mul_ps(r2, scale_r2);
@@ -618,19 +739,15 @@ private:
                     r5 = _mm256_mul_ps(r5, scale_r5);
                     r6 = _mm256_mul_ps(r6, scale_r6);
                     r7 = _mm256_mul_ps(r7, scale_r7);
-
                     __m256 t0 = r0, t1 = r1, t2 = r2, t3 = r3, t4 = r4, t5 = r5, t6 = r6, t7 = r7;
-
                     auto sp_mix = [&](__m256& curr, __m256 prev_reg, __m256 next_reg) {
                         __m256 prev = shift_right_1(curr, prev_reg);
                         __m256 next = shift_left_1(curr, next_reg);
-
                         __m256 res = _mm256_mul_ps(curr, w_sp1);
                         res = _mm256_fmadd_ps(prev, w_sp0, res);
                         res = _mm256_fmadd_ps(next, w_sp2, res);
                         return res;
                     };
-
                     r0 = sp_mix(t0, t7, t1);
                     r1 = sp_mix(t1, t0, t2);
                     r2 = sp_mix(t2, t1, t3);
@@ -639,7 +756,6 @@ private:
                     r5 = sp_mix(t5, t4, t6);
                     r6 = sp_mix(t6, t5, t7);
                     r7 = sp_mix(t7, t6, t0);
-
                     if (use_dilated_) {
                         auto dilated_add = [&](__m256& acc, __m256 curr, __m256 prev, __m256 next) {
                             __m256 dp_res = _mm256_mul_ps(curr, w_dp1);
@@ -656,13 +772,11 @@ private:
                         dilated_add(r6, t6, t5, t7);
                         dilated_add(r7, t7, t6, t0);
                     }
-
                     fwht8_avx2(r0); fwht8_avx2(r1); fwht8_avx2(r2); fwht8_avx2(r3);
                     fwht8_avx2(r4); fwht8_avx2(r5); fwht8_avx2(r6); fwht8_avx2(r7);
                     Ops::butterfly(r0, r1); Ops::butterfly(r2, r3); Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
                     Ops::butterfly(r0, r2); Ops::butterfly(r1, r3); Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
                     Ops::butterfly(r0, r4); Ops::butterfly(r1, r5); Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
-
                     r0 = _mm256_mul_ps(r0, norm);
                     r1 = _mm256_mul_ps(r1, norm);
                     r2 = _mm256_mul_ps(r2, norm);
@@ -671,7 +785,6 @@ private:
                     r5 = _mm256_mul_ps(r5, norm);
                     r6 = _mm256_mul_ps(r6, norm);
                     r7 = _mm256_mul_ps(r7, norm);
-
                     auto bias_relu = [&](__m256& r, __m256 b) {
                         r = _mm256_add_ps(r, b);
                         r = _mm256_max_ps(r, zero);
@@ -684,7 +797,6 @@ private:
                     bias_relu(r5, bias_r5);
                     bias_relu(r6, bias_r6);
                     bias_relu(r7, bias_r7);
-
                     _mm256_storeu_ps(out_ptr + out_idx + 0, r0);
                     _mm256_storeu_ps(out_ptr + out_idx + 8, r1);
                     _mm256_storeu_ps(out_ptr + out_idx + 16, r2);
@@ -724,6 +836,9 @@ private:
 
     Tensor<T> input_cached_;
     Tensor<T> eyes_out_cached_;
+
+    // Cache for optimized weight layout
+    std::vector<float, core::AlignedAllocator<float>> optimized_weights_cache_;
 };
 
 } // namespace layers
