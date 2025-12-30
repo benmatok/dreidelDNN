@@ -150,12 +150,13 @@ void run_benchmark_for_channel(size_t C) {
 
     // --- Zenith Model Configurations (Float) ---
     auto run_zenith_float = [&](const std::string& name, bool ifwht, bool dilated) {
-        layers::ZenithBlock<float> z1(C, 3, C, ifwht, dilated);
+        // Constructor: in, out, kernel, spectral_dim, ifwht, dilated, gating, stride
+        layers::ZenithBlock<float> z1(C, C, 3, C, ifwht, dilated, false, 1);
         AvgPool2D<float> pool(2);
-        layers::ZenithBlock<float> z2(C, 3, C, ifwht, dilated);
-        layers::ZenithBlock<float> z3(C, 3, C, ifwht, dilated);
+        layers::ZenithBlock<float> z2(C, C, 3, C, ifwht, dilated, false, 1);
+        layers::ZenithBlock<float> z3(C, C, 3, C, ifwht, dilated, false, 1);
         Upscale2D<float> upscale(2);
-        layers::ZenithBlock<float> z4(C, 3, C, ifwht, dilated);
+        layers::ZenithBlock<float> z4(C, C, 3, C, ifwht, dilated, false, 1);
 
         // Warmup
         {
@@ -186,8 +187,6 @@ void run_benchmark_for_channel(size_t C) {
     double t_ifwht = run_zenith_float("Zenith Float (+IFWHT)", true, false);
     double t_full = run_zenith_float("Zenith Float (+IFWHT+Dilated)", true, true);
 
-    // Int8 APoT removed as per instruction to simplify and focus on new architecture
-
     layers::Conv2D<float> c1(C, C, 3, 1, 1);
     layers::Conv2D<float> c2(C, C, 3, 1, 1);
     layers::Conv2D<float> c3(C, C, 3, 1, 1);
@@ -214,7 +213,7 @@ void run_benchmark_for_channel(size_t C) {
 
 int main() {
     std::cout << "=== ZenithBlock Benchmark: Float (New) vs Conv2D ===" << std::endl;
-    std::vector<size_t> channels_list = {16}; // Limited to 16 for environment stability
+    std::vector<size_t> channels_list = {8, 16, 32, 64, 128};
     for(size_t C : channels_list) {
         run_benchmark_for_channel(C);
     }
