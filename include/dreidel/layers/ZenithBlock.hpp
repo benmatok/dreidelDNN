@@ -123,10 +123,14 @@ public:
         bool is_downsample = (out_channels_ == in_channels_ / 2);
         bool is_upsample = (out_channels_ == in_channels_ * 2);
 
-        // --- AVX2 Optimized Path ---
+        // --- Optimized Execution Plan ---
+        bool eyes_done = false;
+        bool mixer_done = false;
+
 #ifdef __AVX2__
         if constexpr (std::is_same_v<T, float>) {
-            if (in_channels_ == 64 && out_channels_ == 64 && !is_downsample && !is_upsample && kernel_size_ == 3 && stride_ == 1) {
+            // 1. Eyes Optimization
+            if (in_channels_ == 64 && kernel_size_ == 3 && stride_ == 1) {
                 repack_weights();
 
                 #pragma omp parallel for collapse(2)
@@ -193,20 +197,13 @@ public:
                         }
                     }
                 }
-
-                forward_avx2_c64_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
-                return output;
+                eyes_done = true;
             }
         }
 #endif
 
-        int dilation_in = static_cast<int>(std::sqrt(in_channels_));
-        int dilation_out = static_cast<int>(std::sqrt(out_channels_));
-
-        #pragma omp parallel
-        {
-            // Generic Eyes Loop
-            #pragma omp for collapse(3)
+        if (!eyes_done) {
+            #pragma omp parallel for collapse(3)
             for(size_t n=0; n<N; ++n) {
                 for(size_t h_out=0; h_out<H_out; ++h_out) {
                     for(size_t w_out=0; w_out<W_out; ++w_out) {
@@ -238,93 +235,116 @@ public:
                     }
                 }
             }
+        }
 
+#ifdef __AVX2__
+        if constexpr (std::is_same_v<T, float>) {
+             // 2. Mixer Optimization
+             if (in_channels_ == 64 && out_channels_ == 64) {
+                  // AVX2 Mixer works regardless of stride, as it operates on eyes_ptr (Output Dim)
+                  forward_avx2_c64_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
+                  mixer_done = true;
+             }
+             else if (in_channels_ == 64 && out_channels_ == 1) {
+                  forward_avx2_c64_to_1_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
+                  mixer_done = true;
+             }
+        }
+#endif
+
+        if (!mixer_done) {
             // Generic Mixer Loop
-            std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_);
-            std::vector<T, core::AlignedAllocator<T>> buf_out(out_channels_);
+            int dilation_in = static_cast<int>(std::sqrt(in_channels_));
+            int dilation_out = static_cast<int>(std::sqrt(out_channels_));
 
-            #pragma omp for collapse(3)
-            for(size_t n=0; n<N; ++n) {
-                for(size_t h=0; h<H_out; ++h) {
-                    for(size_t w=0; w<W_out; ++w) {
-                        size_t out_idx = ((n*H_out + h)*W_out + w)*out_channels_;
-                        if (!active_mask[n]) {
-                            for(size_t c=0; c<out_channels_; ++c) out_ptr[out_idx + c] = 0;
-                            continue;
-                        }
+            #pragma omp parallel
+            {
+                std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_);
+                std::vector<T, core::AlignedAllocator<T>> buf_out(out_channels_);
 
-                        size_t eyes_idx = ((n*H_out + h)*W_out + w)*in_channels_;
-                        T* pixel = eyes_ptr + eyes_idx;
+                #pragma omp for collapse(3)
+                for(size_t n=0; n<N; ++n) {
+                    for(size_t h=0; h<H_out; ++h) {
+                        for(size_t w=0; w<W_out; ++w) {
+                            size_t out_idx = ((n*H_out + h)*W_out + w)*out_channels_;
+                            if (!active_mask[n]) {
+                                for(size_t c=0; c<out_channels_; ++c) out_ptr[out_idx + c] = 0;
+                                continue;
+                            }
 
-                        for(size_t c=0; c<in_channels_; ++c) buf_in[c] = pixel[c];
-                        algo::WHT::fwht_1d(buf_in.data(), in_channels_);
-                        for(size_t c=0; c<in_channels_; ++c) buf_in[c] *= scale_ptr[c];
+                            size_t eyes_idx = ((n*H_out + h)*W_out + w)*in_channels_;
+                            T* pixel = eyes_ptr + eyes_idx;
 
-                        if (in_channels_ == out_channels_) {
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
-                                size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
-                                T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[c] + sp_w[2] * buf_in[next];
-                                if (use_dilated_) {
-                                    size_t prev_d = (c < (size_t)dilation_in) ? in_channels_ - dilation_in + c : c - dilation_in;
-                                    size_t next_d = (c + dilation_in >= in_channels_) ? c + dilation_in - in_channels_ : c + dilation_in;
-                                    val += dp_w[0] * buf_in[prev_d] + dp_w[1] * buf_in[c] + dp_w[2] * buf_in[next_d];
+                            for(size_t c=0; c<in_channels_; ++c) buf_in[c] = pixel[c];
+                            algo::WHT::fwht_1d(buf_in.data(), in_channels_);
+                            for(size_t c=0; c<in_channels_; ++c) buf_in[c] *= scale_ptr[c];
+
+                            if (in_channels_ == out_channels_) {
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
+                                    size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
+                                    T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[c] + sp_w[2] * buf_in[next];
+                                    if (use_dilated_) {
+                                        size_t prev_d = (c < (size_t)dilation_in) ? in_channels_ - dilation_in + c : c - dilation_in;
+                                        size_t next_d = (c + dilation_in >= in_channels_) ? c + dilation_in - in_channels_ : c + dilation_in;
+                                        val += dp_w[0] * buf_in[prev_d] + dp_w[1] * buf_in[c] + dp_w[2] * buf_in[next_d];
+                                    }
+                                    buf_out[c] = val;
                                 }
-                                buf_out[c] = val;
-                            }
-                        } else if (is_downsample) {
-                             for(size_t c=0; c<out_channels_; ++c) {
-                                size_t ci = c * 2;
-                                size_t prev = (ci == 0) ? in_channels_ - 1 : ci - 1;
-                                size_t next = (ci == in_channels_ - 1) ? 0 : ci + 1;
-                                T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[ci] + sp_w[2] * buf_in[next];
-                                if (use_dilated_) {
-                                    size_t prev_d = (ci < (size_t)dilation_in) ? in_channels_ - dilation_in + ci : ci - dilation_in;
-                                    size_t next_d = (ci + dilation_in >= in_channels_) ? ci + dilation_in - in_channels_ : ci + dilation_in;
-                                    val += dp_w[0] * buf_in[prev_d] + dp_w[1] * buf_in[ci] + dp_w[2] * buf_in[next_d];
+                            } else if (is_downsample) {
+                                 for(size_t c=0; c<out_channels_; ++c) {
+                                    size_t ci = c * 2;
+                                    size_t prev = (ci == 0) ? in_channels_ - 1 : ci - 1;
+                                    size_t next = (ci == in_channels_ - 1) ? 0 : ci + 1;
+                                    T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[ci] + sp_w[2] * buf_in[next];
+                                    if (use_dilated_) {
+                                        size_t prev_d = (ci < (size_t)dilation_in) ? in_channels_ - dilation_in + ci : ci - dilation_in;
+                                        size_t next_d = (ci + dilation_in >= in_channels_) ? ci + dilation_in - in_channels_ : ci + dilation_in;
+                                        val += dp_w[0] * buf_in[prev_d] + dp_w[1] * buf_in[ci] + dp_w[2] * buf_in[next_d];
+                                    }
+                                    buf_out[c] = val;
                                 }
-                                buf_out[c] = val;
-                            }
-                        } else if (is_upsample) {
-                            std::fill(buf_out.begin(), buf_out.end(), 0);
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                T val = buf_in[c];
-                                size_t co = c * 2;
-                                size_t prev = (co == 0) ? out_channels_ - 1 : co - 1;
-                                size_t next = (co == out_channels_ - 1) ? 0 : co + 1;
-                                buf_out[prev] += val * sp_w[0];
-                                buf_out[co]   += val * sp_w[1];
-                                buf_out[next] += val * sp_w[2];
-                                if (use_dilated_) {
-                                    size_t prev_d = (co < (size_t)dilation_out) ? out_channels_ - dilation_out + co : co - dilation_out;
-                                    size_t next_d = (co + dilation_out >= out_channels_) ? co + dilation_out - out_channels_ : co + dilation_out;
-                                    buf_out[prev_d] += val * dp_w[0];
-                                    buf_out[co]     += val * dp_w[1];
-                                    buf_out[next_d] += val * dp_w[2];
+                            } else if (is_upsample) {
+                                std::fill(buf_out.begin(), buf_out.end(), 0);
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    T val = buf_in[c];
+                                    size_t co = c * 2;
+                                    size_t prev = (co == 0) ? out_channels_ - 1 : co - 1;
+                                    size_t next = (co == out_channels_ - 1) ? 0 : co + 1;
+                                    buf_out[prev] += val * sp_w[0];
+                                    buf_out[co]   += val * sp_w[1];
+                                    buf_out[next] += val * sp_w[2];
+                                    if (use_dilated_) {
+                                        size_t prev_d = (co < (size_t)dilation_out) ? out_channels_ - dilation_out + co : co - dilation_out;
+                                        size_t next_d = (co + dilation_out >= out_channels_) ? co + dilation_out - out_channels_ : co + dilation_out;
+                                        buf_out[prev_d] += val * dp_w[0];
+                                        buf_out[co]     += val * dp_w[1];
+                                        buf_out[next_d] += val * dp_w[2];
+                                    }
+                                }
+                            } else {
+                                // Fallback
+                                std::fill(buf_out.begin(), buf_out.end(), 0);
+                                size_t min_c = std::min(in_channels_, out_channels_);
+                                for(size_t c=0; c<min_c; ++c) {
+                                    size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
+                                    size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
+                                    T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[c] + sp_w[2] * buf_in[next];
+                                    buf_out[c] = val;
                                 }
                             }
-                        } else {
-                            // Fallback
-                            std::fill(buf_out.begin(), buf_out.end(), 0);
-                            size_t min_c = std::min(in_channels_, out_channels_);
-                            for(size_t c=0; c<min_c; ++c) {
-                                size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
-                                size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
-                                T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[c] + sp_w[2] * buf_in[next];
-                                buf_out[c] = val;
+
+                            if (use_ifwht_) {
+                                algo::WHT::fwht_1d(buf_out.data(), out_channels_);
+                                T norm = 1.0f / static_cast<T>(out_channels_);
+                                for(size_t c=0; c<out_channels_; ++c) buf_out[c] *= norm;
                             }
-                        }
 
-                        if (use_ifwht_) {
-                            algo::WHT::fwht_1d(buf_out.data(), out_channels_);
-                            T norm = 1.0f / static_cast<T>(out_channels_);
-                            for(size_t c=0; c<out_channels_; ++c) buf_out[c] *= norm;
-                        }
-
-                        for(size_t c=0; c<out_channels_; ++c) {
-                            T v = buf_out[c] + bias_ptr[c];
-                            if (v < 0) v = 0;
-                            out_ptr[out_idx + c] = v;
+                            for(size_t c=0; c<out_channels_; ++c) {
+                                T v = buf_out[c] + bias_ptr[c];
+                                if (v < 0) v = 0;
+                                out_ptr[out_idx + c] = v;
+                            }
                         }
                     }
                 }
@@ -805,6 +825,98 @@ private:
                     _mm256_storeu_ps(out_ptr + out_idx + 40, r5);
                     _mm256_storeu_ps(out_ptr + out_idx + 48, r6);
                     _mm256_storeu_ps(out_ptr + out_idx + 56, r7);
+                }
+            }
+        }
+    }
+
+    void forward_avx2_c64_to_1_mixer(
+        size_t N, size_t H_out, size_t W_out,
+        float* out_ptr, const float* eyes_ptr,
+        const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr,
+        const std::vector<bool>& active_mask
+    ) {
+        using namespace dreidel::hal::x86;
+        __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0);
+        __m256 w_sp1 = _mm256_broadcast_ss(sp_w + 1);
+        __m256 w_sp2 = _mm256_broadcast_ss(sp_w + 2);
+
+        float bias_val = bias_ptr[0];
+
+        __m256 scale_r0 = _mm256_loadu_ps(scale_ptr + 0);
+        __m256 scale_r1 = _mm256_loadu_ps(scale_ptr + 8);
+        __m256 scale_r2 = _mm256_loadu_ps(scale_ptr + 16);
+        __m256 scale_r3 = _mm256_loadu_ps(scale_ptr + 24);
+        __m256 scale_r4 = _mm256_loadu_ps(scale_ptr + 32);
+        __m256 scale_r5 = _mm256_loadu_ps(scale_ptr + 40);
+        __m256 scale_r6 = _mm256_loadu_ps(scale_ptr + 48);
+        __m256 scale_r7 = _mm256_loadu_ps(scale_ptr + 56);
+
+        #pragma omp parallel for collapse(3)
+        for(size_t n=0; n<N; ++n) {
+            for(size_t h=0; h<H_out; ++h) {
+                for(size_t w=0; w<W_out; ++w) {
+                    size_t out_idx = ((n*H_out + h)*W_out + w); // out_channels=1
+                    if (!active_mask[n]) {
+                        out_ptr[out_idx] = 0.0f;
+                        continue;
+                    }
+                    size_t eyes_idx = ((n*H_out + h)*W_out + w)*64;
+                    const float* ptr = eyes_ptr + eyes_idx;
+
+                    __m256 r0 = _mm256_loadu_ps(ptr + 0);
+                    __m256 r1 = _mm256_loadu_ps(ptr + 8);
+                    __m256 r2 = _mm256_loadu_ps(ptr + 16);
+                    __m256 r3 = _mm256_loadu_ps(ptr + 24);
+                    __m256 r4 = _mm256_loadu_ps(ptr + 32);
+                    __m256 r5 = _mm256_loadu_ps(ptr + 40);
+                    __m256 r6 = _mm256_loadu_ps(ptr + 48);
+                    __m256 r7 = _mm256_loadu_ps(ptr + 56);
+
+                    // FWHT64
+                    fwht8_avx2(r0); fwht8_avx2(r1); fwht8_avx2(r2); fwht8_avx2(r3);
+                    fwht8_avx2(r4); fwht8_avx2(r5); fwht8_avx2(r6); fwht8_avx2(r7);
+                    Ops::butterfly(r0, r1); Ops::butterfly(r2, r3); Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
+                    Ops::butterfly(r0, r2); Ops::butterfly(r1, r3); Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
+                    Ops::butterfly(r0, r4); Ops::butterfly(r1, r5); Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
+
+                    // Scale
+                    r0 = _mm256_mul_ps(r0, scale_r0);
+                    r1 = _mm256_mul_ps(r1, scale_r1);
+                    r2 = _mm256_mul_ps(r2, scale_r2);
+                    r3 = _mm256_mul_ps(r3, scale_r3);
+                    r4 = _mm256_mul_ps(r4, scale_r4);
+                    r5 = _mm256_mul_ps(r5, scale_r5);
+                    r6 = _mm256_mul_ps(r6, scale_r6);
+                    r7 = _mm256_mul_ps(r7, scale_r7);
+
+                    // Permute logic: c=0. prev=63, next=1.
+                    // buf[0] is r0[0]. buf[1] is r0[1]. buf[63] is r7[7].
+
+                    // Extract needed values
+                    float buf0 = _mm256_cvtss_f32(r0); // low element of r0
+                    // Extract r0[1]
+                    __m256 r0_shuf = _mm256_permute_ps(r0, 0x01); // rotate
+                    float buf1 = _mm256_cvtss_f32(r0_shuf);
+                    // Extract r7[7]
+                    // r7: [0,1,2,3, 4,5,6,7]
+                    // high 128: [4,5,6,7]
+                    __m256 r7_high = _mm256_permute2f128_ps(r7, r7, 0x11);
+                    __m256 r7_perm = _mm256_permute_ps(r7_high, 0xFF); // 11111111 -> 3,3,3,3 (last elem of 128 bit lane)
+                    float buf63 = _mm256_cvtss_f32(r7_perm);
+
+                    // Mix
+                    float val = sp_w[0] * buf63 + sp_w[1] * buf0 + sp_w[2] * buf1;
+
+                    // IFWHT(1) is Identity
+
+                    // Bias
+                    val += bias_val;
+
+                    // ReLU
+                    if (val < 0) val = 0;
+
+                    out_ptr[out_idx] = val;
                 }
             }
         }
