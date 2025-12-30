@@ -74,16 +74,8 @@ void run_autoencoder_benchmark(size_t base_channels) {
     size_t H_in = 64, W_in = 64, C_in = 1;
     size_t loops = 5;
 
-    // Scale architecture based on base_channels
-    // Original was C=128 for base_channels=128.
-    // We will scale relative to that or just use base_channels as the main width.
-    // Architecture: C_in -> C -> C/2 -> C/2 -> C -> C -> C_in
-    // We want to ensure divisibility. Let's enforce power of 2 channels.
-    // E.g. 128 -> 128 -> 64. 64 -> 64 -> 32. 32 -> 32 -> 16.
-
     size_t C1 = base_channels;
     size_t C2 = base_channels / 2;
-    // Ensure C2 is at least something reasonable, e.g. 4.
     if (C2 < 4) C2 = 4;
 
     std::cout << "\n--------------------------------------------------" << std::endl;
@@ -96,7 +88,6 @@ void run_autoencoder_benchmark(size_t base_channels) {
     // --- 1. Zenith Autoencoder ---
 
     // Encoder
-    // ZenithBlock: in, out, kernel, spectral_dim, ifwht, dilated, gating, stride
     layers::ZenithBlock<float> z_e1(1, C1, 3, C1, true, true, false, 4);
     layers::ZenithBlock<float> z_e2(C1, C1, 3, C1, true, true, false, 4);
     layers::ZenithBlock<float> z_e3(C1, C2, 3, C1, true, true, false, 4); // Bottleneck
