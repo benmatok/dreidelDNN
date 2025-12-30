@@ -182,59 +182,11 @@ void run_benchmark_for_channel(size_t C) {
         return time;
     };
 
-    // --- Zenith Model (Int8 / APoT) ---
-    auto run_zenith_apot = [&](const std::string& name) {
-        size_t arena_size = 4 * 1024 * 1024;
-        layers::PackAPoT pack;
-        layers::UnpackAPoT unpack;
-        layers::ZenithBlock<int8_t> z1(C, 3, C, arena_size);
-        layers::QuantizedAvgPool2D qpool(2);
-        layers::ZenithBlock<int8_t> z2(C, 3, C, arena_size);
-        layers::ZenithBlock<int8_t> z3(C, 3, C, arena_size);
-        layers::QuantizedUpscale2D qupscale(2);
-        layers::ZenithBlock<int8_t> z4(C, 3, C, arena_size);
-
-        // Warmup
-        {
-            auto t0 = pack.forward(input);
-            auto t1 = z1.forward(t0);
-            auto t2 = qpool.forward(t1);
-            auto t3 = z2.forward(t2);
-            auto t4 = z3.forward(t3);
-            auto t5 = qupscale.forward(t4);
-            auto t6 = z4.forward(t5);
-            auto out = unpack.forward(t6);
-        }
-
-        auto start = std::chrono::high_resolution_clock::now();
-        for(size_t i=0; i<loops; ++i) {
-            auto t0 = pack.forward(input);
-            auto t1 = z1.forward(t0);
-            auto t2 = qpool.forward(t1);
-            auto t3 = z2.forward(t2);
-            auto t4 = z3.forward(t3);
-            auto t5 = qupscale.forward(t4);
-            auto t6 = z4.forward(t5);
-            auto out = unpack.forward(t6);
-        }
-        auto end = std::chrono::high_resolution_clock::now();
-        double time = std::chrono::duration<double>(end - start).count();
-        std::cout << std::left << std::setw(30) << name << " Time: " << time << " s" << std::endl;
-        return time;
-    };
-
     double t_base = run_zenith_float("Zenith Float (Base)", false, false);
     double t_ifwht = run_zenith_float("Zenith Float (+IFWHT)", true, false);
     double t_full = run_zenith_float("Zenith Float (+IFWHT+Dilated)", true, true);
 
-    // Int8 is currently skipped for large C to prevent timeouts/instability in this env
-    double t_apot = 0;
-    if (C <= 16) {
-        t_apot = run_zenith_apot("Zenith APoT (Int8)");
-    } else {
-        std::cout << std::left << std::setw(30) << "Zenith APoT (Int8)" << " Time: " << "SKIPPED" << std::endl;
-        t_apot = 1000.0;
-    }
+    // Int8 APoT removed as per instruction to simplify and focus on new architecture
 
     layers::Conv2D<float> c1(C, C, 3, 1, 1);
     layers::Conv2D<float> c2(C, C, 3, 1, 1);
@@ -261,8 +213,8 @@ void run_benchmark_for_channel(size_t C) {
 }
 
 int main() {
-    std::cout << "=== ZenithBlock Benchmark: Float (New) vs APoT (Optimized) vs Conv2D ===" << std::endl;
-    std::vector<size_t> channels_list = {16}; // Limited to 16 for stability
+    std::cout << "=== ZenithBlock Benchmark: Float (New) vs Conv2D ===" << std::endl;
+    std::vector<size_t> channels_list = {16}; // Limited to 16 for environment stability
     for(size_t C : channels_list) {
         run_benchmark_for_channel(C);
     }
