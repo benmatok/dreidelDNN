@@ -52,19 +52,21 @@ int main() {
     std::cout << "=== Zenith Fitting Test (Distillation) ===" << std::endl;
 
     size_t C = 64;
-    size_t K = 3;
+    size_t K = 5;
     size_t H = 16, W = 16;
     size_t batch = 4;
     size_t epochs = 1000;
 
     // 1. Ground Truth: Conv2D
     std::cout << "Initializing Ground Truth Conv2D (" << C << " smooth filters)..." << std::endl;
-    layers::Conv2D<float> teacher(C, C, K, 1, 1); // Padding 1
+    // Padding = K/2 for Same convolution
+    layers::Conv2D<float> teacher(C, C, K, 1, K/2);
     init_smooth_conv(teacher, C, K);
 
-    // 2. Student: ZenithFloatEyes (Approximating ZenithBlock)
-    std::cout << "Initializing Student ZenithFloatEyes..." << std::endl;
-    layers::ZenithFloatEyes<float> student(C, C, K);
+    // 2. Student: ZenithFloatEyes with Expanded Filters (Spectral Dim)
+    size_t expanded_dim = C * 4;
+    std::cout << "Initializing Student ZenithFloatEyes (Expanded " << C << "->" << expanded_dim << ")..." << std::endl;
+    layers::ZenithFloatEyes<float> student(C, C, K, expanded_dim);
 
     // Optimizer
     optim::DiagonalNewton<float> opt(0.001f); // Reduced Learning rate

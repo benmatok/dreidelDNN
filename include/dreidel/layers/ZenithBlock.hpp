@@ -29,22 +29,15 @@ class ZenithBlock;
 class ZenithBlock : public Layer<int8_t> {
 public:
     // Single constructor with Cin != Cout
-    // We remove the old constructor and handle single-channel usage here by making out_channels mandatory.
-    // However, existing code might pass 4 args assuming `ZenithBlock(C, K, S, Arena)`.
-    // Our new signature is `ZenithBlock(Cin, Cout, K, S, Arena)`.
-    // If we want backward compatibility without ambiguity, we can't overload with defaults easily.
-    // BUT we can use a factory method or just fix the call sites.
-    // There is only ONE call site in `benchmarks/benchmark_zenith_conv.cpp` (and my test).
-
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim, size_t arena_size = 1024*1024, bool use_gating = false)
         : in_channels_(in_channels), out_channels_(out_channels),
           kernel_size_(kernel_size), spectral_dim_(spectral_dim),
           arena_(arena_size),
           use_gating_(use_gating),
           packed_weights_(in_channels * kernel_size * kernel_size), // Depthwise: 1 filter per input channel
-          spectral_scales_(std::max(in_channels, out_channels)), // Scaled in spectral domain
+          spectral_scales_(std::max({in_channels, out_channels, spectral_dim})), // Scaled in spectral domain
           bias_(out_channels),
-          perm_indices_(std::max(in_channels, out_channels))
+          perm_indices_(std::max({in_channels, out_channels, spectral_dim}))
     {
         // Random Init Weights
         std::mt19937 gen(42);
@@ -154,7 +147,7 @@ public:
 
         int k_rad = kernel_size_ / 2;
 
-        size_t mix_dim = std::max(in_channels_, out_channels_);
+        size_t mix_dim = std::max({in_channels_, out_channels_, spectral_dim_});
 
         arena_.reset();
         int8_t* pixel_buffer = arena_.allocate<int8_t>(in_channels_);
@@ -241,13 +234,15 @@ public:
                             }
 
                             // 3. Mixer (Spectral)
-                            // Populate mixer buffer
+                            // Populate mixer buffer using indirect lookup via permutation
                             for(size_t c=0; c<mix_dim; ++c) {
-                                if (c < C_in) mixer_buffer[c] = pixel_buffer[perm_ptr[c]]; // Apply permutation
-                                else mixer_buffer[c] = 0; // Padding
+                                size_t src_idx = perm_ptr[c];
+                                if (src_idx < C_in) mixer_buffer[c] = pixel_buffer[src_idx];
+                                else mixer_buffer[c] = 0; // Virtual padding
                             }
 
                             // FWHT: Hybrid Strategy
+                            // Use mix_dim instead of C
                             size_t c = 0;
 #if defined(DREIDEL_ARCH_AVX2)
                             for (; c + 32 <= mix_dim; c += 32) {
@@ -257,7 +252,7 @@ public:
                             }
 #endif
                             if (c < mix_dim) {
-                                size_t limit = mix_dim - c;
+                                size_t limit = mix_dim - c; // e.g. 16
                                 size_t sub_h = 1;
                                 while (sub_h < 32 && sub_h < limit) {
                                     for(size_t i=c; i<mix_dim; i+=sub_h*2) {
@@ -274,7 +269,7 @@ public:
                                 }
                             }
 
-                            // B. Inter-Register Pass
+                            // B. Inter-Register Pass (Strides 32, 64...)
                             size_t h_len = 32;
                             while (h_len < mix_dim) {
                                 bool handled = false;

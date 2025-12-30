@@ -10,11 +10,10 @@
 namespace dreidel {
 namespace layers {
 
-/**
- * @brief Zenith Variant 1: Dense Mixer (No FWHT)
- * Replaces FWHT mixing with a standard Dense (1x1 Conv) mixing.
- * Keeps Eyes (Spatial APoT).
- */
+// ... (ZenithDenseMixer omitted for brevity as it is unchanged) ...
+// Actually I need to include it or overwrite the whole file.
+// I will just overwrite the whole file with updated ZenithFloatEyes.
+
 template <typename T>
 class ZenithDenseMixer : public Layer<T> {
 public:
@@ -35,6 +34,8 @@ public:
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
+        // ... (Implementation same as before) ...
+        // Re-pasting the implementation to ensure file correctness
         input_ = input;
         auto shape = input.shape();
         size_t batch = shape[0], H = shape[1], W = shape[2], C = shape[3];
@@ -53,7 +54,6 @@ public:
         for(size_t n=0; n<batch; ++n) {
             for(size_t h=0; h<H; ++h) {
                 for(size_t w=0; w<W; ++w) {
-                    // Eyes
                     std::fill(pixel_buf.begin(), pixel_buf.end(), 0);
                     for(int ky=-k_rad; ky<=k_rad; ++ky) {
                         for(int kx=-k_rad; kx<=k_rad; ++kx) {
@@ -66,8 +66,6 @@ public:
                             }
                         }
                     }
-
-                    // Dense Mixer: y = x * W
                     std::fill(mix_buf.begin(), mix_buf.end(), 0);
                     for(size_t c_out=0; c_out<C; ++c_out) {
                         T acc = 0;
@@ -76,8 +74,6 @@ public:
                         }
                         mix_buf[c_out] = acc;
                     }
-
-                    // Write
                     T* p_out = out_ptr + ((n*H + h)*W + w)*C;
                     for(size_t c=0; c<C; ++c) p_out[c] = mix_buf[c];
                 }
@@ -87,7 +83,7 @@ public:
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
-        // Simplified backward
+        // ... (Implementation same as before) ...
         auto shape = input_.shape();
         size_t batch = shape[0], H = shape[1], W = shape[2], C = shape[3];
         Tensor<T> grad_input(shape); grad_input.fill(0);
@@ -104,7 +100,7 @@ public:
 
         std::vector<T> d_vec(C);
         std::vector<T> d_eyes(C);
-        std::vector<T> eyes_out(C); // Need recompute
+        std::vector<T> eyes_out(C);
 
         for(size_t n=0; n<batch; ++n) {
             for(size_t h=0; h<H; ++h) {
@@ -112,7 +108,6 @@ public:
                     const T* p_go = go_ptr + ((n*H + h)*W + w)*C;
                     for(size_t c=0; c<C; ++c) d_vec[c] = p_go[c];
 
-                    // Recompute Eyes Output for Mixer Grad
                     std::fill(eyes_out.begin(), eyes_out.end(), 0);
                     for(int ky=-k_rad; ky<=k_rad; ++ky) {
                         for(int kx=-k_rad; kx<=k_rad; ++kx) {
@@ -126,9 +121,6 @@ public:
                         }
                     }
 
-                    // Backward Mixer
-                    // dL/dW = x^T * dy
-                    // dL/dx = dy * W^T
                     std::fill(d_eyes.begin(), d_eyes.end(), 0);
                     for(size_t c_out=0; c_out<C; ++c_out) {
                         T dy = d_vec[c_out];
@@ -138,7 +130,6 @@ public:
                         }
                     }
 
-                    // Backward Eyes
                     for(int ky=-k_rad; ky<=k_rad; ++ky) {
                         for(int kx=-k_rad; kx<=k_rad; ++kx) {
                             int ih = h + ky; int iw = w + kx;
@@ -182,19 +173,21 @@ private:
 template <typename T>
 class ZenithFloatEyes : public Layer<T> {
 public:
-    // Supports Cin != Cout
-    ZenithFloatEyes(size_t in_channels, size_t out_channels, size_t kernel_size)
+    // Supports Cin != Cout and optional custom Spectral Dim
+    ZenithFloatEyes(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim = 0)
         : in_channels_(in_channels), out_channels_(out_channels), kernel_size_(kernel_size),
+          // mix_dim is max(in, out, spectral)
+          mix_dim_(std::max({in_channels, out_channels, spectral_dim})),
           spatial_weights_({in_channels, 1, kernel_size, kernel_size}),
-          spectral_scales_({1, std::max(in_channels, out_channels)}),
-          perm_indices_(std::max(in_channels, out_channels)),
+          spectral_scales_({1, std::max({in_channels, out_channels, spectral_dim})}),
+          perm_indices_(std::max({in_channels, out_channels, spectral_dim})),
           grad_spatial_({in_channels, 1, kernel_size, kernel_size}),
-          grad_scales_({1, std::max(in_channels, out_channels)})
+          grad_scales_({1, std::max({in_channels, out_channels, spectral_dim})})
     {
         // Standard init (no quantization)
         spatial_weights_.random(0.0, std::sqrt(2.0 / (kernel_size * kernel_size * in_channels)));
 
-        T scale_init = 1.0 / std::sqrt(static_cast<T>(std::max(in_channels, out_channels)));
+        T scale_init = 1.0 / std::sqrt(static_cast<T>(mix_dim_));
         spectral_scales_.fill(scale_init);
 
         std::iota(perm_indices_.begin(), perm_indices_.end(), 0);
@@ -218,9 +211,8 @@ public:
         const T* scale_ptr = spectral_scales_.data();
         int k_rad = kernel_size_ / 2;
 
-        size_t mix_dim = std::max(in_channels_, out_channels_);
         std::vector<T> pixel_buf(in_channels_);
-        std::vector<T> mix_buf(mix_dim);
+        std::vector<T> mix_buf(mix_dim_);
 
         for(size_t n=0; n<batch; ++n) {
             for(size_t h=0; h<H; ++h) {
@@ -240,20 +232,19 @@ public:
                     }
 
                     // Prepare Mixer Buffer (Padding)
-                    for(size_t i=0; i<mix_dim; ++i) {
+                    for(size_t i=0; i<mix_dim_; ++i) {
                         if (i < C_in) mix_buf[i] = pixel_buf[i];
                         else mix_buf[i] = 0;
                     }
 
                     // Permute and FWHT
-                    // Need temp buf to permute
-                    std::vector<T> temp_perm(mix_dim);
-                    for(size_t i=0; i<mix_dim; ++i) temp_perm[i] = mix_buf[perm_indices_[i]];
+                    std::vector<T> temp_perm(mix_dim_);
+                    for(size_t i=0; i<mix_dim_; ++i) temp_perm[i] = mix_buf[perm_indices_[i]];
 
-                    algo::WHT::fwht_1d(temp_perm.data(), mix_dim);
+                    algo::WHT::fwht_1d(temp_perm.data(), mix_dim_);
 
                     // Scale
-                    for(size_t i=0; i<mix_dim; ++i) temp_perm[i] *= scale_ptr[i];
+                    for(size_t i=0; i<mix_dim_; ++i) temp_perm[i] *= scale_ptr[i];
 
                     // Output (Slice)
                     T* p_out = out_ptr + ((n*H + h)*W + w)*out_channels_;
@@ -265,8 +256,6 @@ public:
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
-        // ... (Similar logic, omitted for brevity, assumes essentially same as ZenithBlock but float mul)
-        // Implementing basic backward to allow training
         auto shape = input_.shape();
         size_t batch = shape[0], H = shape[1], W = shape[2], C_in = shape[3];
         Tensor<T> grad_input(shape); grad_input.fill(0);
@@ -282,12 +271,11 @@ public:
         T* gi_ptr = grad_input.data();
         const T* in_ptr = input_.data();
 
-        size_t mix_dim = std::max(in_channels_, out_channels_);
         std::vector<T> d_vec(out_channels_);
-        std::vector<T> d_mix(mix_dim); // padded grad
+        std::vector<T> d_mix(mix_dim_);
         std::vector<T> eyes_out(in_channels_);
-        std::vector<T> mixer_in(mix_dim);
-        std::vector<T> d_unperm(mix_dim);
+        std::vector<T> mixer_in(mix_dim_);
+        std::vector<T> d_unperm(mix_dim_);
 
         for(size_t n=0; n<batch; ++n) {
             for(size_t h=0; h<H; ++h) {
@@ -310,36 +298,27 @@ public:
                     }
 
                     // Forward Mix for Scale Grad
-                    for(size_t i=0; i<mix_dim; ++i) {
+                    for(size_t i=0; i<mix_dim_; ++i) {
                          if (i < C_in) mixer_in[i] = eyes_out[i];
                          else mixer_in[i] = 0;
                     }
-                    // Apply permutation
-                    std::vector<T> temp_perm(mix_dim);
-                    for(size_t i=0; i<mix_dim; ++i) temp_perm[i] = mixer_in[perm_indices_[i]];
+                    std::vector<T> temp_perm(mix_dim_);
+                    for(size_t i=0; i<mix_dim_; ++i) temp_perm[i] = mixer_in[perm_indices_[i]];
 
-                    algo::WHT::fwht_1d(temp_perm.data(), mix_dim); // Spectral domain before scale
+                    algo::WHT::fwht_1d(temp_perm.data(), mix_dim_);
 
                     // Backward Scale
-                    // dL/dScale = dL/dY * FWHT(Perm(Eyes))
-                    // d_vec is dL/dY (slice).
-                    // We need to pad d_vec to mix_dim (zeros for unused output channels?)
-                    // Yes, gradients from non-existent outputs are 0.
-                    for(size_t c=0; c<mix_dim; ++c) {
+                    for(size_t c=0; c<mix_dim_; ++c) {
                         T dy = (c < out_channels_) ? d_vec[c] : 0;
-                        gscale_ptr[c] += dy * temp_perm[c]; // Accumulate scale grad
-                        d_mix[c] = dy * scale_ptr[c];       // Propagate through scale
+                        gscale_ptr[c] += dy * temp_perm[c];
+                        d_mix[c] = dy * scale_ptr[c];
                     }
 
                     // Backward FWHT
-                    algo::WHT::fwht_1d(d_mix.data(), mix_dim);
+                    algo::WHT::fwht_1d(d_mix.data(), mix_dim_);
 
                     // Backward Permute
-                    for(size_t i=0; i<mix_dim; ++i) d_unperm[perm_indices_[i]] = d_mix[i];
-
-                    // Backward Padding (slice back to C_in)
-                    // d_unperm is gradient w.r.t mixer_in (padded eyes_out)
-                    // We only care about first C_in elements.
+                    for(size_t i=0; i<mix_dim_; ++i) d_unperm[perm_indices_[i]] = d_mix[i];
 
                     // Backward Eyes
                     for(int ky=-k_rad; ky<=k_rad; ++ky) {
@@ -371,7 +350,7 @@ public:
     std::string name() const override { return "ZenithFloatEyes"; }
 
 private:
-    size_t in_channels_, out_channels_, kernel_size_;
+    size_t in_channels_, out_channels_, kernel_size_, mix_dim_;
     Tensor<T> spatial_weights_, spectral_scales_;
     std::vector<int> perm_indices_;
     Tensor<T> grad_spatial_, grad_scales_;
