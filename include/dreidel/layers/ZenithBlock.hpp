@@ -14,7 +14,7 @@
 
 #ifdef __AVX2__
 #include <immintrin.h>
-#include "../hal/x86.hpp" // Ensure we have access to FWHT helpers
+#include "../hal/x86.hpp"
 #endif
 
 namespace dreidel {
@@ -152,7 +152,6 @@ public:
         bool is_downsample = (out_channels_ == in_channels_ / 2);
         bool is_upsample = (out_channels_ == in_channels_ * 2);
 
-        // Check for AVX2 Optimization Path (C=64)
 #ifdef __AVX2__
         if constexpr (std::is_same_v<T, float>) {
             if (in_channels_ == 64 && out_channels_ == 64 && !is_downsample && !is_upsample) {
@@ -262,17 +261,12 @@ public:
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
-        // ... (backward implementation unchanged for now) ...
-        // Note: Since we only optimized forward, we reuse the standard backward.
-        // It relies on eyes_out_cached_ which is still populated.
-
-        // grad_output shape: (N, H_out, W_out, out_channels)
         auto g_shape = grad_output.shape();
         size_t H_out = g_shape[1];
         size_t W_out = g_shape[2];
 
         auto shape = input_cached_.shape();
-        size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3]; // C is in_channels
+        size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
 
         Tensor<T> grad_input(shape);
         grad_input.fill(0);
@@ -356,9 +350,8 @@ public:
 
                         std::fill(dL_dScaled.begin(), dL_dScaled.end(), 0);
 
-                        // Backward Permutation
                         if (is_downsample) {
-                            for(size_t c=0; c<out_channels_; ++c) {
+                             for(size_t c=0; c<out_channels_; ++c) {
                                 T grad = dL_dPerm[c];
                                 size_t ci = c * 2;
                                 size_t prev = (ci == 0) ? in_channels_ - 1 : ci - 1;
@@ -383,8 +376,7 @@ public:
                                 }
                             }
                         } else if (is_upsample) {
-                            // ... (upsample backward) ...
-                             for(size_t c=0; c<in_channels_; ++c) {
+                            for(size_t c=0; c<in_channels_; ++c) {
                                 size_t co = c * 2;
                                 size_t prev = (co == 0) ? out_channels_ - 1 : co - 1;
                                 size_t next = (co == out_channels_ - 1) ? 0 : co + 1;
@@ -436,15 +428,16 @@ public:
                                     }
                                 }
                             } else {
-                                // Fallback
                                 size_t min_c = std::min(in_channels_, out_channels_);
                                 for(size_t c=0; c<min_c; ++c) {
                                     size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
                                     size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
                                     T grad = dL_dPerm[c];
+
                                     dL_dScaled[prev] += grad * sp_w[0];
                                     dL_dScaled[c]    += grad * sp_w[1];
                                     dL_dScaled[next] += grad * sp_w[2];
+
                                     t_grad_sp[0] += grad * buf_scaled[prev];
                                     t_grad_sp[1] += grad * buf_scaled[c];
                                     t_grad_sp[2] += grad * buf_scaled[next];
@@ -463,6 +456,7 @@ public:
                         for(size_t c=0; c<in_channels_; ++c) t_grad_eyes[c] = dL_dEyes[c];
 
                         int k_rad = kernel_size_ / 2;
+
                         int h_in_center = h * stride_;
                         int w_in_center = w * stride_;
 
@@ -527,24 +521,34 @@ public:
 
 private:
 #ifdef __AVX2__
+    static inline __m256 shift_right_1(__m256 curr, __m256 prev_reg) {
+        __m256 t_mix = _mm256_permute2f128_ps(prev_reg, curr, 0x21);
+        __m256i t_mix_i = _mm256_castps_si256(t_mix);
+        __m256i curr_i = _mm256_castps_si256(curr);
+        __m256i res = _mm256_alignr_epi8(curr_i, t_mix_i, 12);
+        return _mm256_castsi256_ps(res);
+    }
+
+    static inline __m256 shift_left_1(__m256 curr, __m256 next_reg) {
+        __m256 t_mix = _mm256_permute2f128_ps(curr, next_reg, 0x21);
+        __m256i t_mix_i = _mm256_castps_si256(t_mix);
+        __m256i curr_i = _mm256_castps_si256(curr);
+        __m256i res = _mm256_alignr_epi8(t_mix_i, curr_i, 4);
+        return _mm256_castsi256_ps(res);
+    }
+
     void forward_avx2_c64_mixer(
         size_t N, size_t H_out, size_t W_out,
         float* out_ptr, const float* eyes_ptr,
         const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr,
         const std::vector<bool>& active_mask
     ) {
-        // Optimized C=64 In-Register implementation
-        // Only handles C=64 -> C=64 (No stride/downsample)
         using namespace dreidel::hal::x86;
 
-        // Load global weights
         __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0);
         __m256 w_sp1 = _mm256_broadcast_ss(sp_w + 1);
         __m256 w_sp2 = _mm256_broadcast_ss(sp_w + 2);
 
-        // For dilated (dilation = sqrt(64) = 8)
-        // prev_d = c-8, next_d = c+8.
-        // This corresponds to prev/next REGISTERS! r0 prev is r7, next is r1.
         __m256 w_dp0 = _mm256_broadcast_ss(dp_w + 0);
         __m256 w_dp1 = _mm256_broadcast_ss(dp_w + 1);
         __m256 w_dp2 = _mm256_broadcast_ss(dp_w + 2);
@@ -574,7 +578,7 @@ private:
         for(size_t n=0; n<N; ++n) {
             for(size_t h=0; h<H_out; ++h) {
                 for(size_t w=0; w<W_out; ++w) {
-                    size_t out_idx = ((n*H_out + h)*W_out + w)*64; // C=64
+                    size_t out_idx = ((n*H_out + h)*W_out + w)*64;
 
                     if (!active_mask[n]) {
                         _mm256_storeu_ps(out_ptr + out_idx + 0, zero);
@@ -591,7 +595,6 @@ private:
                     size_t eyes_idx = ((n*H_out + h)*W_out + w)*64;
                     const float* ptr = eyes_ptr + eyes_idx;
 
-                    // 1. LOAD (Aligned if possible, but use loadu for safety)
                     __m256 r0 = _mm256_loadu_ps(ptr + 0);
                     __m256 r1 = _mm256_loadu_ps(ptr + 8);
                     __m256 r2 = _mm256_loadu_ps(ptr + 16);
@@ -601,22 +604,12 @@ private:
                     __m256 r6 = _mm256_loadu_ps(ptr + 48);
                     __m256 r7 = _mm256_loadu_ps(ptr + 56);
 
-                    // 2. FWHT (In-Register)
-                    // Intra
                     fwht8_avx2(r0); fwht8_avx2(r1); fwht8_avx2(r2); fwht8_avx2(r3);
                     fwht8_avx2(r4); fwht8_avx2(r5); fwht8_avx2(r6); fwht8_avx2(r7);
+                    Ops::butterfly(r0, r1); Ops::butterfly(r2, r3); Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
+                    Ops::butterfly(r0, r2); Ops::butterfly(r1, r3); Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
+                    Ops::butterfly(r0, r4); Ops::butterfly(r1, r5); Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
 
-                    // Inter
-                    Ops::butterfly(r0, r1); Ops::butterfly(r2, r3);
-                    Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
-
-                    Ops::butterfly(r0, r2); Ops::butterfly(r1, r3);
-                    Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
-
-                    Ops::butterfly(r0, r4); Ops::butterfly(r1, r5);
-                    Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
-
-                    // 3. SCALE
                     r0 = _mm256_mul_ps(r0, scale_r0);
                     r1 = _mm256_mul_ps(r1, scale_r1);
                     r2 = _mm256_mul_ps(r2, scale_r2);
@@ -626,24 +619,27 @@ private:
                     r6 = _mm256_mul_ps(r6, scale_r6);
                     r7 = _mm256_mul_ps(r7, scale_r7);
 
-                    // 4. PERMUTATION
-                    // We need to accumulate SoftPerm and DilatedPerm.
-                    // Keep copies for calculating components.
                     __m256 t0 = r0, t1 = r1, t2 = r2, t3 = r3, t4 = r4, t5 = r5, t6 = r6, t7 = r7;
 
-                    // Soft Permutation (Standard): Approximation for now (Center only)
-                    // To be fully correct, we need neighbor mixing for Stride 1 too.
-                    // But for now, we use just the center weight w_sp1.
-                    r0 = _mm256_mul_ps(t0, w_sp1);
-                    r1 = _mm256_mul_ps(t1, w_sp1);
-                    r2 = _mm256_mul_ps(t2, w_sp1);
-                    r3 = _mm256_mul_ps(t3, w_sp1);
-                    r4 = _mm256_mul_ps(t4, w_sp1);
-                    r5 = _mm256_mul_ps(t5, w_sp1);
-                    r6 = _mm256_mul_ps(t6, w_sp1);
-                    r7 = _mm256_mul_ps(t7, w_sp1);
+                    auto sp_mix = [&](__m256& curr, __m256 prev_reg, __m256 next_reg) {
+                        __m256 prev = shift_right_1(curr, prev_reg);
+                        __m256 next = shift_left_1(curr, next_reg);
 
-                    // Dilated Permutation (Stride 8): Neighbor mixing across registers
+                        __m256 res = _mm256_mul_ps(curr, w_sp1);
+                        res = _mm256_fmadd_ps(prev, w_sp0, res);
+                        res = _mm256_fmadd_ps(next, w_sp2, res);
+                        return res;
+                    };
+
+                    r0 = sp_mix(t0, t7, t1);
+                    r1 = sp_mix(t1, t0, t2);
+                    r2 = sp_mix(t2, t1, t3);
+                    r3 = sp_mix(t3, t2, t4);
+                    r4 = sp_mix(t4, t3, t5);
+                    r5 = sp_mix(t5, t4, t6);
+                    r6 = sp_mix(t6, t5, t7);
+                    r7 = sp_mix(t7, t6, t0);
+
                     if (use_dilated_) {
                         auto dilated_add = [&](__m256& acc, __m256 curr, __m256 prev, __m256 next) {
                             __m256 dp_res = _mm256_mul_ps(curr, w_dp1);
@@ -651,27 +647,22 @@ private:
                             dp_res = _mm256_fmadd_ps(next, w_dp2, dp_res);
                             acc = _mm256_add_ps(acc, dp_res);
                         };
-
-                        dilated_add(r0, t0, t7, t1); // Wrap r7->r0
+                        dilated_add(r0, t0, t7, t1);
                         dilated_add(r1, t1, t0, t2);
                         dilated_add(r2, t2, t1, t3);
                         dilated_add(r3, t3, t2, t4);
                         dilated_add(r4, t4, t3, t5);
                         dilated_add(r5, t5, t4, t6);
                         dilated_add(r6, t6, t5, t7);
-                        dilated_add(r7, t7, t6, t0); // Wrap r0->r7
+                        dilated_add(r7, t7, t6, t0);
                     }
 
-                    // 5. IFWHT (Same as FWHT + Normalize)
-                    // Intra
                     fwht8_avx2(r0); fwht8_avx2(r1); fwht8_avx2(r2); fwht8_avx2(r3);
                     fwht8_avx2(r4); fwht8_avx2(r5); fwht8_avx2(r6); fwht8_avx2(r7);
-                    // Inter
                     Ops::butterfly(r0, r1); Ops::butterfly(r2, r3); Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
                     Ops::butterfly(r0, r2); Ops::butterfly(r1, r3); Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
                     Ops::butterfly(r0, r4); Ops::butterfly(r1, r5); Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
 
-                    // Normalize
                     r0 = _mm256_mul_ps(r0, norm);
                     r1 = _mm256_mul_ps(r1, norm);
                     r2 = _mm256_mul_ps(r2, norm);
@@ -681,7 +672,6 @@ private:
                     r6 = _mm256_mul_ps(r6, norm);
                     r7 = _mm256_mul_ps(r7, norm);
 
-                    // 6. BIAS + ReLU
                     auto bias_relu = [&](__m256& r, __m256 b) {
                         r = _mm256_add_ps(r, b);
                         r = _mm256_max_ps(r, zero);
@@ -695,7 +685,6 @@ private:
                     bias_relu(r6, bias_r6);
                     bias_relu(r7, bias_r7);
 
-                    // 7. STORE
                     _mm256_storeu_ps(out_ptr + out_idx + 0, r0);
                     _mm256_storeu_ps(out_ptr + out_idx + 8, r1);
                     _mm256_storeu_ps(out_ptr + out_idx + 16, r2);
@@ -717,7 +706,7 @@ private:
     bool use_ifwht_;
     bool use_dilated_;
     bool use_gating_;
-    size_t stride_; // Added stride support
+    size_t stride_;
 
     Tensor<T> packed_weights_;
     Tensor<T> spectral_scales_;
