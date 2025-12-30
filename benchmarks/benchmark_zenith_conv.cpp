@@ -12,13 +12,10 @@
 #include "../include/dreidel/layers/Dense.hpp"
 #include "../include/dreidel/layers/Conv2D.hpp"
 #include "../include/dreidel/layers/ZenithBlock.hpp"
-#include "../include/dreidel/layers/Quantization.hpp" // Pack/Unpack
-#include "../include/dreidel/layers/QuantizedStandard.hpp" // QPool, QUpscale, QDense
 
 using namespace dreidel;
 
 // Helpers: We only need standard float layers for the Conv model now.
-// For Zenith model, we use QuantizedStandard.hpp layers.
 
 template <typename T>
 class AvgPool2D : public layers::Layer<T> {
@@ -141,28 +138,54 @@ void generate_wavelet_images(Tensor<T>& data) {
 void run_benchmark_for_channel(size_t C) {
     size_t batch_size = 8;
     size_t H = 64, W = 64;
-    size_t latent_dim = 64; // Unused for dense, but maybe useful context
     size_t loops = 10;
 
     std::cout << "\n--------------------------------------------------" << std::endl;
     std::cout << "Benchmarking Channel Count C=" << C << std::endl;
 
-    // --- Zenith Model (Int8 Chain - No Dense) ---
-    // In(F) -> Pack -> Z1 -> QPool -> Z2 -> Z3 (Bottleneck) -> QUpscale -> Z4 -> Unpack(Out)
-    size_t arena_size = 4 * 1024 * 1024;
+    // Data
+    Tensor<float> input({batch_size, H, W, C});
+    generate_wavelet_images(input);
 
-    layers::PackAPoT pack;
-    layers::UnpackAPoT unpack;
+    // --- Zenith Model Configurations ---
+    auto run_zenith = [&](const std::string& name, bool ifwht, bool dilated) {
+        layers::ZenithBlock<float> z1(C, 3, C, ifwht, dilated);
+        AvgPool2D<float> pool(2);
+        layers::ZenithBlock<float> z2(C, 3, C, ifwht, dilated);
+        layers::ZenithBlock<float> z3(C, 3, C, ifwht, dilated);
+        Upscale2D<float> upscale(2);
+        layers::ZenithBlock<float> z4(C, 3, C, ifwht, dilated);
 
-    layers::ZenithBlock z1(C, 3, C, arena_size);
-    layers::QuantizedAvgPool2D qpool(2); // Outputs Int8
-    layers::ZenithBlock z2(C, 3, C, arena_size);
-    layers::ZenithBlock z3(C, 3, C, arena_size); // Replaces dense bottleneck logic
-    layers::QuantizedUpscale2D qupscale(2);
-    layers::ZenithBlock z4(C, 3, C, arena_size);
+        // Warmup
+        {
+            auto t1 = z1.forward(input);
+            auto t2 = pool.forward(t1);
+            auto t3 = z2.forward(t2);
+            auto t4 = z3.forward(t3);
+            auto t5 = upscale.forward(t4);
+            auto t6 = z4.forward(t5);
+        }
 
-    // --- Conv Model (Standard Sequential Float - No Dense) ---
-    // C1 -> Pool -> C2 -> C3 -> Upscale -> C4
+        auto start = std::chrono::high_resolution_clock::now();
+        for(size_t i=0; i<loops; ++i) {
+            auto t1 = z1.forward(input);
+            auto t2 = pool.forward(t1);
+            auto t3 = z2.forward(t2);
+            auto t4 = z3.forward(t3);
+            auto t5 = upscale.forward(t4);
+            auto t6 = z4.forward(t5);
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        double time = std::chrono::duration<double>(end - start).count();
+        std::cout << name << " Time: " << time << " s" << std::endl;
+        return time;
+    };
+
+    double t_base = run_zenith("Zenith (Base)", false, false);
+    double t_ifwht = run_zenith("Zenith (+IFWHT)", true, false);
+    double t_full = run_zenith("Zenith (+IFWHT+Dilated)", true, true);
+
+    // --- Conv Model ---
     layers::Conv2D<float> c1(C, C, 3, 1, 1);
     layers::Conv2D<float> c2(C, C, 3, 1, 1);
     layers::Conv2D<float> c3(C, C, 3, 1, 1);
@@ -171,38 +194,6 @@ void run_benchmark_for_channel(size_t C) {
     AvgPool2D<float> pool_f(2);
     Upscale2D<float> upscale_f(2);
 
-    // Data
-    Tensor<float> input({batch_size, H, W, C});
-    generate_wavelet_images(input);
-
-    // Warmup Zenith
-    {
-        auto t0 = pack.forward(input);
-        auto t1 = z1.forward(t0);
-        auto t2 = qpool.forward(t1);
-        auto t3 = z2.forward(t2);
-        auto t4 = z3.forward(t3);
-        auto t5 = qupscale.forward(t4);
-        auto t6 = z4.forward(t5);
-        auto out = unpack.forward(t6);
-    }
-
-    // Benchmark Zenith
-    auto start_z = std::chrono::high_resolution_clock::now();
-    for(size_t i=0; i<loops; ++i) {
-        auto t0 = pack.forward(input);
-        auto t1 = z1.forward(t0);
-        auto t2 = qpool.forward(t1);
-        auto t3 = z2.forward(t2);
-        auto t4 = z3.forward(t3);
-        auto t5 = qupscale.forward(t4);
-        auto t6 = z4.forward(t5);
-        auto out = unpack.forward(t6);
-    }
-    auto end_z = std::chrono::high_resolution_clock::now();
-    double time_z = std::chrono::duration<double>(end_z - start_z).count();
-
-    // Benchmark Conv
     auto start_c = std::chrono::high_resolution_clock::now();
     for(size_t i=0; i<loops; ++i) {
         auto t1 = c1.forward(input);
@@ -215,13 +206,12 @@ void run_benchmark_for_channel(size_t C) {
     auto end_c = std::chrono::high_resolution_clock::now();
     double time_c = std::chrono::duration<double>(end_c - start_c).count();
 
-    std::cout << "Zenith Time: " << time_z << " s" << std::endl;
     std::cout << "Conv2D Time: " << time_c << " s" << std::endl;
-    std::cout << "Speedup: " << time_c / time_z << "x" << std::endl;
+    std::cout << "Speedup (Full vs Conv): " << time_c / t_full << "x" << std::endl;
 }
 
 int main() {
-    std::cout << "=== ZenithBlock (Strict APoT Chain) vs Conv2D Benchmark (No Dense) ===" << std::endl;
+    std::cout << "=== ZenithBlock (Float) vs Conv2D Benchmark ===" << std::endl;
     std::vector<size_t> channels_list = {16, 64, 128};
     for(size_t C : channels_list) {
         run_benchmark_for_channel(C);
