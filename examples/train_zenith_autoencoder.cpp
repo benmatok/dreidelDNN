@@ -113,7 +113,7 @@ int main() {
     // Config
     size_t batch_size = 8;
     size_t H = 64, W = 64;
-    size_t epochs = 10;
+    size_t epochs = 1000;
     float lr = 0.001f;
 
     std::vector<layers::Layer<float>*> model;
@@ -186,8 +186,8 @@ int main() {
         // Update
         optimizer.step();
 
-        if (epoch % 1 == 0) {
-            std::cout << "Epoch " << std::setw(3) << epoch << " | Loss: " << loss << std::endl;
+        if (epoch % 50 == 0 || epoch == epochs - 1) {
+            std::cout << "Epoch " << std::setw(4) << epoch << " | Loss: " << loss << std::endl;
         }
     }
 
