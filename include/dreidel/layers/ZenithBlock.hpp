@@ -2,6 +2,7 @@
 
 #include "Layer.hpp"
 #include "../core/Memory.hpp"
+#include "../core/Allocator.hpp"
 #include "../hal/ops.hpp"
 #include "../algo/WHT.hpp"
 #include <vector>
@@ -151,8 +152,8 @@ public:
 
         #pragma omp parallel
         {
-            std::vector<T> buf_in(in_channels_);
-            std::vector<T> buf_out(out_channels_);
+            std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_);
+            std::vector<T, core::AlignedAllocator<T>> buf_out(out_channels_);
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
@@ -300,14 +301,14 @@ public:
             std::vector<T> t_grad_dp(3, 0);
             std::vector<T> t_grad_scale(in_channels_, 0);
             std::vector<T> t_grad_bias(out_channels_, 0);
-            std::vector<T> t_grad_eyes(in_channels_);
+            std::vector<T, core::AlignedAllocator<T>> t_grad_eyes(in_channels_);
             std::vector<T> t_grad_packed_weights(in_channels_ * kernel_size_ * kernel_size_, 0);
 
-            std::vector<T> buf_in(in_channels_), buf_scaled(in_channels_);
-            std::vector<T> dL_dPerm(out_channels_); // Gradient coming from IFWHT
+            std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_scaled(in_channels_);
+            std::vector<T, core::AlignedAllocator<T>> dL_dPerm(out_channels_); // Gradient coming from IFWHT
             std::vector<T> dL_dScaled(in_channels_); // Gradient w.r.t scaled input
-            std::vector<T> dL_dSpectral(in_channels_); // Gradient w.r.t FWHT output
-            std::vector<T> dL_dEyes(in_channels_);
+            std::vector<T, core::AlignedAllocator<T>> dL_dSpectral(in_channels_); // Gradient w.r.t FWHT output
+            std::vector<T, core::AlignedAllocator<T>> dL_dEyes(in_channels_);
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
