@@ -69,16 +69,13 @@ void generate_wavelet_images(Tensor<T>& data) {
 }
 
 void run_autoencoder_benchmark() {
-    // Requested Architecture:
-    // 64x64x1 -> 32x32x256 -> 16x16x128 -> 8x8x64 -> 1x1x64
-    // -> 8x8x64 -> 16x16x128 -> 32x32x256 -> 64x64x1
-
+    // Config: 64x64x1 -> 1x1x64 (Stride 4^3) -> 64x64x1
     size_t batch_size = 4;
     size_t H_in = 64, W_in = 64, C_in = 1;
-    size_t loops = 2;
+    size_t loops = 5;
 
-    std::cout << "=== Autoencoder Benchmark: Zenith vs Conv2D ===" << std::endl;
-    std::cout << "Architecture: 64x64x1 -> 32x32x256 -> 16x16x128 -> 8x8x64 -> 1x1x64 -> 8x8x64 -> 16x16x128 -> 32x32x256 -> 64x64x1" << std::endl;
+    std::cout << "=== Autoencoder Benchmark: Zenith vs Conv2D (6 Layers) ===" << std::endl;
+    std::cout << "Architecture: 64x64x1 -> 16x16x128 -> 4x4x128 -> 1x1x64 -> 4x4x128 -> 16x16x128 -> 64x64x1" << std::endl;
     std::cout << "Batch: " << batch_size << ", Loops: " << loops << std::endl;
 
     Tensor<float> input({batch_size, H_in, W_in, C_in});
@@ -87,47 +84,30 @@ void run_autoencoder_benchmark() {
     // --- 1. Zenith Autoencoder ---
 
     // Encoder
-    // 64x64x1 -> 32x32x256 (Stride 2)
-    layers::ZenithBlock<float> z_e1(1, 256, 3, 256, true, true, false, 2);
-    // 32x32x256 -> 16x16x128 (Stride 2)
-    layers::ZenithBlock<float> z_e2(256, 128, 3, 256, true, true, false, 2);
-    // 16x16x128 -> 8x8x64 (Stride 2)
-    layers::ZenithBlock<float> z_e3(128, 64, 3, 128, true, true, false, 2);
-    // 8x8x64 -> 1x1x64 (Stride 8)
-    layers::ZenithBlock<float> z_e4(64, 64, 3, 64, true, true, false, 8);
+    layers::ZenithBlock<float> z_e1(1, 128, 3, 128, true, true, false, 4);
+    layers::ZenithBlock<float> z_e2(128, 128, 3, 128, true, true, false, 4);
+    layers::ZenithBlock<float> z_e3(128, 64, 3, 128, true, true, false, 4);
 
     // Decoder
-    // 1x1x64 -> 8x8x64 (Upscale 8)
-    Upscale2D<float> z_up1(8);
-    layers::ZenithBlock<float> z_d1(64, 64, 3, 64, true, true, false, 1);
-
-    // 8x8x64 -> 16x16x128 (Upscale 2)
-    Upscale2D<float> z_up2(2);
-    layers::ZenithBlock<float> z_d2(64, 128, 3, 128, true, true, false, 1);
-
-    // 16x16x128 -> 32x32x256 (Upscale 2)
-    Upscale2D<float> z_up3(2);
-    layers::ZenithBlock<float> z_d3(128, 256, 3, 256, true, true, false, 1);
-
-    // 32x32x256 -> 64x64x1 (Upscale 2)
-    Upscale2D<float> z_up4(2);
-    layers::ZenithBlock<float> z_d4(256, 1, 3, 256, true, true, false, 1);
+    Upscale2D<float> z_up1(4);
+    layers::ZenithBlock<float> z_d1(64, 128, 3, 128, true, true, false, 1);
+    Upscale2D<float> z_up2(4);
+    layers::ZenithBlock<float> z_d2(128, 128, 3, 128, true, true, false, 1);
+    Upscale2D<float> z_up3(4);
+    layers::ZenithBlock<float> z_d3(128, 1, 3, 128, true, true, false, 1);
 
     // Warmup Zenith
     {
         auto t1 = z_e1.forward(input);
         auto t2 = z_e2.forward(t1);
-        auto t3 = z_e3.forward(t2);
-        auto t4 = z_e4.forward(t3); // Bottleneck 1x1x64
+        auto t3 = z_e3.forward(t2); // Bottleneck 1x1x64
 
-        auto d1 = z_up1.forward(t4);
+        auto d1 = z_up1.forward(t3);
         auto d2 = z_d1.forward(d1);
         auto d3 = z_up2.forward(d2);
         auto d4 = z_d2.forward(d3);
         auto d5 = z_up3.forward(d4);
-        auto d6 = z_d3.forward(d5);
-        auto d7 = z_up4.forward(d6);
-        auto out = z_d4.forward(d7);
+        auto out = z_d3.forward(d5);
     }
 
     auto start_z = std::chrono::high_resolution_clock::now();
@@ -135,52 +115,42 @@ void run_autoencoder_benchmark() {
         auto t1 = z_e1.forward(input);
         auto t2 = z_e2.forward(t1);
         auto t3 = z_e3.forward(t2);
-        auto t4 = z_e4.forward(t3);
 
-        auto d1 = z_up1.forward(t4);
+        auto d1 = z_up1.forward(t3);
         auto d2 = z_d1.forward(d1);
         auto d3 = z_up2.forward(d2);
         auto d4 = z_d2.forward(d3);
         auto d5 = z_up3.forward(d4);
-        auto d6 = z_d3.forward(d5);
-        auto d7 = z_up4.forward(d6);
-        auto out = z_d4.forward(d7);
+        auto out = z_d3.forward(d5);
     }
     auto end_z = std::chrono::high_resolution_clock::now();
     double time_z = std::chrono::duration<double>(end_z - start_z).count();
 
 
     // --- 2. Conv2D Autoencoder ---
-    layers::Conv2D<float> c_e1(1, 256, 3, 2, 1);
-    layers::Conv2D<float> c_e2(256, 128, 3, 2, 1);
-    layers::Conv2D<float> c_e3(128, 64, 3, 2, 1);
-    layers::Conv2D<float> c_e4(64, 64, 3, 8, 1); // Stride 8 needs proper padding in naive conv?
-    // Naive Conv2D logic: (H+2p-k)/s + 1. (8+2-3)/8 + 1 = 7/8 + 1 = 1. Matches.
+    layers::Conv2D<float> c_e1(1, 128, 3, 4, 1);
+    layers::Conv2D<float> c_e2(128, 128, 3, 4, 1);
+    layers::Conv2D<float> c_e3(128, 64, 3, 4, 1);
 
-    Upscale2D<float> c_up1(8);
-    layers::Conv2D<float> c_d1(64, 64, 3, 1, 1);
-    Upscale2D<float> c_up2(2);
-    layers::Conv2D<float> c_d2(64, 128, 3, 1, 1);
-    Upscale2D<float> c_up3(2);
-    layers::Conv2D<float> c_d3(128, 256, 3, 1, 1);
-    Upscale2D<float> c_up4(2);
-    layers::Conv2D<float> c_d4(256, 1, 3, 1, 1);
+    Upscale2D<float> c_up1(4);
+    layers::Conv2D<float> c_d1(64, 128, 3, 1, 1);
+    Upscale2D<float> c_up2(4);
+    layers::Conv2D<float> c_d2(128, 128, 3, 1, 1);
+    Upscale2D<float> c_up3(4);
+    layers::Conv2D<float> c_d3(128, 1, 3, 1, 1);
 
     // Warmup Conv
     {
         auto t1 = c_e1.forward(input);
         auto t2 = c_e2.forward(t1);
         auto t3 = c_e3.forward(t2);
-        auto t4 = c_e4.forward(t3);
 
-        auto d1 = c_up1.forward(t4);
+        auto d1 = c_up1.forward(t3);
         auto d2 = c_d1.forward(d1);
         auto d3 = c_up2.forward(d2);
         auto d4 = c_d2.forward(d3);
         auto d5 = c_up3.forward(d4);
-        auto d6 = c_d3.forward(d5);
-        auto d7 = c_up4.forward(d6);
-        auto out = c_d4.forward(d7);
+        auto out = c_d3.forward(d5);
     }
 
     auto start_c = std::chrono::high_resolution_clock::now();
@@ -188,16 +158,13 @@ void run_autoencoder_benchmark() {
         auto t1 = c_e1.forward(input);
         auto t2 = c_e2.forward(t1);
         auto t3 = c_e3.forward(t2);
-        auto t4 = c_e4.forward(t3);
 
-        auto d1 = c_up1.forward(t4);
+        auto d1 = c_up1.forward(t3);
         auto d2 = c_d1.forward(d1);
         auto d3 = c_up2.forward(d2);
         auto d4 = c_d2.forward(d3);
         auto d5 = c_up3.forward(d4);
-        auto d6 = c_d3.forward(d5);
-        auto d7 = c_up4.forward(d6);
-        auto out = c_d4.forward(d7);
+        auto out = c_d3.forward(d5);
     }
     auto end_c = std::chrono::high_resolution_clock::now();
     double time_c = std::chrono::duration<double>(end_c - start_c).count();

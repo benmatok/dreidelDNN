@@ -108,7 +108,7 @@ void generate_wavelet_batch(Tensor<T>& data) {
 }
 
 int main() {
-    std::cout << "=== Training Zenith Autoencoder on Wavelets ===" << std::endl;
+    std::cout << "=== Training Zenith Autoencoder (6 Layers) on Wavelets ===" << std::endl;
 
     // Config
     size_t batch_size = 8;
@@ -118,21 +118,26 @@ int main() {
 
     std::vector<layers::Layer<float>*> model;
 
-    // Encoder
-    model.push_back(new layers::ZenithBlock<float>(1, 256, 3, 256, true, true, false, 2));
-    model.push_back(new layers::ZenithBlock<float>(256, 128, 3, 256, true, true, false, 2));
-    model.push_back(new layers::ZenithBlock<float>(128, 64, 3, 128, true, true, false, 2));
-    model.push_back(new layers::ZenithBlock<float>(64, 64, 3, 64, true, true, false, 8));
+    // Encoder (64x64x1 -> 1x1x64) in 3 steps
+    // 1. 64x64x1 -> 16x16x128 (Stride 4)
+    model.push_back(new layers::ZenithBlock<float>(1, 128, 3, 128, true, true, false, 4));
+    // 2. 16x16x128 -> 4x4x128 (Stride 4)
+    model.push_back(new layers::ZenithBlock<float>(128, 128, 3, 128, true, true, false, 4));
+    // 3. 4x4x128 -> 1x1x64 (Stride 4)
+    model.push_back(new layers::ZenithBlock<float>(128, 64, 3, 128, true, true, false, 4));
 
-    // Decoder
-    model.push_back(new Upscale2D<float>(8));
-    model.push_back(new layers::ZenithBlock<float>(64, 64, 3, 64, true, true, false, 1));
-    model.push_back(new Upscale2D<float>(2));
+    // Decoder (1x1x64 -> 64x64x1) in 3 steps
+    // 1. 1x1x64 -> 4x4x128 (Upscale 4)
+    model.push_back(new Upscale2D<float>(4));
     model.push_back(new layers::ZenithBlock<float>(64, 128, 3, 128, true, true, false, 1));
-    model.push_back(new Upscale2D<float>(2));
-    model.push_back(new layers::ZenithBlock<float>(128, 256, 3, 256, true, true, false, 1));
-    model.push_back(new Upscale2D<float>(2));
-    model.push_back(new layers::ZenithBlock<float>(256, 1, 3, 256, true, true, false, 1));
+
+    // 2. 4x4x128 -> 16x16x128 (Upscale 4)
+    model.push_back(new Upscale2D<float>(4));
+    model.push_back(new layers::ZenithBlock<float>(128, 128, 3, 128, true, true, false, 1));
+
+    // 3. 16x16x128 -> 64x64x1 (Upscale 4)
+    model.push_back(new Upscale2D<float>(4));
+    model.push_back(new layers::ZenithBlock<float>(128, 1, 3, 128, true, true, false, 1));
 
     // Optimizer
     optim::SGD<float> optimizer(lr);
