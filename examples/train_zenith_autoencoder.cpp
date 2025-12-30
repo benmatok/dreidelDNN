@@ -113,7 +113,7 @@ int main() {
     // Config
     size_t batch_size = 8;
     size_t H = 64, W = 64;
-    size_t epochs = 1000;
+    size_t epochs = 500;
     float lr = 0.001f;
 
     std::vector<layers::Layer<float>*> model;
