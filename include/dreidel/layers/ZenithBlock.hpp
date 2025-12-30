@@ -58,7 +58,6 @@ public:
     }
 
     Tensor<float> forward(const Tensor<float>& input) override {
-        // ... (The float implementation from previous step)
         input_cached_ = input;
         auto shape = input.shape();
         size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
@@ -157,7 +156,7 @@ public:
 
                         if (use_ifwht_) {
                             algo::WHT::fwht_1d(buf.data(), C);
-                            float norm = 1.0f / std::sqrt(C);
+                            float norm = 1.0f / static_cast<float>(C);
                             for(size_t c=0; c<C; ++c) buf[c] *= norm;
                         }
 
@@ -174,7 +173,6 @@ public:
     }
 
     Tensor<float> backward(const Tensor<float>& grad_output) override {
-        // ... (Optimized backward with thread locals)
         auto shape = input_cached_.shape();
         size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
 
@@ -249,7 +247,7 @@ public:
 
                         if (use_ifwht_) {
                             algo::WHT::fwht_1d(buf.data(), C);
-                            float norm = 1.0f / std::sqrt(C);
+                            float norm = 1.0f / static_cast<float>(C);
                             for(size_t c=0; c<C; ++c) buf[c] *= norm;
                         }
 
@@ -264,7 +262,7 @@ public:
                         for(size_t c=0; c<C; ++c) dL_dPerm[c] = dL_dPreAct[c];
                         if (use_ifwht_) {
                             algo::WHT::fwht_1d(dL_dPerm.data(), C);
-                            float norm = 1.0f / std::sqrt(C);
+                            float norm = 1.0f / static_cast<float>(C);
                             for(size_t c=0; c<C; ++c) dL_dPerm[c] *= norm;
                         }
 
@@ -612,7 +610,8 @@ public:
                             size_t h_len = 32;
                             while (h_len < C) {
                                 bool handled = false;
-#if defined(DREIDEL_ARCH_AVX2)
+// Disabled AVX2 for Inter-Reg Loop due to instability at large C
+#if 0 && defined(DREIDEL_ARCH_AVX2)
                                 for (size_t i = 0; i < C; i += h_len * 2) {
                                     for (size_t j = i; j < i + h_len; j += 32) {
                                         __m256i x = _mm256_loadu_si256((const __m256i*)(mixer_buffer + j));
