@@ -68,15 +68,27 @@ void generate_wavelet_images(Tensor<T>& data) {
     }
 }
 
-void run_autoencoder_benchmark() {
-    // Config: 64x64x1 -> 1x1x64 (Stride 4^3) -> 64x64x1
+void run_autoencoder_benchmark(size_t base_channels) {
+    // Config: 64x64x1 -> ... bottleneck ... -> 64x64x1
     size_t batch_size = 4;
     size_t H_in = 64, W_in = 64, C_in = 1;
     size_t loops = 5;
 
-    std::cout << "=== Autoencoder Benchmark: Zenith vs Conv2D (6 Layers) ===" << std::endl;
-    std::cout << "Architecture: 64x64x1 -> 16x16x128 -> 4x4x128 -> 1x1x64 -> 4x4x128 -> 16x16x128 -> 64x64x1" << std::endl;
-    std::cout << "Batch: " << batch_size << ", Loops: " << loops << std::endl;
+    // Scale architecture based on base_channels
+    // Original was C=128 for base_channels=128.
+    // We will scale relative to that or just use base_channels as the main width.
+    // Architecture: C_in -> C -> C/2 -> C/2 -> C -> C -> C_in
+    // We want to ensure divisibility. Let's enforce power of 2 channels.
+    // E.g. 128 -> 128 -> 64. 64 -> 64 -> 32. 32 -> 32 -> 16.
+
+    size_t C1 = base_channels;
+    size_t C2 = base_channels / 2;
+    // Ensure C2 is at least something reasonable, e.g. 4.
+    if (C2 < 4) C2 = 4;
+
+    std::cout << "\n--------------------------------------------------" << std::endl;
+    std::cout << "Benchmarking Autoencoder with Base Channel C=" << base_channels << std::endl;
+    std::cout << "Architecture: 64x64x1 -> 16x16x" << C1 << " -> 4x4x" << C1 << " -> 1x1x" << C2 << " -> 4x4x" << C1 << " -> 16x16x" << C1 << " -> 64x64x1" << std::endl;
 
     Tensor<float> input({batch_size, H_in, W_in, C_in});
     generate_wavelet_images(input);
@@ -84,23 +96,24 @@ void run_autoencoder_benchmark() {
     // --- 1. Zenith Autoencoder ---
 
     // Encoder
-    layers::ZenithBlock<float> z_e1(1, 128, 3, 128, true, true, false, 4);
-    layers::ZenithBlock<float> z_e2(128, 128, 3, 128, true, true, false, 4);
-    layers::ZenithBlock<float> z_e3(128, 64, 3, 128, true, true, false, 4);
+    // ZenithBlock: in, out, kernel, spectral_dim, ifwht, dilated, gating, stride
+    layers::ZenithBlock<float> z_e1(1, C1, 3, C1, true, true, false, 4);
+    layers::ZenithBlock<float> z_e2(C1, C1, 3, C1, true, true, false, 4);
+    layers::ZenithBlock<float> z_e3(C1, C2, 3, C1, true, true, false, 4); // Bottleneck
 
     // Decoder
     Upscale2D<float> z_up1(4);
-    layers::ZenithBlock<float> z_d1(64, 128, 3, 128, true, true, false, 1);
+    layers::ZenithBlock<float> z_d1(C2, C1, 3, C1, true, true, false, 1);
     Upscale2D<float> z_up2(4);
-    layers::ZenithBlock<float> z_d2(128, 128, 3, 128, true, true, false, 1);
+    layers::ZenithBlock<float> z_d2(C1, C1, 3, C1, true, true, false, 1);
     Upscale2D<float> z_up3(4);
-    layers::ZenithBlock<float> z_d3(128, 1, 3, 128, true, true, false, 1);
+    layers::ZenithBlock<float> z_d3(C1, 1, 3, C1, true, true, false, 1);
 
     // Warmup Zenith
     {
         auto t1 = z_e1.forward(input);
         auto t2 = z_e2.forward(t1);
-        auto t3 = z_e3.forward(t2); // Bottleneck 1x1x64
+        auto t3 = z_e3.forward(t2);
 
         auto d1 = z_up1.forward(t3);
         auto d2 = z_d1.forward(d1);
@@ -128,16 +141,16 @@ void run_autoencoder_benchmark() {
 
 
     // --- 2. Conv2D Autoencoder ---
-    layers::Conv2D<float> c_e1(1, 128, 3, 4, 1);
-    layers::Conv2D<float> c_e2(128, 128, 3, 4, 1);
-    layers::Conv2D<float> c_e3(128, 64, 3, 4, 1);
+    layers::Conv2D<float> c_e1(1, C1, 3, 4, 1);
+    layers::Conv2D<float> c_e2(C1, C1, 3, 4, 1);
+    layers::Conv2D<float> c_e3(C1, C2, 3, 4, 1);
 
     Upscale2D<float> c_up1(4);
-    layers::Conv2D<float> c_d1(64, 128, 3, 1, 1);
+    layers::Conv2D<float> c_d1(C2, C1, 3, 1, 1);
     Upscale2D<float> c_up2(4);
-    layers::Conv2D<float> c_d2(128, 128, 3, 1, 1);
+    layers::Conv2D<float> c_d2(C1, C1, 3, 1, 1);
     Upscale2D<float> c_up3(4);
-    layers::Conv2D<float> c_d3(128, 1, 3, 1, 1);
+    layers::Conv2D<float> c_d3(C1, 1, 3, 1, 1);
 
     // Warmup Conv
     {
@@ -170,16 +183,16 @@ void run_autoencoder_benchmark() {
     double time_c = std::chrono::duration<double>(end_c - start_c).count();
 
     // --- Report ---
-    std::cout << "\nResults:" << std::endl;
-    std::cout << std::left << std::setw(20) << "Model" << "Time (s)" << std::endl;
-    std::cout << std::string(30, '-') << std::endl;
-    std::cout << std::left << std::setw(20) << "Zenith AE" << time_z << std::endl;
-    std::cout << std::left << std::setw(20) << "Conv2D AE" << time_c << std::endl;
-    std::cout << std::string(30, '-') << std::endl;
+    std::cout << std::left << std::setw(20) << "Zenith AE Time:" << time_z << " s" << std::endl;
+    std::cout << std::left << std::setw(20) << "Conv2D AE Time:" << time_c << " s" << std::endl;
     std::cout << "Speedup: " << time_c / time_z << "x" << std::endl;
 }
 
 int main() {
-    run_autoencoder_benchmark();
+    std::cout << "=== Autoencoder Benchmark: Zenith vs Conv2D ===" << std::endl;
+    std::vector<size_t> channels_list = {8, 16, 32, 64, 128};
+    for(size_t C : channels_list) {
+        run_autoencoder_benchmark(C);
+    }
     return 0;
 }
