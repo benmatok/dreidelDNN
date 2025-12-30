@@ -12,6 +12,18 @@
 #include <omp.h>
 #endif
 
+// Forward declare AVX2 helpers
+namespace dreidel {
+namespace hal {
+namespace x86 {
+    inline void fwht16_avx2(float* data);
+    inline void fwht32_avx2(float* data);
+    inline void fwht64_avx2(float* data);
+    inline void fwht128_avx2(float* data);
+}
+}
+}
+
 namespace dreidel {
 namespace algo {
 
@@ -20,6 +32,16 @@ public:
     // Single Vector FWHT Kernel (No OpenMP, for Fused Loops)
     template <typename T>
     static void fwht_1d(T* data, size_t N) {
+        // Dispatch to optimized register-resident kernels if available
+#ifdef DREIDEL_ARCH_AVX2
+        if constexpr (std::is_same_v<T, float>) {
+            if (N == 16) { hal::x86::fwht16_avx2(data); return; }
+            if (N == 32) { hal::x86::fwht32_avx2(data); return; }
+            if (N == 64) { hal::x86::fwht64_avx2(data); return; }
+            if (N == 128) { hal::x86::fwht128_avx2(data); return; }
+        }
+#endif
+
         using Ops = hal::ActiveOps;
 
         size_t len = 1;
