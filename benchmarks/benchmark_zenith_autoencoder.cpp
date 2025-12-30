@@ -85,20 +85,19 @@ void run_autoencoder_benchmark(size_t base_channels) {
     Tensor<float> input({batch_size, H_in, W_in, C_in});
     generate_wavelet_images(input);
 
-    // --- 1. Zenith Autoencoder ---
+    // --- 1. Zenith Autoencoder (Implicit Upscale) ---
 
     // Encoder
     layers::ZenithBlock<float> z_e1(1, C1, 3, C1, true, true, false, 4);
     layers::ZenithBlock<float> z_e2(C1, C1, 3, C1, true, true, false, 4);
     layers::ZenithBlock<float> z_e3(C1, C2, 3, C1, true, true, false, 4); // Bottleneck
 
-    // Decoder
-    Upscale2D<float> z_up1(4);
-    layers::ZenithBlock<float> z_d1(C2, C1, 3, C1, true, true, false, 1);
-    Upscale2D<float> z_up2(4);
-    layers::ZenithBlock<float> z_d2(C1, C1, 3, C1, true, true, false, 1);
-    Upscale2D<float> z_up3(4);
-    layers::ZenithBlock<float> z_d3(C1, 1, 3, C1, true, true, false, 1);
+    // Decoder (Fused Upscale)
+    // Removed Upscale2D layers. Added upscale param to ZenithBlocks.
+    // Constructor: in, out, kernel, spectral, ifwht, dilated, gating, stride, upscale
+    layers::ZenithBlock<float> z_d1(C2, C1, 3, C1, true, true, false, 1, 4);
+    layers::ZenithBlock<float> z_d2(C1, C1, 3, C1, true, true, false, 1, 4);
+    layers::ZenithBlock<float> z_d3(C1, 1, 3, C1, true, true, false, 1, 4);
 
     // Warmup Zenith
     {
@@ -106,12 +105,9 @@ void run_autoencoder_benchmark(size_t base_channels) {
         auto t2 = z_e2.forward(t1);
         auto t3 = z_e3.forward(t2);
 
-        auto d1 = z_up1.forward(t3);
-        auto d2 = z_d1.forward(d1);
-        auto d3 = z_up2.forward(d2);
-        auto d4 = z_d2.forward(d3);
-        auto d5 = z_up3.forward(d4);
-        auto out = z_d3.forward(d5);
+        auto d1 = z_d1.forward(t3); // Implicit upscale 4x
+        auto d2 = z_d2.forward(d1); // Implicit upscale 4x
+        auto out = z_d3.forward(d2); // Implicit upscale 4x
     }
 
     auto start_z = std::chrono::high_resolution_clock::now();
@@ -120,18 +116,17 @@ void run_autoencoder_benchmark(size_t base_channels) {
         auto t2 = z_e2.forward(t1);
         auto t3 = z_e3.forward(t2);
 
-        auto d1 = z_up1.forward(t3);
-        auto d2 = z_d1.forward(d1);
-        auto d3 = z_up2.forward(d2);
-        auto d4 = z_d2.forward(d3);
-        auto d5 = z_up3.forward(d4);
-        auto out = z_d3.forward(d5);
+        auto d1 = z_d1.forward(t3);
+        auto d2 = z_d2.forward(d1);
+        auto out = z_d3.forward(d2);
     }
     auto end_z = std::chrono::high_resolution_clock::now();
     double time_z = std::chrono::duration<double>(end_z - start_z).count();
 
 
-    // --- 2. Conv2D Autoencoder ---
+    // --- 2. Conv2D Autoencoder (Explicit Upscale) ---
+    // Conv2D doesn't support implicit upscale in this framework, so we keep explicit layers.
+    // This is a fair comparison of "Optimized Zenith Architecture" vs "Standard Conv Architecture".
     layers::Conv2D<float> c_e1(1, C1, 3, 4, 1);
     layers::Conv2D<float> c_e2(C1, C1, 3, 4, 1);
     layers::Conv2D<float> c_e3(C1, C2, 3, 4, 1);
