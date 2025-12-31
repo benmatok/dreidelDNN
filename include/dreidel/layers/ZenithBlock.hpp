@@ -11,6 +11,7 @@
 #include <random>
 #include <iostream>
 #include <omp.h>
+#include <cassert>
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -24,35 +25,43 @@ template <typename T>
 class ZenithBlock : public Layer<T> {
 public:
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim,
-                bool use_ifwht = true, bool use_dilated = true, bool use_gating = false, size_t stride = 1, size_t upscale = 1)
+                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1)
         : in_channels_(in_channels), out_channels_(out_channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
-          use_ifwht_(use_ifwht), use_dilated_(use_dilated), use_gating_(use_gating), stride_(stride), upscale_(upscale),
+          use_ifwht_(use_ifwht), use_gating_(use_gating), stride_(stride), upscale_(upscale),
           packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           spectral_scales_({1, in_channels}),
-          soft_perm_weights_({1, 3}),
-          dilated_perm_weights_({1, 3}),
+          mixing_weights_({3, in_channels}),
           bias_({1, out_channels}),
           oracle_projection_({1, in_channels}),
 
           grad_packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           grad_spectral_scales_({1, in_channels}),
-          grad_soft_perm_weights_({1, 3}),
-          grad_dilated_perm_weights_({1, 3}),
+          grad_mixing_weights_({3, in_channels}),
           grad_bias_({1, out_channels}),
           grad_oracle_projection_({1, in_channels})
     {
+        // Enforce Power-of-Two for in_channels (required for FWHT)
+        if ((in_channels_ & (in_channels_ - 1)) != 0) {
+            throw std::invalid_argument("ZenithBlock in_channels must be a power of 2 for Spectral Mixing.");
+        }
+
         T stddev = std::sqrt(static_cast<T>(2.0) / (kernel_size * kernel_size));
         packed_weights_.random(0, stddev);
         spectral_scales_.fill(1.0);
-        soft_perm_weights_.fill(0); soft_perm_weights_.data()[1] = 1.0;
-        dilated_perm_weights_.fill(0);
+
+        // Initialize Mixing Weights: Center=1, Neighbors=0 (Identity Mixing)
+        mixing_weights_.fill(0);
+        T* mw = mixing_weights_.data();
+        // Layout: Row 0 (Left), Row 1 (Center), Row 2 (Right)
+        // Center row is at offset in_channels_
+        std::fill(mw + in_channels_, mw + 2 * in_channels_, 1.0f);
+
         bias_.fill(0);
         oracle_projection_.random(-1.0, 1.0);
 
         grad_packed_weights_.fill(0);
         grad_spectral_scales_.fill(0);
-        grad_soft_perm_weights_.fill(0);
-        grad_dilated_perm_weights_.fill(0);
+        grad_mixing_weights_.fill(0);
         grad_bias_.fill(0);
         grad_oracle_projection_.fill(0);
 
@@ -60,7 +69,7 @@ public:
     }
 
     ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim,
-                bool use_ifwht = true, bool use_dilated = true, bool use_gating = false)
+                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false)
         : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1) {}
 
 
@@ -113,8 +122,7 @@ public:
 
         const T* scale_ptr = spectral_scales_.data();
         const T* bias_ptr = bias_.data();
-        const T* sp_w = soft_perm_weights_.data();
-        const T* dp_w = dilated_perm_weights_.data();
+        const T* mix_w = mixing_weights_.data();
 
         bool is_downsample = (out_channels_ == in_channels_ / 2);
         bool is_upsample = (out_channels_ == in_channels_ * 2);
@@ -254,30 +262,28 @@ public:
         if constexpr (std::is_same_v<T, float>) {
              if (in_channels_ == out_channels_) {
                  if (in_channels_ == 32) {
-                     forward_avx2_c32_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
+                     forward_avx2_c32_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, mix_w, bias_ptr, active_mask);
                      mixer_done = true;
                  } else if (in_channels_ == 64) {
-                     forward_avx2_c64_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
+                     forward_avx2_c64_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, mix_w, bias_ptr, active_mask);
                      mixer_done = true;
                  } else if (in_channels_ == 128) {
-                     forward_avx2_c128_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
+                     forward_avx2_c128_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, mix_w, bias_ptr, active_mask);
                      mixer_done = true;
                  } else if (in_channels_ > 128 && in_channels_ % 8 == 0) {
-                     forward_avx2_generic_large_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask, in_channels_);
+                     forward_avx2_generic_large_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, mix_w, bias_ptr, active_mask, in_channels_);
                      mixer_done = true;
                  }
              }
              else if (in_channels_ == 64 && out_channels_ == 1) {
-                  forward_avx2_c64_to_1_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
+                  forward_avx2_c64_to_1_mixer(N, H_out, W_out, out_ptr, eyes_ptr, scale_ptr, mix_w, bias_ptr, active_mask);
                   mixer_done = true;
              }
         }
 #endif
 
         if (!mixer_done) {
-            // Fallback generic
-            int dilation_in = static_cast<int>(std::sqrt(in_channels_));
-            int dilation_out = static_cast<int>(std::sqrt(out_channels_));
+            // Fallback generic with Locally Connected Mixing
             #pragma omp parallel
             {
                 std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
@@ -297,26 +303,34 @@ public:
                             for(size_t c=0; c<in_channels_; ++c) buf_in[c] *= scale_ptr[c];
 
                             if (in_channels_ == out_channels_) {
+                                // Locally Connected Mixing with Zero Padding at Boundaries
+                                const T* w_L = mix_w;
+                                const T* w_C = mix_w + in_channels_;
+                                const T* w_R = mix_w + 2 * in_channels_;
+
+                                // Buffer copy to avoid modifying while reading neighbors
+                                // Or use buf_out as temp if in-place?
+                                // mixing is C->C. buf_out is destination.
+
                                 for(size_t c=0; c<in_channels_; ++c) {
-                                    size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
-                                    size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
-                                    T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[c] + sp_w[2] * buf_in[next];
-                                    if (use_dilated_) {
-                                        size_t prev_d = (c < (size_t)dilation_in) ? in_channels_ - dilation_in + c : c - dilation_in;
-                                        size_t next_d = (c + dilation_in >= in_channels_) ? c + dilation_in - in_channels_ : c + dilation_in;
-                                        val += dp_w[0] * buf_in[prev_d] + dp_w[1] * buf_in[c] + dp_w[2] * buf_in[next_d];
-                                    }
+                                    T prev = (c == 0) ? 0 : buf_in[c - 1];
+                                    T next = (c == in_channels_ - 1) ? 0 : buf_in[c + 1];
+
+                                    T val = w_L[c] * prev + w_C[c] * buf_in[c] + w_R[c] * next;
                                     buf_out[c] = val;
                                 }
                             } else {
-                                // Downsample/Upscale fallback code (omitted for brevity, assume previous impl or handle in future)
-                                // Minimal fallback for non-matching channels
+                                // Fallback for non-matching channels
                                 std::fill(buf_out.begin(), buf_out.end(), 0);
                                 size_t min_c = std::min(in_channels_, out_channels_);
+                                const T* w_L = mix_w;
+                                const T* w_C = mix_w + in_channels_;
+                                const T* w_R = mix_w + 2 * in_channels_;
+
                                 for(size_t c=0; c<min_c; ++c) {
-                                    size_t prev = (c == 0) ? in_channels_ - 1 : c - 1;
-                                    size_t next = (c == in_channels_ - 1) ? 0 : c + 1;
-                                    T val = sp_w[0] * buf_in[prev] + sp_w[1] * buf_in[c] + sp_w[2] * buf_in[next];
+                                    T prev = (c == 0) ? 0 : buf_in[c - 1];
+                                    T next = (c == in_channels_ - 1) ? 0 : buf_in[c + 1];
+                                    T val = w_L[c] * prev + w_C[c] * buf_in[c] + w_R[c] * next;
                                     buf_out[c] = val;
                                 }
                             }
@@ -347,11 +361,11 @@ public:
     }
 
     std::vector<Tensor<T>*> parameters() override {
-        return {&packed_weights_, &spectral_scales_, &soft_perm_weights_, &dilated_perm_weights_, &bias_, &oracle_projection_};
+        return {&packed_weights_, &spectral_scales_, &mixing_weights_, &bias_, &oracle_projection_};
     }
 
     std::vector<Tensor<T>*> gradients() override {
-        return {&grad_packed_weights_, &grad_spectral_scales_, &grad_soft_perm_weights_, &grad_dilated_perm_weights_, &grad_bias_, &grad_oracle_projection_};
+        return {&grad_packed_weights_, &grad_spectral_scales_, &grad_mixing_weights_, &grad_bias_, &grad_oracle_projection_};
     }
 
     std::string name() const override { return "ZenithBlock"; }
@@ -475,13 +489,13 @@ private:
         }
     }
 
-    void forward_avx2_c32_mixer(size_t N, size_t H, size_t W, float* out_ptr, const float* eyes_ptr, const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr, const std::vector<bool>& active_mask) {
+    void forward_avx2_c32_mixer(size_t N, size_t H, size_t W, float* out_ptr, const float* eyes_ptr, const float* scale_ptr, const float* mix_w, const float* bias_ptr, const std::vector<bool>& active_mask) {
         using namespace dreidel::hal::x86;
-        __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0), w_sp1 = _mm256_broadcast_ss(sp_w + 1), w_sp2 = _mm256_broadcast_ss(sp_w + 2);
-        __m256 w_dp0 = _mm256_broadcast_ss(dp_w + 0), w_dp1 = _mm256_broadcast_ss(dp_w + 1), w_dp2 = _mm256_broadcast_ss(dp_w + 2);
-        __m256 bias[4], scale[4];
-        for(int i=0; i<4; ++i) bias[i] = _mm256_loadu_ps(bias_ptr + i*8);
-        for(int i=0; i<4; ++i) scale[i] = _mm256_loadu_ps(scale_ptr + i*8);
+        // Pointers to mixing weights: Row 0 (L), Row 1 (C), Row 2 (R)
+        const float* w_L = mix_w;
+        const float* w_C = mix_w + 32;
+        const float* w_R = mix_w + 64;
+
         __m256 norm = _mm256_set1_ps(1.0f/32.0f);
         __m256 zero = _mm256_setzero_ps();
 
@@ -500,92 +514,61 @@ private:
                     Ops::butterfly(r[0], r[1]); Ops::butterfly(r[2], r[3]);
                     Ops::butterfly(r[0], r[2]); Ops::butterfly(r[1], r[3]);
 
-                    for(int i=0; i<4; ++i) r[i] = _mm256_mul_ps(r[i], scale[i]);
+                    // Scale
+                    for(int i=0; i<4; ++i) {
+                        __m256 s = _mm256_loadu_ps(scale_ptr + i*8);
+                        r[i] = _mm256_mul_ps(r[i], s);
+                    }
 
+                    // Locally Connected Mixing
                     __m256 t[4]; for(int i=0; i<4; ++i) t[i] = r[i];
-                    auto mix = [&](__m256& curr, __m256 prev, __m256 next) {
+
+                    // Boundaries: r[0] prev is Zero. r[3] next is Zero.
+                    auto mix_ch = [&](int i, __m256 curr, __m256 prev, __m256 next) {
+                        __m256 wl = _mm256_load_ps(w_L + i*8);
+                        __m256 wc = _mm256_load_ps(w_C + i*8);
+                        __m256 wr = _mm256_load_ps(w_R + i*8);
+
                         __m256 p = shift_right_1(curr, prev);
                         __m256 n = shift_left_1(curr, next);
-                        __m256 res = _mm256_mul_ps(curr, w_sp1);
-                        res = _mm256_fmadd_ps(p, w_sp0, res);
-                        res = _mm256_fmadd_ps(n, w_sp2, res);
+                        __m256 res = _mm256_mul_ps(curr, wc);
+                        res = _mm256_fmadd_ps(p, wl, res);
+                        res = _mm256_fmadd_ps(n, wr, res);
                         return res;
                     };
-                    r[0] = mix(t[0], t[3], t[1]);
-                    r[1] = mix(t[1], t[0], t[2]);
-                    r[2] = mix(t[2], t[1], t[3]);
-                    r[3] = mix(t[3], t[2], t[0]);
 
-                    // Dilated C=32 -> sqrt(32) ~ 5. Not nice. Dilation in generic logic is "prev_d".
-                    // For register mixing, D=5 is hard (not power of 2).
-                    // Skip Dilated for C=32 in AVX reg (fallback to generic if dilated required? Or approximate?)
-                    // Current arch uses sqrt(C).
-                    // If we assume dilated is not critical for C=32 or we implement it using unaligned loads?
-                    // Let's implement generic dilated using masked permutes? Too complex.
-                    // For C=32, if we skip dilated, performance improves. Does quality suffer?
-                    // Let's rely on generic implementation for dilated if `use_dilated_`.
-                    // But wait, `forward` checks `use_dilated_` inside.
-                    // If I hardcode `use_dilated` as false here, it breaks correctness.
-                    // I will add `if (use_dilated_)` block.
-                    // Implementing D=5 shift in registers:
-                    // r0 indices [0..7]. prev_d for r0[0] is 0-5 = -5 = 27 -> r3[3].
-                    // This is irregular.
-                    // So C=32 register mixer should only be used if !use_dilated?
-                    // Or I implement a simple shuffle-based dilated.
-                    // Actually, for benchmark purpose, let's assume use_dilated is false or implemented.
-                    // The original c64 mixer implemented dilated because sqrt(64)=8 which is exactly 1 register shift!
-                    // That's why c64 was so clean.
-                    // sqrt(32) = 5.
-                    // sqrt(128) = 11.
-                    // Only 16, 64, 256 have power-of-2 roots (4, 8, 16).
-                    // So `DilatedPerm` in registers is only easy for 16, 64, 256.
-
-                    // For 32, I will skip dilated implementation here for brevity/speed in this step,
-                    // implying this kernel is used when dilated is disabled OR accepting approximation.
-                    // To be safe, I should only dispatch to this if (!use_dilated_).
+                    r[0] = mix_ch(0, t[0], zero, t[1]);
+                    r[1] = mix_ch(1, t[1], t[0], t[2]);
+                    r[2] = mix_ch(2, t[2], t[1], t[3]);
+                    r[3] = mix_ch(3, t[3], t[2], zero);
 
                     fwht8_avx2(r[0]); fwht8_avx2(r[1]); fwht8_avx2(r[2]); fwht8_avx2(r[3]);
                     Ops::butterfly(r[0], r[1]); Ops::butterfly(r[2], r[3]);
                     Ops::butterfly(r[0], r[2]); Ops::butterfly(r[1], r[3]);
 
                     for(int i=0; i<4; ++i) r[i] = _mm256_mul_ps(r[i], norm);
-                    for(int i=0; i<4; ++i) { r[i] = _mm256_add_ps(r[i], bias[i]); r[i] = _mm256_max_ps(r[i], zero); }
-                    for(int i=0; i<4; ++i) _mm256_storeu_ps(out_ptr + out_idx + i*8, r[i]);
+                    for(int i=0; i<4; ++i) {
+                        __m256 b = _mm256_loadu_ps(bias_ptr + i*8);
+                        r[i] = _mm256_add_ps(r[i], b);
+                        r[i] = _mm256_max_ps(r[i], zero);
+                        _mm256_storeu_ps(out_ptr + out_idx + i*8, r[i]);
+                    }
                 }
             }
         }
-
     }
 
     void forward_avx2_c64_mixer(
         size_t N, size_t H_out, size_t W_out,
         float* out_ptr, const float* eyes_ptr,
-        const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr,
+        const float* scale_ptr, const float* mix_w, const float* bias_ptr,
         const std::vector<bool>& active_mask
     ) {
         using namespace dreidel::hal::x86;
-        __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0);
-        __m256 w_sp1 = _mm256_broadcast_ss(sp_w + 1);
-        __m256 w_sp2 = _mm256_broadcast_ss(sp_w + 2);
-        __m256 w_dp0 = _mm256_broadcast_ss(dp_w + 0);
-        __m256 w_dp1 = _mm256_broadcast_ss(dp_w + 1);
-        __m256 w_dp2 = _mm256_broadcast_ss(dp_w + 2);
-        __m256 bias_r0 = _mm256_loadu_ps(bias_ptr + 0);
-        __m256 bias_r1 = _mm256_loadu_ps(bias_ptr + 8);
-        __m256 bias_r2 = _mm256_loadu_ps(bias_ptr + 16);
-        __m256 bias_r3 = _mm256_loadu_ps(bias_ptr + 24);
-        __m256 bias_r4 = _mm256_loadu_ps(bias_ptr + 32);
-        __m256 bias_r5 = _mm256_loadu_ps(bias_ptr + 40);
-        __m256 bias_r6 = _mm256_loadu_ps(bias_ptr + 48);
-        __m256 bias_r7 = _mm256_loadu_ps(bias_ptr + 56);
-        __m256 scale_r0 = _mm256_loadu_ps(scale_ptr + 0);
-        __m256 scale_r1 = _mm256_loadu_ps(scale_ptr + 8);
-        __m256 scale_r2 = _mm256_loadu_ps(scale_ptr + 16);
-        __m256 scale_r3 = _mm256_loadu_ps(scale_ptr + 24);
-        __m256 scale_r4 = _mm256_loadu_ps(scale_ptr + 32);
-        __m256 scale_r5 = _mm256_loadu_ps(scale_ptr + 40);
-        __m256 scale_r6 = _mm256_loadu_ps(scale_ptr + 48);
-        __m256 scale_r7 = _mm256_loadu_ps(scale_ptr + 56);
+        const float* w_L = mix_w;
+        const float* w_C = mix_w + 64;
+        const float* w_R = mix_w + 128;
+
         __m256 norm = _mm256_set1_ps(1.0f/64.0f);
         __m256 zero = _mm256_setzero_ps();
 
@@ -595,115 +578,68 @@ private:
                 for(size_t w=0; w<W_out; ++w) {
                     size_t out_idx = ((n*H_out + h)*W_out + w)*64;
                     if (!active_mask[n]) {
-                        _mm256_storeu_ps(out_ptr + out_idx + 0, zero);
-                        _mm256_storeu_ps(out_ptr + out_idx + 8, zero);
-                        _mm256_storeu_ps(out_ptr + out_idx + 16, zero);
-                        _mm256_storeu_ps(out_ptr + out_idx + 24, zero);
-                        _mm256_storeu_ps(out_ptr + out_idx + 32, zero);
-                        _mm256_storeu_ps(out_ptr + out_idx + 40, zero);
-                        _mm256_storeu_ps(out_ptr + out_idx + 48, zero);
-                        _mm256_storeu_ps(out_ptr + out_idx + 56, zero);
+                        for(int i=0; i<8; ++i) _mm256_storeu_ps(out_ptr + out_idx + i*8, zero);
                         continue;
                     }
                     size_t eyes_idx = ((n*H_out + h)*W_out + w)*64;
                     const float* ptr = eyes_ptr + eyes_idx;
-                    __m256 r0 = _mm256_loadu_ps(ptr + 0);
-                    __m256 r1 = _mm256_loadu_ps(ptr + 8);
-                    __m256 r2 = _mm256_loadu_ps(ptr + 16);
-                    __m256 r3 = _mm256_loadu_ps(ptr + 24);
-                    __m256 r4 = _mm256_loadu_ps(ptr + 32);
-                    __m256 r5 = _mm256_loadu_ps(ptr + 40);
-                    __m256 r6 = _mm256_loadu_ps(ptr + 48);
-                    __m256 r7 = _mm256_loadu_ps(ptr + 56);
-                    fwht8_avx2(r0); fwht8_avx2(r1); fwht8_avx2(r2); fwht8_avx2(r3);
-                    fwht8_avx2(r4); fwht8_avx2(r5); fwht8_avx2(r6); fwht8_avx2(r7);
-                    Ops::butterfly(r0, r1); Ops::butterfly(r2, r3); Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
-                    Ops::butterfly(r0, r2); Ops::butterfly(r1, r3); Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
-                    Ops::butterfly(r0, r4); Ops::butterfly(r1, r5); Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
-                    r0 = _mm256_mul_ps(r0, scale_r0);
-                    r1 = _mm256_mul_ps(r1, scale_r1);
-                    r2 = _mm256_mul_ps(r2, scale_r2);
-                    r3 = _mm256_mul_ps(r3, scale_r3);
-                    r4 = _mm256_mul_ps(r4, scale_r4);
-                    r5 = _mm256_mul_ps(r5, scale_r5);
-                    r6 = _mm256_mul_ps(r6, scale_r6);
-                    r7 = _mm256_mul_ps(r7, scale_r7);
-                    __m256 t0 = r0, t1 = r1, t2 = r2, t3 = r3, t4 = r4, t5 = r5, t6 = r6, t7 = r7;
-                    auto sp_mix = [&](__m256& curr, __m256 prev_reg, __m256 next_reg) {
-                        __m256 prev = shift_right_1(curr, prev_reg);
-                        __m256 next = shift_left_1(curr, next_reg);
-                        __m256 res = _mm256_mul_ps(curr, w_sp1);
-                        res = _mm256_fmadd_ps(prev, w_sp0, res);
-                        res = _mm256_fmadd_ps(next, w_sp2, res);
+
+                    __m256 r[8];
+                    for(int i=0; i<8; ++i) r[i] = _mm256_loadu_ps(ptr + i*8);
+
+                    fwht8_avx2(r[0]); fwht8_avx2(r[1]); fwht8_avx2(r[2]); fwht8_avx2(r[3]);
+                    fwht8_avx2(r[4]); fwht8_avx2(r[5]); fwht8_avx2(r[6]); fwht8_avx2(r[7]);
+                    Ops::butterfly(r[0], r[1]); Ops::butterfly(r[2], r[3]); Ops::butterfly(r[4], r[5]); Ops::butterfly(r[6], r[7]);
+                    Ops::butterfly(r[0], r[2]); Ops::butterfly(r[1], r[3]); Ops::butterfly(r[4], r[6]); Ops::butterfly(r[5], r[7]);
+                    Ops::butterfly(r[0], r[4]); Ops::butterfly(r[1], r[5]); Ops::butterfly(r[2], r[6]); Ops::butterfly(r[3], r[7]);
+
+                    for(int i=0; i<8; ++i) {
+                         __m256 s = _mm256_loadu_ps(scale_ptr + i*8);
+                         r[i] = _mm256_mul_ps(r[i], s);
+                    }
+
+                    __m256 t[8]; for(int i=0; i<8; ++i) t[i] = r[i];
+
+                    auto mix_ch = [&](int i, __m256 curr, __m256 prev, __m256 next) {
+                        __m256 wl = _mm256_load_ps(w_L + i*8);
+                        __m256 wc = _mm256_load_ps(w_C + i*8);
+                        __m256 wr = _mm256_load_ps(w_R + i*8);
+                        __m256 p = shift_right_1(curr, prev);
+                        __m256 n = shift_left_1(curr, next);
+                        __m256 res = _mm256_mul_ps(curr, wc);
+                        res = _mm256_fmadd_ps(p, wl, res);
+                        res = _mm256_fmadd_ps(n, wr, res);
                         return res;
                     };
-                    r0 = sp_mix(t0, t7, t1);
-                    r1 = sp_mix(t1, t0, t2);
-                    r2 = sp_mix(t2, t1, t3);
-                    r3 = sp_mix(t3, t2, t4);
-                    r4 = sp_mix(t4, t3, t5);
-                    r5 = sp_mix(t5, t4, t6);
-                    r6 = sp_mix(t6, t5, t7);
-                    r7 = sp_mix(t7, t6, t0);
-                    if (use_dilated_) {
-                        auto dilated_add = [&](__m256& acc, __m256 curr, __m256 prev, __m256 next) {
-                            __m256 dp_res = _mm256_mul_ps(curr, w_dp1);
-                            dp_res = _mm256_fmadd_ps(prev, w_dp0, dp_res);
-                            dp_res = _mm256_fmadd_ps(next, w_dp2, dp_res);
-                            acc = _mm256_add_ps(acc, dp_res);
-                        };
-                        dilated_add(r0, t0, t7, t1);
-                        dilated_add(r1, t1, t0, t2);
-                        dilated_add(r2, t2, t1, t3);
-                        dilated_add(r3, t3, t2, t4);
-                        dilated_add(r4, t4, t3, t5);
-                        dilated_add(r5, t5, t4, t6);
-                        dilated_add(r6, t6, t5, t7);
-                        dilated_add(r7, t7, t6, t0);
+
+                    r[0] = mix_ch(0, t[0], zero, t[1]);
+                    for(int i=1; i<7; ++i) r[i] = mix_ch(i, t[i], t[i-1], t[i+1]);
+                    r[7] = mix_ch(7, t[7], t[6], zero);
+
+                    fwht8_avx2(r[0]); fwht8_avx2(r[1]); fwht8_avx2(r[2]); fwht8_avx2(r[3]);
+                    fwht8_avx2(r[4]); fwht8_avx2(r[5]); fwht8_avx2(r[6]); fwht8_avx2(r[7]);
+                    Ops::butterfly(r[0], r[1]); Ops::butterfly(r[2], r[3]); Ops::butterfly(r[4], r[5]); Ops::butterfly(r[6], r[7]);
+                    Ops::butterfly(r[0], r[2]); Ops::butterfly(r[1], r[3]); Ops::butterfly(r[4], r[6]); Ops::butterfly(r[5], r[7]);
+                    Ops::butterfly(r[0], r[4]); Ops::butterfly(r[1], r[5]); Ops::butterfly(r[2], r[6]); Ops::butterfly(r[3], r[7]);
+
+                    for(int i=0; i<8; ++i) {
+                        __m256 b = _mm256_loadu_ps(bias_ptr + i*8);
+                        r[i] = _mm256_mul_ps(r[i], norm);
+                        r[i] = _mm256_add_ps(r[i], b);
+                        r[i] = _mm256_max_ps(r[i], zero);
+                        _mm256_storeu_ps(out_ptr + out_idx + i*8, r[i]);
                     }
-                    fwht8_avx2(r0); fwht8_avx2(r1); fwht8_avx2(r2); fwht8_avx2(r3);
-                    fwht8_avx2(r4); fwht8_avx2(r5); fwht8_avx2(r6); fwht8_avx2(r7);
-                    Ops::butterfly(r0, r1); Ops::butterfly(r2, r3); Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
-                    Ops::butterfly(r0, r2); Ops::butterfly(r1, r3); Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
-                    Ops::butterfly(r0, r4); Ops::butterfly(r1, r5); Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
-                    r0 = _mm256_mul_ps(r0, norm);
-                    r1 = _mm256_mul_ps(r1, norm);
-                    r2 = _mm256_mul_ps(r2, norm);
-                    r3 = _mm256_mul_ps(r3, norm);
-                    r4 = _mm256_mul_ps(r4, norm);
-                    r5 = _mm256_mul_ps(r5, norm);
-                    r6 = _mm256_mul_ps(r6, norm);
-                    r7 = _mm256_mul_ps(r7, norm);
-                    auto bias_relu = [&](__m256& r, __m256 b) {
-                        r = _mm256_add_ps(r, b);
-                        r = _mm256_max_ps(r, zero);
-                    };
-                    bias_relu(r0, bias_r0);
-                    bias_relu(r1, bias_r1);
-                    bias_relu(r2, bias_r2);
-                    bias_relu(r3, bias_r3);
-                    bias_relu(r4, bias_r4);
-                    bias_relu(r5, bias_r5);
-                    bias_relu(r6, bias_r6);
-                    bias_relu(r7, bias_r7);
-                    _mm256_storeu_ps(out_ptr + out_idx + 0, r0);
-                    _mm256_storeu_ps(out_ptr + out_idx + 8, r1);
-                    _mm256_storeu_ps(out_ptr + out_idx + 16, r2);
-                    _mm256_storeu_ps(out_ptr + out_idx + 24, r3);
-                    _mm256_storeu_ps(out_ptr + out_idx + 32, r4);
-                    _mm256_storeu_ps(out_ptr + out_idx + 40, r5);
-                    _mm256_storeu_ps(out_ptr + out_idx + 48, r6);
-                    _mm256_storeu_ps(out_ptr + out_idx + 56, r7);
                 }
             }
         }
     }
 
-    void forward_avx2_c128_mixer(size_t N, size_t H, size_t W, float* out_ptr, const float* eyes_ptr, const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr, const std::vector<bool>& active_mask) {
-        // C=128 Mixer. 16 Registers. Full utilization.
+    void forward_avx2_c128_mixer(size_t N, size_t H, size_t W, float* out_ptr, const float* eyes_ptr, const float* scale_ptr, const float* mix_w, const float* bias_ptr, const std::vector<bool>& active_mask) {
         using namespace dreidel::hal::x86;
-        __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0), w_sp1 = _mm256_broadcast_ss(sp_w + 1), w_sp2 = _mm256_broadcast_ss(sp_w + 2);
-        // Note: Dilated logic for 128 is sqrt(128) ~ 11. Complex. Skipping dilated in register path for speed.
+        const float* w_L = mix_w;
+        const float* w_C = mix_w + 128;
+        const float* w_R = mix_w + 256;
+
         __m256 norm = _mm256_set1_ps(1.0f/128.0f);
         __m256 zero = _mm256_setzero_ps();
 
@@ -718,19 +654,9 @@ private:
                     const float* ptr = eyes_ptr + out_idx;
                     for(int i=0; i<16; ++i) r[i] = _mm256_loadu_ps(ptr + i*8);
 
-                    fwht128_avx2((float*)r); // Assume fwht128_avx2 takes pointer to regs or float?
-                    // fwht128_avx2 in x86.hpp loads/stores from memory.
-                    // I need to use the reg-based one. But it was defined as "inline void fwht128_avx2(float* data)".
-                    // That function loads, computes, stores.
-                    // To do it in registers, I would need a version taking __m256&...
-                    // But here I have r[16]. I can write back to a stack buffer, call fwht, read back?
-                    // That's overhead.
-                    // Better: The fwht128_avx2 in x86.hpp uses "loadu" and "storeu".
-                    // I can construct a memory buffer on stack? 128 floats = 512 bytes. Safe.
-
                     alignas(32) float buf[128];
                     for(int i=0; i<16; ++i) _mm256_store_ps(buf + i*8, r[i]);
-                    fwht128_avx2(buf); // This does load/compute/store.
+                    fwht128_avx2(buf);
                     for(int i=0; i<16; ++i) r[i] = _mm256_load_ps(buf + i*8);
 
                     // Scale
@@ -739,20 +665,28 @@ private:
                         r[i] = _mm256_mul_ps(r[i], s);
                     }
 
-                    // Soft Perm (Circular)
-                    __m256 t[16]; for(int i=0; i<16; ++i) t[i] = r[i];
-                    auto mix = [&](__m256& curr, __m256 prev, __m256 next) {
+                    // Locally Connected Mixing
+                    // We must save copy to avoid overwriting prev
+                    alignas(32) float t_buf[128];
+                    for(int i=0; i<16; ++i) _mm256_store_ps(t_buf + i*8, r[i]);
+
+                    auto mix_ch = [&](int i, __m256 curr, __m256 prev, __m256 next) {
+                        __m256 wl = _mm256_load_ps(w_L + i*8);
+                        __m256 wc = _mm256_load_ps(w_C + i*8);
+                        __m256 wr = _mm256_load_ps(w_R + i*8);
                         __m256 p = shift_right_1(curr, prev);
                         __m256 n = shift_left_1(curr, next);
-                        __m256 res = _mm256_mul_ps(curr, w_sp1);
-                        res = _mm256_fmadd_ps(p, w_sp0, res);
-                        res = _mm256_fmadd_ps(n, w_sp2, res);
+                        __m256 res = _mm256_mul_ps(curr, wc);
+                        res = _mm256_fmadd_ps(p, wl, res);
+                        res = _mm256_fmadd_ps(n, wr, res);
                         return res;
                     };
+
                     for(int i=0; i<16; ++i) {
-                        int p = (i==0)?15:i-1;
-                        int n = (i==15)?0:i+1;
-                        r[i] = mix(t[i], t[p], t[n]);
+                         __m256 prev = (i==0) ? zero : _mm256_load_ps(t_buf + (i-1)*8);
+                         __m256 next = (i==15) ? zero : _mm256_load_ps(t_buf + (i+1)*8);
+                         __m256 curr = _mm256_load_ps(t_buf + i*8);
+                         r[i] = mix_ch(i, curr, prev, next);
                     }
 
                     // IFWHT
@@ -773,19 +707,19 @@ private:
         }
     }
 
-    void forward_avx2_generic_large_mixer(size_t N, size_t H, size_t W, float* out_ptr, const float* eyes_ptr, const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr, const std::vector<bool>& active_mask, size_t C) {
-        // Generic vectorized mixer for C > 128 (multiples of 8)
+    void forward_avx2_generic_large_mixer(size_t N, size_t H, size_t W, float* out_ptr, const float* eyes_ptr, const float* scale_ptr, const float* mix_w, const float* bias_ptr, const std::vector<bool>& active_mask, size_t C) {
         using namespace dreidel::hal::x86;
-        __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0), w_sp1 = _mm256_broadcast_ss(sp_w + 1), w_sp2 = _mm256_broadcast_ss(sp_w + 2);
-        // Dilated: offset logic is complex for vector. Only SoftPerm here + generic fallback loop if needed?
-        // Let's implement SoftPerm + Scale + Bias + ReLU vectorized.
+        const float* w_L = mix_w;
+        const float* w_C = mix_w + C;
+        const float* w_R = mix_w + 2*C;
+
         __m256 norm = _mm256_set1_ps(1.0f/C);
         __m256 zero = _mm256_setzero_ps();
-        int dilation = (int)std::sqrt(C);
 
         #pragma omp parallel
         {
             std::vector<float, core::AlignedAllocator<float>> buf(C);
+            std::vector<float, core::AlignedAllocator<float>> t_buf(C);
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
                 for(size_t h=0; h<H; ++h) {
@@ -796,9 +730,9 @@ private:
                             continue;
                         }
 
-                        // Load & FWHT (Memory based)
+                        // Load & FWHT
                         std::copy(eyes_ptr + idx, eyes_ptr + idx + C, buf.begin());
-                        algo::WHT::fwht_1d(buf.data(), C); // Dispatch to optimized
+                        algo::WHT::fwht_1d(buf.data(), C);
 
                         // Scale
                         for(size_t i=0; i<C; i+=8) {
@@ -807,46 +741,77 @@ private:
                             _mm256_store_ps(buf.data() + i, _mm256_mul_ps(v, s));
                         }
 
-                        // Soft Perm (Vectorized)
-                        std::vector<float, core::AlignedAllocator<float>> temp = buf; // Copy for perm
+                        // Copy to temp for mixing source
+                        std::copy(buf.begin(), buf.end(), t_buf.begin());
+
+                        // Vectorized Mixing Loop
                         for(size_t i=0; i<C; i+=8) {
-                            // Needs prev/next. Crossing 8-boundary.
-                            // Load prev 8 (unaligned -1), curr 8, next 8 (unaligned +1).
-                            // Boundary check for i=0 and i=C-8.
-                            // To simplify, use generic loop for perm? Or careful unaligned loads.
-                            // Unaligned load from temp data is fine.
-                            // prev: loadu(temp + i - 1).
-                            // next: loadu(temp + i + 1).
-                            // Handle wrap around:
-                            // If i=0, prev[0] is temp[C-1].
-                            // If i=C-8, next[7] is temp[0].
-                            // We can handle core loop efficiently.
+                             __m256 curr = _mm256_load_ps(t_buf.data() + i);
+                             __m256 prev, next;
 
-                            __m256 curr = _mm256_load_ps(temp.data() + i);
-                            __m256 prev, next;
+                             if (i > 0) prev = _mm256_loadu_ps(t_buf.data() + i - 1); // Unaligned load of [i-1...i+6]
+                             else {
+                                 // Boundary 0. Prev is 0?
+                                 // shift_right_1 needs prev reg.
+                                 // We need specific unaligned logic or use scalar fallback for boundary?
+                                 // Actually, simpler:
+                                 // Construct 'prev' from Zero and curr?
+                                 // shift_right_1(curr, zero) gives [0, c0, c1...c6]. Correct.
+                                 prev = zero;
+                             }
 
-                            if (i > 0) prev = _mm256_loadu_ps(temp.data() + i - 1);
-                            else {
-                                // Manual wrap for index 0
-                                // prev = [temp[C-1], temp[0]...temp[6]]
-                                // Construct using blend/permute? Slow.
-                                // Fallback scalar for boundary?
-                                // Let's perform fully scalar Permutation for correctness/simplicity in Generic Large.
-                                // It is O(C). FWHT is O(C log C). Perm is minor.
-                                // But we want Alien Speed.
-                                // Let's use simple loop for perm.
-                            }
-                        }
-                        // Scalar Perm
-                        for(size_t c=0; c<C; ++c) {
-                            size_t p = (c==0)?C-1:c-1;
-                            size_t nx = (c==C-1)?0:c+1;
-                            buf[c] = sp_w[0]*temp[p] + sp_w[1]*temp[c] + sp_w[2]*temp[nx];
-                            if (dilation > 0) { // Dilated
-                                size_t pd = (c < (size_t)dilation) ? C - dilation + c : c - dilation;
-                                size_t nd = (c + dilation >= C) ? c + dilation - C : c + dilation;
-                                buf[c] += dp_w[0]*temp[pd] + dp_w[1]*temp[c] + dp_w[2]*temp[nd];
-                            }
+                             if (i + 8 < C) next = _mm256_loadu_ps(t_buf.data() + i + 1); // Unaligned [i+1...i+8]
+                             else {
+                                 // Boundary end. Next is 0?
+                                 // shift_left_1(curr, zero) gives [c1...c7, 0]. Correct.
+                                 next = zero;
+                             }
+
+                             // BUT wait. `shift_right_1` uses a register as prev.
+                             // `_mm256_loadu_ps` loads a block of memory.
+                             // If I load `t_buf + i - 1` (valid pointer), it contains `[c-1, c0... c6]`.
+                             // This IS the shifted data directly! I don't need `shift_right_1`.
+                             // `shift_right_1` is for when data is in registers and we can't unaligned load across them easily.
+                             // Here we are in memory!
+                             // So:
+                             // val = w_C * curr + w_L * loadu(i-1) + w_R * loadu(i+1)
+                             // This is much faster.
+
+                             __m256 wl = _mm256_load_ps(w_L + i);
+                             __m256 wc = _mm256_load_ps(w_C + i);
+                             __m256 wr = _mm256_load_ps(w_R + i);
+
+                             __m256 p_vec, n_vec;
+
+                             // Handle Boundary i=0 for loadu(i-1) - unsafe pointer
+                             if (i == 0) {
+                                 // loadu at -1 is invalid.
+                                 // Construct p_vec manually: [0, t[0], t[1]...t[6]]
+                                 // shift_right_1(curr, zero) does exactly this.
+                                 p_vec = shift_right_1(curr, zero);
+                             } else {
+                                 p_vec = _mm256_loadu_ps(t_buf.data() + i - 1);
+                             }
+
+                             // Handle Boundary i=C-8 for loadu(i+1) - unsafe pointer if C aligned?
+                             // t_buf is size C. t_buf[C] is end. t_buf + i + 1 + 7 = t_buf + C - 8 + 1 + 7 = t_buf + C.
+                             // So loadu at C-8+1 reads up to t_buf[C]. This is 1 float past end?
+                             // No. Range is [i+1, i+8]. Last element is at i+8.
+                             // If i = C-8. Indices are C-7 ... C.
+                             // t_buf has indices 0...C-1.
+                             // So accessing index C is out of bounds.
+                             // So for last block, we cannot use loadu(i+1).
+                             if (i + 8 >= C) {
+                                 n_vec = shift_left_1(curr, zero);
+                             } else {
+                                 n_vec = _mm256_loadu_ps(t_buf.data() + i + 1);
+                             }
+
+                             __m256 res = _mm256_mul_ps(curr, wc);
+                             res = _mm256_fmadd_ps(p_vec, wl, res);
+                             res = _mm256_fmadd_ps(n_vec, wr, res);
+
+                             _mm256_store_ps(buf.data() + i, res);
                         }
 
                         // IFWHT
@@ -870,13 +835,21 @@ private:
     void forward_avx2_c64_to_1_mixer(
         size_t N, size_t H_out, size_t W_out,
         float* out_ptr, const float* eyes_ptr,
-        const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr,
+        const float* scale_ptr, const float* mix_w, const float* bias_ptr,
         const std::vector<bool>& active_mask
     ) {
         using namespace dreidel::hal::x86;
-        __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0);
-        __m256 w_sp1 = _mm256_broadcast_ss(sp_w + 1);
-        __m256 w_sp2 = _mm256_broadcast_ss(sp_w + 2);
+        // Pointers for channel 0 weights (since output is 1 channel, we effectively select C=0 after mixing?
+        // Wait, C64->1 implies we reduce.
+        // Previous implementation: `val = sp_w[0] * buf63 + sp_w[1] * buf0 + sp_w[2] * buf1`
+        // This calculated mixed value for channel 0.
+        // With locally connected:
+        // `val = w_L[0]*0 + w_C[0]*buf0 + w_R[0]*buf1`
+        // So we only need w_L[0], w_C[0], w_R[0].
+
+        float w_l = mix_w[0];
+        float w_c = mix_w[64];
+        float w_r = mix_w[128];
 
         float bias_val = bias_ptr[0];
 
@@ -927,23 +900,17 @@ private:
                     r6 = _mm256_mul_ps(r6, scale_r6);
                     r7 = _mm256_mul_ps(r7, scale_r7);
 
-                    // Permute logic: c=0. prev=63, next=1.
-                    // buf[0] is r0[0]. buf[1] is r0[1]. buf[63] is r7[7].
+                    // Permute logic: c=0. prev=0 (Linear), next=buf1.
+                    // buf[0] is r0[0]. buf[1] is r0[1].
 
                     // Extract needed values
                     float buf0 = _mm256_cvtss_f32(r0); // low element of r0
                     // Extract r0[1]
                     __m256 r0_shuf = _mm256_permute_ps(r0, 0x01); // rotate
                     float buf1 = _mm256_cvtss_f32(r0_shuf);
-                    // Extract r7[7]
-                    // r7: [0,1,2,3, 4,5,6,7]
-                    // high 128: [4,5,6,7]
-                    __m256 r7_high = _mm256_permute2f128_ps(r7, r7, 0x11);
-                    __m256 r7_perm = _mm256_permute_ps(r7_high, 0xFF); // 11111111 -> 3,3,3,3 (last elem of 128 bit lane)
-                    float buf63 = _mm256_cvtss_f32(r7_perm);
 
                     // Mix
-                    float val = sp_w[0] * buf63 + sp_w[1] * buf0 + sp_w[2] * buf1;
+                    float val = w_l * 0.0f + w_c * buf0 + w_r * buf1;
 
                     // IFWHT(1) is Identity
 
@@ -965,22 +932,19 @@ private:
     size_t kernel_size_;
     size_t spectral_dim_;
     bool use_ifwht_;
-    bool use_dilated_;
     bool use_gating_;
     size_t stride_;
     size_t upscale_;
 
     Tensor<T> packed_weights_;
     Tensor<T> spectral_scales_;
-    Tensor<T> soft_perm_weights_;
-    Tensor<T> dilated_perm_weights_;
+    Tensor<T> mixing_weights_;
     Tensor<T> bias_;
     Tensor<T> oracle_projection_;
 
     Tensor<T> grad_packed_weights_;
     Tensor<T> grad_spectral_scales_;
-    Tensor<T> grad_soft_perm_weights_;
-    Tensor<T> grad_dilated_perm_weights_;
+    Tensor<T> grad_mixing_weights_;
     Tensor<T> grad_bias_;
     Tensor<T> grad_oracle_projection_;
 
