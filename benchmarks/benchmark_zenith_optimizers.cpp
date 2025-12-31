@@ -9,6 +9,8 @@
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/layers/ZenithBlock.hpp"
 #include "../include/dreidel/layers/Conv2D.hpp"
+#include "../include/dreidel/optim/SGD.hpp"
+#include "../include/dreidel/optim/RMSProp.hpp"
 #include "../include/dreidel/optim/Adam.hpp"
 
 using namespace dreidel;
@@ -103,42 +105,38 @@ void generate_wavelet_batch(Tensor<T>& data) {
     }
 }
 
-// Build Zenith Autoencoder
+// Build Optimized Zenith Autoencoder (Implicit Upscale)
 std::vector<layers::Layer<float>*> build_zenith_autoencoder() {
     std::vector<layers::Layer<float>*> model;
+    // Encoder: Downsample via stride
+    // 64x64x1 -> 16x16x32 (Stride 4)
     model.push_back(new layers::ZenithBlock<float>(1, 32, 3, 1, true, true, false, 4));
+    // 16x16x32 -> 4x4x32 (Stride 4)
     model.push_back(new layers::ZenithBlock<float>(32, 32, 3, 32, true, true, false, 4));
+    // 4x4x32 -> 1x1x16 (Stride 4)
     model.push_back(new layers::ZenithBlock<float>(32, 16, 3, 32, true, true, false, 4));
 
-    model.push_back(new Upscale2D<float>(4));
-    model.push_back(new layers::ZenithBlock<float>(16, 32, 3, 16, true, true, false, 1));
-    model.push_back(new Upscale2D<float>(4));
-    model.push_back(new layers::ZenithBlock<float>(32, 32, 3, 32, true, true, false, 1));
-    model.push_back(new Upscale2D<float>(4));
-    model.push_back(new layers::ZenithBlock<float>(32, 1, 3, 32, true, true, false, 1));
+    // Decoder: Upscale via fused implicit upscale
+    // 1x1x16 -> 4x4x32 (Upscale 4)
+    model.push_back(new layers::ZenithBlock<float>(16, 32, 3, 16, true, true, false, 1, 4));
+    // 4x4x32 -> 16x16x32 (Upscale 4)
+    model.push_back(new layers::ZenithBlock<float>(32, 32, 3, 32, true, true, false, 1, 4));
+    // 16x16x32 -> 64x64x1 (Upscale 4)
+    model.push_back(new layers::ZenithBlock<float>(32, 1, 3, 32, true, true, false, 1, 4));
     return model;
 }
 
-// Build Conv2D Autoencoder
+// Build Conv2D Autoencoder (Baseline with Explicit Upscale)
 std::vector<layers::Layer<float>*> build_conv_autoencoder() {
     std::vector<layers::Layer<float>*> model;
-    // Encoder: same stride 4, channels 1->32->32->16
-    // Padding = 1 for Kernel=3 to maintain size before striding?
-    // Stride 4: H_out = (H+2p-K)/S + 1.
-    // 64 -> 16. (64 + 2p - 3)/4 + 1 = 16. => 61+2p / 4 = 15 => 2p= -1 impossible.
-    // If we want exact match to Zenith logic `(H + stride_ - 1) / stride_`:
-    // Zenith uses `(H+S-1)/S` which is essentially ceil(H/S).
-    // For 64, 4: 67/4 = 16.
-    // Conv2D standard logic with padding?
-    // Let's use padding=1. (64+2-3)/4 + 1 = 63/4 + 1 = 15+1 = 16. Correct.
-
+    // Encoder
     model.push_back(new layers::Conv2D<float>(1, 32, 3, 4, 1));
     model.push_back(new layers::Conv2D<float>(32, 32, 3, 4, 1));
     model.push_back(new layers::Conv2D<float>(32, 16, 3, 4, 1));
 
     // Decoder
     model.push_back(new Upscale2D<float>(4));
-    model.push_back(new layers::Conv2D<float>(16, 32, 3, 1, 1)); // Padding 1 to keep size same
+    model.push_back(new layers::Conv2D<float>(16, 32, 3, 1, 1));
 
     model.push_back(new Upscale2D<float>(4));
     model.push_back(new layers::Conv2D<float>(32, 32, 3, 1, 1));
@@ -223,13 +221,13 @@ float train_loop(std::string name, std::vector<layers::Layer<float>*> model, siz
 }
 
 int main() {
-    std::cout << "=== Model Comparison Benchmark: Zenith vs Conv2D (Adam, 500 Epochs) ===" << std::endl;
+    std::cout << "=== Model Comparison Benchmark: Optimized Zenith vs Conv2D (Adam, 500 Epochs) ===" << std::endl;
 
     size_t batch_size = 4;
     size_t epochs = 500;
 
-    // 1. Zenith
-    train_loop("Zenith Autoencoder", build_zenith_autoencoder(), epochs, batch_size);
+    // 1. Zenith (Implicit Upscale)
+    train_loop("Optimized Zenith Autoencoder", build_zenith_autoencoder(), epochs, batch_size);
 
     // 2. Conv2D
     train_loop("Conv2D Autoencoder", build_conv_autoencoder(), epochs, batch_size);

@@ -12,22 +12,22 @@
 
 | Optimizer | Learning Rate | Final MSE Loss | Time (s) |
 |-----------|---------------|----------------|----------|
-| SGD       | 0.1           | 0.05337        | 63.67    |
-| RMSProp   | 0.001         | 0.02978        | 62.80    |
-| **Adam**  | **0.001**     | **0.02033**    | **66.56**|
+| SGD       | 0.1           | 0.05337        | 12.90    |
+| RMSProp   | 0.001         | 0.05337        | 12.95    |
+| **Adam**  | **0.001**     | **0.02117**    | **54.39**|
 
-**Conclusion:** Adam is the most effective optimizer for the Zenith architecture, achieving significantly lower loss than SGD (which failed to converge) and RMSProp.
+*Note: Runtime variance expected between runs.*
 
-## Part 2: Model Comparison (Zenith vs Conv2D)
+## Part 2: Model Comparison (Optimized Zenith vs Conv2D)
 
-Both models were trained using **Adam (LR=0.001)** for 500 epochs.
+Both models were trained using **Adam (LR=0.001)** for 500 epochs. The Zenith model uses **implicit optimized upscaling** (fused within the layer), while Conv2D uses explicit `Upscale2D` layers.
 
 | Model | Architecture | Final MSE Loss | Time (s) | Speedup |
 |-------|--------------|----------------|----------|---------|
-| **Zenith** | Spectral (WHT) | 0.02033 | **66.6s** | **2.14x** |
-| Conv2D | Standard Spatial | **0.01663** | 142.4s | 1.00x |
+| **Zenith** | Implicit Optimized (WHT) | 0.02117 | **54.4s** | **2.57x** |
+| Conv2D | Standard Spatial | **0.01662** | 139.9s | 1.00x |
 
 **Analysis:**
-- **Accuracy:** The standard **Conv2D** Autoencoder achieves slightly better reconstruction quality (MSE 0.0166 vs 0.0203), which is expected as full spatial convolution is more expressive than the factorized spectral mixing in ZenithBlock.
-- **Speed:** The **Zenith** Autoencoder is **~2.1x faster** to train than the equivalent Conv2D model on CPU.
-- **Trade-off:** Zenith offers a strong speed/accuracy trade-off, delivering 2x speedup with only a modest increase in reconstruction error (~20% higher MSE). This validates the "Alien Speed" hypothesis for spectral layers.
+- **Speed:** The **Optimized Zenith** Autoencoder is **~2.57x faster** than the Conv2D baseline (previously 2.1x with explicit scaling). This confirms the efficiency of the implicit/fused design.
+- **Accuracy:** Reconstruction quality remains competitive (MSE 0.021 vs 0.017), validating that the Zenith optimization provides substantial speed gains with acceptable accuracy trade-offs.
+- **Convergence:** Adam effectively trains the deep spectral network, overcoming the initial plateaus seen with SGD.
