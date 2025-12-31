@@ -12,7 +12,7 @@ class SGD : public Optimizer<T, B> {
 public:
     SGD(T learning_rate) : learning_rate_(learning_rate) {}
 
-    void add_parameters(std::vector<Tensor<T, B>*> params, std::vector<Tensor<T, B>*> grads) {
+    void add_parameters(std::vector<Tensor<T, B>*> params, std::vector<Tensor<T, B>*> grads) override {
         if (params.size() != grads.size()) {
              throw std::invalid_argument("Params and grads size mismatch");
         }
@@ -24,11 +24,6 @@ public:
         for (size_t i = 0; i < parameters_.size(); ++i) {
             Tensor<T, B>* param = parameters_[i];
             Tensor<T, B>* grad = gradients_[i];
-
-            // p = p - lr * grad
-            // Using existing Tensor ops: p = p + (grad * -lr)
-            // Or implement operator-= in Tensor.
-            // Using what we have:
 
             Tensor<T, B> update = (*grad) * (-learning_rate_);
             *param = (*param) + update;

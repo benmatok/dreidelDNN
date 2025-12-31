@@ -4,6 +4,7 @@
 #include <vector>
 #include <cmath>
 #include <random>
+#include <omp.h>
 
 namespace dreidel {
 namespace layers {
@@ -28,12 +29,7 @@ public:
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
-        // Input: (N, H, W, C_in) or (N, C, H, W)?
-        // ZenithBlock uses (N, H, W, C). Let's stick to that for consistency,
-        // although standard C++ implementations often prefer NCHW for SIMD.
-        // dreidel::Tensor doesn't strictly enforce, but earlier code used NHWC loops.
-        // Let's assume NHWC.
-
+        // Input: (N, H, W, C_in)
         input_ = input;
         auto shape = input.shape();
         size_t N = shape[0];
@@ -53,18 +49,13 @@ public:
         const T* b_ptr = bias_.data();
         T* out_ptr = output.data();
 
-        int k_rad = kernel_size_ / 2; // Only valid for odd kernels if we think in radius, but here we use 0..K-1
-
-        // Naive 6-loop implementation (Slow baseline)
-        // Optimized slightly by hoisting
-
         #pragma omp parallel for collapse(3)
         for(size_t n=0; n<N; ++n) {
             for(size_t h_out=0; h_out<H_out; ++h_out) {
                 for(size_t w_out=0; w_out<W_out; ++w_out) {
 
-                    size_t h_in_start = h_out * stride_ - padding_;
-                    size_t w_in_start = w_out * stride_ - padding_;
+                    int h_in_start = (int)h_out * (int)stride_ - (int)padding_;
+                    int w_in_start = (int)w_out * (int)stride_ - (int)padding_;
 
                     for(size_t c_out=0; c_out<C_out; ++c_out) {
                         T acc = b_ptr[c_out];
@@ -74,7 +65,7 @@ public:
                                 int h_in = h_in_start + ky;
                                 int w_in = w_in_start + kx;
 
-                                if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+                                if (h_in >= 0 && h_in < (int)H && w_in >= 0 && w_in < (int)W) {
                                     for(size_t c_in=0; c_in<C_in; ++c_in) {
                                         // w index: c_out * (C_in*K*K) + c_in * (K*K) + ky*K + kx
                                         // in index: ((n*H + h_in)*W + w_in)*C_in + c_in
@@ -109,7 +100,7 @@ public:
         grad_input.fill(0);
 
         grad_weights_.fill(0);
-        grad_bias_.fill(0); // Actually accumulates
+        grad_bias_.fill(0);
 
         const T* go_ptr = grad_output.data();
         const T* in_ptr = input_.data();
@@ -119,49 +110,38 @@ public:
         T* gw_ptr = grad_weights_.data();
         T* gb_ptr = grad_bias_.data();
 
-        // Accumulate Bias gradients
-        for(size_t n=0; n<N; ++n) {
-            for(size_t h=0; h<H_out; ++h) {
-                for(size_t w=0; w<W_out; ++w) {
-                    for(size_t c=0; c<out_channels_; ++c) {
-                        gb_ptr[c] += go_ptr[((n*H_out+h)*W_out+w)*out_channels_ + c];
-                    }
-                }
-            }
-        }
+        // Use thread-local accumulators for gradients to avoid massive atomic contention
+        // However, generic Conv2D backward is notoriously hard to parallelize cleanly without im2col.
+        // We stick to OpenMP atomic for simplicity in this baseline, but optimize loops slightly.
 
-        // Gradients for Weights and Input
-        // This is very slow naively.
-        // We need to implement it correctly for validation.
-
-        // Since we are writing to shared grad_weights and grad_input, parallelization needs care (atomics or reduction).
-        // For simplicity in baseline, we might serialise or use atomics.
-
-        // Let's iterate over output pixels and backpropagate
+        #pragma omp parallel for collapse(3)
         for(size_t n=0; n<N; ++n) {
             for(size_t h_out=0; h_out<H_out; ++h_out) {
                 for(size_t w_out=0; w_out<W_out; ++w_out) {
 
-                    int h_in_start = h_out * stride_ - padding_;
-                    int w_in_start = w_out * stride_ - padding_;
+                    int h_in_start = (int)h_out * (int)stride_ - (int)padding_;
+                    int w_in_start = (int)w_out * (int)stride_ - (int)padding_;
 
                     for(size_t c_out=0; c_out<out_channels_; ++c_out) {
                         T dy = go_ptr[((n*H_out+h_out)*W_out+w_out)*out_channels_ + c_out];
+
+                        #pragma omp atomic
+                        gb_ptr[c_out] += dy;
 
                         for(size_t ky=0; ky<kernel_size_; ++ky) {
                             for(size_t kx=0; kx<kernel_size_; ++kx) {
                                 int h_in = h_in_start + ky;
                                 int w_in = w_in_start + kx;
 
-                                if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+                                if (h_in >= 0 && h_in < (int)H && w_in >= 0 && w_in < (int)W) {
                                     for(size_t c_in=0; c_in<C_in; ++c_in) {
                                         size_t w_idx = ((c_out * in_channels_ + c_in) * kernel_size_ + ky) * kernel_size_ + kx;
                                         size_t in_idx = ((n*H + h_in)*W + w_in)*C_in + c_in;
 
-                                        // dL/dW += dy * x
+                                        #pragma omp atomic
                                         gw_ptr[w_idx] += dy * in_ptr[in_idx];
 
-                                        // dL/dx += dy * w
+                                        #pragma omp atomic
                                         gi_ptr[in_idx] += dy * w_ptr[w_idx];
                                     }
                                 }
