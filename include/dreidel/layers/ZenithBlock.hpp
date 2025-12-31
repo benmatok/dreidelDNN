@@ -321,7 +321,6 @@ public:
                 }
             }
         }
-
         return output;
     }
 
