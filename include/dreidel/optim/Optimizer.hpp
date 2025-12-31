@@ -12,6 +12,9 @@ class Optimizer {
 public:
     virtual ~Optimizer() = default;
 
+    // Common interface for adding parameters
+    virtual void add_parameters(std::vector<Tensor<T, B>*> params, std::vector<Tensor<T, B>*> grads) = 0;
+
     // Update weights given gradients
     virtual void step() = 0;
 

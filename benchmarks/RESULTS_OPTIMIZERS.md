@@ -1,23 +1,24 @@
-# Optimizer Benchmark Results
+# Optimizer Benchmark Results (Zenith Autoencoder)
 
 ## Experiment Setup
-- **Model:** Autoencoder (Input 64 -> Dense(32) -> Tanh -> Dense(16) -> Tanh -> Dense(32) -> Tanh -> Dense(64))
-- **Data:** Synthetic Gaussian/Gabor-like signals
-- **Batch Size:** 32
-- **Epochs:** 1000
+- **Model:** Deep Zenith Autoencoder (64x64x1 -> ... -> 1x1x16 -> ... -> 64x64x1)
+- **Layers:** 6 layers (3 Encoder, 3 Decoder) using `ZenithBlock` with spectral mixing.
+- **Data:** Synthetic Wavelet/Gaussian 2D signals.
+- **Batch Size:** 4
+- **Epochs:** 100
 - **Hardware:** CPU (OpenMP)
 
 ## Results
 
 | Optimizer | Learning Rate | Final MSE Loss | Time (s) |
 |-----------|---------------|----------------|----------|
-| SGD       | 0.01          | 0.0980055      | 0.303    |
-| RMSProp   | 0.001         | 0.0001572      | 0.321    |
-| Adam      | 0.001         | 0.0003766      | 0.365    |
+| SGD       | 0.1           | 0.05337        | 12.83    |
+| RMSProp   | 0.001         | 0.02922        | 13.72    |
+| Adam      | 0.001         | 0.02967        | 11.72    |
 
 ## Conclusion
-**RMSProp** is the best performing optimizer for this specific Autoencoder task.
+**RMSProp** and **Adam** significantly outperform SGD for training the deep Zenith Autoencoder.
 
-- **Loss:** RMSProp achieved the lowest final loss (0.000157), slightly outperforming Adam (0.000377). Both significantly outperformed SGD (0.098), which failed to converge to a low error state.
-- **Speed:** RMSProp is slightly faster than Adam (~12% faster in this run) as it tracks fewer moments (only squared average vs. mean and variance).
-- **Recommendation:** For this class of small-scale dense autoencoders on CPU, RMSProp offers the best balance of convergence speed and computational efficiency.
+- **Loss:** Both RMSProp (0.0292) and Adam (0.0297) achieved meaningful convergence, reducing the loss by ~45% from the initial state. SGD (0.0534) failed to converge effectively in this timeframe, likely stuck on a plateau due to the complex spectral landscape.
+- **Speed:** Adam was slightly faster (11.7s) than RMSProp (13.7s) and SGD (12.8s) in this run, though performance is roughly comparable.
+- **Recommendation:** Adaptive gradient methods like RMSProp or Adam are essential for training Zenith-based spectral architectures.
