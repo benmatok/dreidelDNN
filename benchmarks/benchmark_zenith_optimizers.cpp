@@ -205,7 +205,7 @@ int main() {
     std::cout << "=== Zenith Autoencoder Optimizer Benchmark ===" << std::endl;
 
     size_t batch_size = 4;
-    size_t epochs = 100;
+    size_t epochs = 500;
 
     // 1. SGD
     {
