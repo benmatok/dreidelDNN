@@ -148,11 +148,11 @@ std::vector<layers::Layer<float>*> build_conv_autoencoder() {
 }
 
 // Training Loop Helper
-float train_loop(std::string name, std::vector<layers::Layer<float>*> model, size_t epochs, size_t batch_size) {
+float train_loop(std::string name, std::vector<layers::Layer<float>*> model, size_t epochs, size_t batch_size, float lr = 0.001f) {
     std::cout << "\n--- Starting Training: " << name << " ---" << std::endl;
     size_t H = 64, W = 64;
 
-    optim::Adam<float> optimizer(0.001f); // Use Adam as it was best
+    optim::Adam<float> optimizer(lr); // Use Adam as it was best
 
     // Register params
     for(auto* layer : model) {
@@ -227,10 +227,11 @@ int main() {
     size_t epochs = 500;
 
     // 1. Zenith (Implicit Upscale)
-    train_loop("Optimized Zenith Autoencoder", build_zenith_autoencoder(), epochs, batch_size);
+    // Reduce LR to prevent divergence in AVX optimized path
+    train_loop("Optimized Zenith Autoencoder", build_zenith_autoencoder(), epochs, batch_size, 0.0001f);
 
     // 2. Conv2D
-    train_loop("Conv2D Autoencoder", build_conv_autoencoder(), epochs, batch_size);
+    train_loop("Conv2D Autoencoder", build_conv_autoencoder(), epochs, batch_size, 0.001f);
 
     return 0;
 }

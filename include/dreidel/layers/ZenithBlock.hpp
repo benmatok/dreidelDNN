@@ -43,10 +43,16 @@ public:
     {
         T stddev = std::sqrt(static_cast<T>(2.0) / (kernel_size * kernel_size));
         packed_weights_.random(0, stddev);
-        spectral_scales_.fill(1.0);
+
+        // Initialization update: Mean 1.0, std 0.2
+        spectral_scales_.random(1.0, 0.2);
+
         soft_perm_weights_.fill(0); soft_perm_weights_.data()[1] = 1.0;
         dilated_perm_weights_.fill(0);
-        bias_.fill(0);
+
+        // Initialization update: Bias 0.01 to prevent dead ReLU
+        bias_.fill(0.01);
+
         oracle_projection_.random(-1.0, 1.0);
 
         grad_packed_weights_.fill(0);
@@ -109,6 +115,7 @@ public:
         const T* scale_ptr = spectral_scales_.data();
         const T* bias_ptr = bias_.data();
         const T* sp_w = soft_perm_weights_.data();
+        const T* dp_w = dilated_perm_weights_.data();
         const T* w_ptr = packed_weights_.data();
         int k_rad = kernel_size_ / 2;
 
@@ -117,7 +124,7 @@ public:
 
 #ifdef __AVX2__
         if constexpr (std::is_same_v<T, float>) {
-            // Eyes Optimization: Only for C >= 8 and multiples of 8 for now
+            // Eyes Optimization
             if (in_channels_ >= 8 && in_channels_ % 8 == 0 && kernel_size_ == 3 && stride_ == 1) {
                 repack_weights();
 
@@ -224,9 +231,29 @@ public:
             }
         }
 
-        // --- MIXER ---
-        // NOTE: We disable AVX mixer to ensure numerical consistency with Backward pass (generic).
-        // The Eyes optimization provides the bulk of the speedup.
+#ifdef __AVX2__
+        if constexpr (std::is_same_v<T, float>) {
+             if (in_channels_ == out_channels_) {
+                 if (in_channels_ == 32) {
+                     forward_avx2_c32_mixer(N, H_out, W_out, out_ptr, pre_relu_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
+                     mixer_done = true;
+                 } else if (in_channels_ == 64) {
+                     forward_avx2_c64_mixer(N, H_out, W_out, out_ptr, pre_relu_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
+                     mixer_done = true;
+                 } else if (in_channels_ == 128) {
+                     forward_avx2_c128_mixer(N, H_out, W_out, out_ptr, pre_relu_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
+                     mixer_done = true;
+                 } else if (in_channels_ > 128 && in_channels_ % 8 == 0) {
+                     forward_avx2_generic_large_mixer(N, H_out, W_out, out_ptr, pre_relu_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask, in_channels_);
+                     mixer_done = true;
+                 }
+             }
+             else if (in_channels_ == 64 && out_channels_ == 1) {
+                  forward_avx2_c64_to_1_mixer(N, H_out, W_out, out_ptr, pre_relu_ptr, eyes_ptr, scale_ptr, sp_w, dp_w, bias_ptr, active_mask);
+                  mixer_done = true;
+             }
+        }
+#endif
 
         if (!mixer_done) {
             #pragma omp parallel
@@ -579,7 +606,380 @@ private:
             }
         }
     }
-    // AVX Mixers disabled for training consistency
+
+    void forward_avx2_c32_mixer(size_t N, size_t H, size_t W, float* out_ptr, float* pre_relu_ptr, const float* eyes_ptr, const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr, const std::vector<bool>& active_mask) {
+        using namespace dreidel::hal::x86;
+        __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0), w_sp1 = _mm256_broadcast_ss(sp_w + 1), w_sp2 = _mm256_broadcast_ss(sp_w + 2);
+        __m256 bias[4], scale[4];
+        for(int i=0; i<4; ++i) bias[i] = _mm256_loadu_ps(bias_ptr + i*8);
+        for(int i=0; i<4; ++i) scale[i] = _mm256_loadu_ps(scale_ptr + i*8);
+        __m256 norm = _mm256_set1_ps(1.0f/32.0f);
+        __m256 zero = _mm256_setzero_ps();
+
+        #pragma omp parallel for collapse(3)
+        for(size_t n=0; n<N; ++n) {
+            for(size_t h=0; h<H; ++h) {
+                for(size_t w=0; w<W; ++w) {
+                    size_t out_idx = ((n*H + h)*W + w)*32;
+                    if (!active_mask[n]) {
+                        for(int i=0; i<4; ++i) {
+                            _mm256_storeu_ps(out_ptr + out_idx + i*8, zero);
+                            _mm256_storeu_ps(pre_relu_ptr + out_idx + i*8, _mm256_set1_ps(-1.0f));
+                        }
+                        continue;
+                    }
+
+                    __m256 r[4];
+                    const float* ptr = eyes_ptr + out_idx;
+                    for(int i=0; i<4; ++i) r[i] = _mm256_loadu_ps(ptr + i*8);
+
+                    fwht8_avx2(r[0]); fwht8_avx2(r[1]); fwht8_avx2(r[2]); fwht8_avx2(r[3]);
+                    Ops::butterfly(r[0], r[1]); Ops::butterfly(r[2], r[3]);
+                    Ops::butterfly(r[0], r[2]); Ops::butterfly(r[1], r[3]);
+
+                    for(int i=0; i<4; ++i) r[i] = _mm256_mul_ps(r[i], scale[i]);
+
+                    __m256 t[4]; for(int i=0; i<4; ++i) t[i] = r[i];
+                    auto mix = [&](__m256& curr, __m256 prev, __m256 next) {
+                        __m256 p = shift_right_1(curr, prev);
+                        __m256 n = shift_left_1(curr, next);
+                        __m256 res = _mm256_mul_ps(curr, w_sp1);
+                        res = _mm256_fmadd_ps(p, w_sp0, res);
+                        res = _mm256_fmadd_ps(n, w_sp2, res);
+                        return res;
+                    };
+                    r[0] = mix(t[0], t[3], t[1]);
+                    r[1] = mix(t[1], t[0], t[2]);
+                    r[2] = mix(t[2], t[1], t[3]);
+                    r[3] = mix(t[3], t[2], t[0]);
+
+                    fwht8_avx2(r[0]); fwht8_avx2(r[1]); fwht8_avx2(r[2]); fwht8_avx2(r[3]);
+                    Ops::butterfly(r[0], r[1]); Ops::butterfly(r[2], r[3]);
+                    Ops::butterfly(r[0], r[2]); Ops::butterfly(r[1], r[3]);
+
+                    for(int i=0; i<4; ++i) r[i] = _mm256_mul_ps(r[i], norm);
+                    for(int i=0; i<4; ++i) {
+                        r[i] = _mm256_add_ps(r[i], bias[i]);
+                        _mm256_storeu_ps(pre_relu_ptr + out_idx + i*8, r[i]); // Store pre-ReLU
+                        r[i] = _mm256_max_ps(r[i], zero);
+                    }
+                    for(int i=0; i<4; ++i) _mm256_storeu_ps(out_ptr + out_idx + i*8, r[i]);
+                }
+            }
+        }
+    }
+
+    void forward_avx2_c64_mixer(
+        size_t N, size_t H_out, size_t W_out,
+        float* out_ptr, float* pre_relu_ptr, const float* eyes_ptr,
+        const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr,
+        const std::vector<bool>& active_mask
+    ) {
+        using namespace dreidel::hal::x86;
+        __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0);
+        __m256 w_sp1 = _mm256_broadcast_ss(sp_w + 1);
+        __m256 w_sp2 = _mm256_broadcast_ss(sp_w + 2);
+        __m256 bias_r0 = _mm256_loadu_ps(bias_ptr + 0);
+        __m256 bias_r1 = _mm256_loadu_ps(bias_ptr + 8);
+        __m256 bias_r2 = _mm256_loadu_ps(bias_ptr + 16);
+        __m256 bias_r3 = _mm256_loadu_ps(bias_ptr + 24);
+        __m256 bias_r4 = _mm256_loadu_ps(bias_ptr + 32);
+        __m256 bias_r5 = _mm256_loadu_ps(bias_ptr + 40);
+        __m256 bias_r6 = _mm256_loadu_ps(bias_ptr + 48);
+        __m256 bias_r7 = _mm256_loadu_ps(bias_ptr + 56);
+        __m256 scale_r0 = _mm256_loadu_ps(scale_ptr + 0);
+        __m256 scale_r1 = _mm256_loadu_ps(scale_ptr + 8);
+        __m256 scale_r2 = _mm256_loadu_ps(scale_ptr + 16);
+        __m256 scale_r3 = _mm256_loadu_ps(scale_ptr + 24);
+        __m256 scale_r4 = _mm256_loadu_ps(scale_ptr + 32);
+        __m256 scale_r5 = _mm256_loadu_ps(scale_ptr + 40);
+        __m256 scale_r6 = _mm256_loadu_ps(scale_ptr + 48);
+        __m256 scale_r7 = _mm256_loadu_ps(scale_ptr + 56);
+        __m256 norm = _mm256_set1_ps(1.0f/64.0f);
+        __m256 zero = _mm256_setzero_ps();
+
+        #pragma omp parallel for collapse(3)
+        for(size_t n=0; n<N; ++n) {
+            for(size_t h=0; h<H_out; ++h) {
+                for(size_t w=0; w<W_out; ++w) {
+                    size_t out_idx = ((n*H_out + h)*W_out + w)*64;
+                    if (!active_mask[n]) {
+                        for(int i=0; i<8; ++i) {
+                            _mm256_storeu_ps(out_ptr + out_idx + i*8, zero);
+                            _mm256_storeu_ps(pre_relu_ptr + out_idx + i*8, _mm256_set1_ps(-1.0f));
+                        }
+                        continue;
+                    }
+                    size_t eyes_idx = ((n*H_out + h)*W_out + w)*64;
+                    const float* ptr = eyes_ptr + eyes_idx;
+                    __m256 r0 = _mm256_loadu_ps(ptr + 0);
+                    __m256 r1 = _mm256_loadu_ps(ptr + 8);
+                    __m256 r2 = _mm256_loadu_ps(ptr + 16);
+                    __m256 r3 = _mm256_loadu_ps(ptr + 24);
+                    __m256 r4 = _mm256_loadu_ps(ptr + 32);
+                    __m256 r5 = _mm256_loadu_ps(ptr + 40);
+                    __m256 r6 = _mm256_loadu_ps(ptr + 48);
+                    __m256 r7 = _mm256_loadu_ps(ptr + 56);
+                    fwht8_avx2(r0); fwht8_avx2(r1); fwht8_avx2(r2); fwht8_avx2(r3);
+                    fwht8_avx2(r4); fwht8_avx2(r5); fwht8_avx2(r6); fwht8_avx2(r7);
+                    Ops::butterfly(r0, r1); Ops::butterfly(r2, r3); Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
+                    Ops::butterfly(r0, r2); Ops::butterfly(r1, r3); Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
+                    Ops::butterfly(r0, r4); Ops::butterfly(r1, r5); Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
+                    r0 = _mm256_mul_ps(r0, scale_r0);
+                    r1 = _mm256_mul_ps(r1, scale_r1);
+                    r2 = _mm256_mul_ps(r2, scale_r2);
+                    r3 = _mm256_mul_ps(r3, scale_r3);
+                    r4 = _mm256_mul_ps(r4, scale_r4);
+                    r5 = _mm256_mul_ps(r5, scale_r5);
+                    r6 = _mm256_mul_ps(r6, scale_r6);
+                    r7 = _mm256_mul_ps(r7, scale_r7);
+                    __m256 t0 = r0, t1 = r1, t2 = r2, t3 = r3, t4 = r4, t5 = r5, t6 = r6, t7 = r7;
+                    auto sp_mix = [&](__m256& curr, __m256 prev_reg, __m256 next_reg) {
+                        __m256 prev = shift_right_1(curr, prev_reg);
+                        __m256 next = shift_left_1(curr, next_reg);
+                        __m256 res = _mm256_mul_ps(curr, w_sp1);
+                        res = _mm256_fmadd_ps(prev, w_sp0, res);
+                        res = _mm256_fmadd_ps(next, w_sp2, res);
+                        return res;
+                    };
+                    r0 = sp_mix(t0, t7, t1);
+                    r1 = sp_mix(t1, t0, t2);
+                    r2 = sp_mix(t2, t1, t3);
+                    r3 = sp_mix(t3, t2, t4);
+                    r4 = sp_mix(t4, t3, t5);
+                    r5 = sp_mix(t5, t4, t6);
+                    r6 = sp_mix(t6, t5, t7);
+                    r7 = sp_mix(t7, t6, t0);
+
+                    fwht8_avx2(r0); fwht8_avx2(r1); fwht8_avx2(r2); fwht8_avx2(r3);
+                    fwht8_avx2(r4); fwht8_avx2(r5); fwht8_avx2(r6); fwht8_avx2(r7);
+                    Ops::butterfly(r0, r1); Ops::butterfly(r2, r3); Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
+                    Ops::butterfly(r0, r2); Ops::butterfly(r1, r3); Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
+                    Ops::butterfly(r0, r4); Ops::butterfly(r1, r5); Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
+                    r0 = _mm256_mul_ps(r0, norm);
+                    r1 = _mm256_mul_ps(r1, norm);
+                    r2 = _mm256_mul_ps(r2, norm);
+                    r3 = _mm256_mul_ps(r3, norm);
+                    r4 = _mm256_mul_ps(r4, norm);
+                    r5 = _mm256_mul_ps(r5, norm);
+                    r6 = _mm256_mul_ps(r6, norm);
+                    r7 = _mm256_mul_ps(r7, norm);
+                    auto bias_relu = [&](__m256& r, __m256 b, float* pre_p) {
+                        r = _mm256_add_ps(r, b);
+                        _mm256_storeu_ps(pre_p, r);
+                        r = _mm256_max_ps(r, zero);
+                    };
+                    bias_relu(r0, bias_r0, pre_relu_ptr + out_idx + 0);
+                    bias_relu(r1, bias_r1, pre_relu_ptr + out_idx + 8);
+                    bias_relu(r2, bias_r2, pre_relu_ptr + out_idx + 16);
+                    bias_relu(r3, bias_r3, pre_relu_ptr + out_idx + 24);
+                    bias_relu(r4, bias_r4, pre_relu_ptr + out_idx + 32);
+                    bias_relu(r5, bias_r5, pre_relu_ptr + out_idx + 40);
+                    bias_relu(r6, bias_r6, pre_relu_ptr + out_idx + 48);
+                    bias_relu(r7, bias_r7, pre_relu_ptr + out_idx + 56);
+                    _mm256_storeu_ps(out_ptr + out_idx + 0, r0);
+                    _mm256_storeu_ps(out_ptr + out_idx + 8, r1);
+                    _mm256_storeu_ps(out_ptr + out_idx + 16, r2);
+                    _mm256_storeu_ps(out_ptr + out_idx + 24, r3);
+                    _mm256_storeu_ps(out_ptr + out_idx + 32, r4);
+                    _mm256_storeu_ps(out_ptr + out_idx + 40, r5);
+                    _mm256_storeu_ps(out_ptr + out_idx + 48, r6);
+                    _mm256_storeu_ps(out_ptr + out_idx + 56, r7);
+                }
+            }
+        }
+    }
+
+    void forward_avx2_c128_mixer(size_t N, size_t H, size_t W, float* out_ptr, float* pre_relu_ptr, const float* eyes_ptr, const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr, const std::vector<bool>& active_mask) {
+        using namespace dreidel::hal::x86;
+        __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0), w_sp1 = _mm256_broadcast_ss(sp_w + 1), w_sp2 = _mm256_broadcast_ss(sp_w + 2);
+        __m256 norm = _mm256_set1_ps(1.0f/128.0f);
+        __m256 zero = _mm256_setzero_ps();
+
+        #pragma omp parallel for collapse(3)
+        for(size_t n=0; n<N; ++n) {
+            for(size_t h=0; h<H; ++h) {
+                for(size_t w=0; w<W; ++w) {
+                    size_t out_idx = ((n*H + h)*W + w)*128;
+                    if (!active_mask[n]) {
+                        for(int i=0; i<16; ++i) {
+                            _mm256_storeu_ps(out_ptr + out_idx + i*8, zero);
+                            _mm256_storeu_ps(pre_relu_ptr + out_idx + i*8, _mm256_set1_ps(-1.0f));
+                        }
+                        continue;
+                    }
+
+                    __m256 r[16];
+                    const float* ptr = eyes_ptr + out_idx;
+                    for(int i=0; i<16; ++i) r[i] = _mm256_loadu_ps(ptr + i*8);
+
+                    alignas(32) float buf[128];
+                    for(int i=0; i<16; ++i) _mm256_store_ps(buf + i*8, r[i]);
+                    fwht128_avx2(buf);
+                    for(int i=0; i<16; ++i) r[i] = _mm256_load_ps(buf + i*8);
+
+                    for(int i=0; i<16; ++i) {
+                        __m256 s = _mm256_loadu_ps(scale_ptr + i*8);
+                        r[i] = _mm256_mul_ps(r[i], s);
+                    }
+
+                    __m256 t[16]; for(int i=0; i<16; ++i) t[i] = r[i];
+                    auto mix = [&](__m256& curr, __m256 prev, __m256 next) {
+                        __m256 p = shift_right_1(curr, prev);
+                        __m256 n = shift_left_1(curr, next);
+                        __m256 res = _mm256_mul_ps(curr, w_sp1);
+                        res = _mm256_fmadd_ps(p, w_sp0, res);
+                        res = _mm256_fmadd_ps(n, w_sp2, res);
+                        return res;
+                    };
+                    for(int i=0; i<16; ++i) {
+                        int p = (i==0)?15:i-1;
+                        int n = (i==15)?0:i+1;
+                        r[i] = mix(t[i], t[p], t[n]);
+                    }
+
+                    for(int i=0; i<16; ++i) _mm256_store_ps(buf + i*8, r[i]);
+                    fwht128_avx2(buf);
+                    for(int i=0; i<16; ++i) r[i] = _mm256_load_ps(buf + i*8);
+
+                    for(int i=0; i<16; ++i) {
+                        __m256 b = _mm256_loadu_ps(bias_ptr + i*8);
+                        r[i] = _mm256_mul_ps(r[i], norm);
+                        r[i] = _mm256_add_ps(r[i], b);
+                        _mm256_storeu_ps(pre_relu_ptr + out_idx + i*8, r[i]);
+                        r[i] = _mm256_max_ps(r[i], zero);
+                        _mm256_storeu_ps(out_ptr + out_idx + i*8, r[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    void forward_avx2_generic_large_mixer(size_t N, size_t H, size_t W, float* out_ptr, float* pre_relu_ptr, const float* eyes_ptr, const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr, const std::vector<bool>& active_mask, size_t C) {
+        using namespace dreidel::hal::x86;
+        __m256 w_sp0 = _mm256_broadcast_ss(sp_w + 0), w_sp1 = _mm256_broadcast_ss(sp_w + 1), w_sp2 = _mm256_broadcast_ss(sp_w + 2);
+        __m256 norm = _mm256_set1_ps(1.0f/C);
+        __m256 zero = _mm256_setzero_ps();
+
+        #pragma omp parallel
+        {
+            std::vector<float, core::AlignedAllocator<float>> buf(C);
+            #pragma omp for collapse(3)
+            for(size_t n=0; n<N; ++n) {
+                for(size_t h=0; h<H; ++h) {
+                    for(size_t w=0; w<W; ++w) {
+                        size_t idx = ((n*H + h)*W + w)*C;
+                        if (!active_mask[n]) {
+                            for(size_t i=0; i<C; i+=8) {
+                                _mm256_storeu_ps(out_ptr + idx + i, zero);
+                                _mm256_storeu_ps(pre_relu_ptr + idx + i, _mm256_set1_ps(-1.0f));
+                            }
+                            continue;
+                        }
+
+                        std::copy(eyes_ptr + idx, eyes_ptr + idx + C, buf.begin());
+                        algo::WHT::fwht_1d(buf.data(), C);
+
+                        for(size_t i=0; i<C; i+=8) {
+                            __m256 v = _mm256_load_ps(buf.data() + i);
+                            __m256 s = _mm256_loadu_ps(scale_ptr + i);
+                            _mm256_store_ps(buf.data() + i, _mm256_mul_ps(v, s));
+                        }
+
+                        std::vector<float, core::AlignedAllocator<float>> temp = buf;
+                        for(size_t c=0; c<C; ++c) {
+                            size_t p = (c==0)?C-1:c-1;
+                            size_t nx = (c==C-1)?0:c+1;
+                            buf[c] = sp_w[0]*temp[p] + sp_w[1]*temp[c] + sp_w[2]*temp[nx];
+                        }
+
+                        algo::WHT::fwht_1d(buf.data(), C);
+
+                        for(size_t i=0; i<C; i+=8) {
+                            __m256 v = _mm256_load_ps(buf.data() + i);
+                            __m256 b = _mm256_loadu_ps(bias_ptr + i);
+                            v = _mm256_mul_ps(v, norm);
+                            v = _mm256_add_ps(v, b);
+                            _mm256_storeu_ps(pre_relu_ptr + idx + i, v);
+                            v = _mm256_max_ps(v, zero);
+                            _mm256_storeu_ps(out_ptr + idx + i, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void forward_avx2_c64_to_1_mixer(
+        size_t N, size_t H_out, size_t W_out,
+        float* out_ptr, float* pre_relu_ptr, const float* eyes_ptr,
+        const float* scale_ptr, const float* sp_w, const float* dp_w, const float* bias_ptr,
+        const std::vector<bool>& active_mask
+    ) {
+        using namespace dreidel::hal::x86;
+        float bias_val = bias_ptr[0];
+        __m256 scale_r0 = _mm256_loadu_ps(scale_ptr + 0);
+        __m256 scale_r1 = _mm256_loadu_ps(scale_ptr + 8);
+        __m256 scale_r2 = _mm256_loadu_ps(scale_ptr + 16);
+        __m256 scale_r3 = _mm256_loadu_ps(scale_ptr + 24);
+        __m256 scale_r4 = _mm256_loadu_ps(scale_ptr + 32);
+        __m256 scale_r5 = _mm256_loadu_ps(scale_ptr + 40);
+        __m256 scale_r6 = _mm256_loadu_ps(scale_ptr + 48);
+        __m256 scale_r7 = _mm256_loadu_ps(scale_ptr + 56);
+
+        #pragma omp parallel for collapse(3)
+        for(size_t n=0; n<N; ++n) {
+            for(size_t h=0; h<H_out; ++h) {
+                for(size_t w=0; w<W_out; ++w) {
+                    size_t out_idx = ((n*H_out + h)*W_out + w);
+                    if (!active_mask[n]) {
+                        out_ptr[out_idx] = 0.0f;
+                        pre_relu_ptr[out_idx] = -1.0f;
+                        continue;
+                    }
+                    size_t eyes_idx = ((n*H_out + h)*W_out + w)*64;
+                    const float* ptr = eyes_ptr + eyes_idx;
+
+                    __m256 r0 = _mm256_loadu_ps(ptr + 0);
+                    __m256 r1 = _mm256_loadu_ps(ptr + 8);
+                    __m256 r2 = _mm256_loadu_ps(ptr + 16);
+                    __m256 r3 = _mm256_loadu_ps(ptr + 24);
+                    __m256 r4 = _mm256_loadu_ps(ptr + 32);
+                    __m256 r5 = _mm256_loadu_ps(ptr + 40);
+                    __m256 r6 = _mm256_loadu_ps(ptr + 48);
+                    __m256 r7 = _mm256_loadu_ps(ptr + 56);
+
+                    fwht8_avx2(r0); fwht8_avx2(r1); fwht8_avx2(r2); fwht8_avx2(r3);
+                    fwht8_avx2(r4); fwht8_avx2(r5); fwht8_avx2(r6); fwht8_avx2(r7);
+                    Ops::butterfly(r0, r1); Ops::butterfly(r2, r3); Ops::butterfly(r4, r5); Ops::butterfly(r6, r7);
+                    Ops::butterfly(r0, r2); Ops::butterfly(r1, r3); Ops::butterfly(r4, r6); Ops::butterfly(r5, r7);
+                    Ops::butterfly(r0, r4); Ops::butterfly(r1, r5); Ops::butterfly(r2, r6); Ops::butterfly(r3, r7);
+
+                    r0 = _mm256_mul_ps(r0, scale_r0);
+                    r1 = _mm256_mul_ps(r1, scale_r1);
+                    r2 = _mm256_mul_ps(r2, scale_r2);
+                    r3 = _mm256_mul_ps(r3, scale_r3);
+                    r4 = _mm256_mul_ps(r4, scale_r4);
+                    r5 = _mm256_mul_ps(r5, scale_r5);
+                    r6 = _mm256_mul_ps(r6, scale_r6);
+                    r7 = _mm256_mul_ps(r7, scale_r7);
+
+                    float buf0 = _mm256_cvtss_f32(r0);
+                    __m256 r0_shuf = _mm256_permute_ps(r0, 0x01);
+                    float buf1 = _mm256_cvtss_f32(r0_shuf);
+                    __m256 r7_high = _mm256_permute2f128_ps(r7, r7, 0x11);
+                    __m256 r7_perm = _mm256_permute_ps(r7_high, 0xFF);
+                    float buf63 = _mm256_cvtss_f32(r7_perm);
+
+                    float val = sp_w[0] * buf63 + sp_w[1] * buf0 + sp_w[2] * buf1;
+                    val += bias_val;
+                    pre_relu_ptr[out_idx] = val;
+                    if (val < 0) val = 0;
+                    out_ptr[out_idx] = val;
+                }
+            }
+        }
+    }
 #endif
     size_t in_channels_;
     size_t out_channels_;
