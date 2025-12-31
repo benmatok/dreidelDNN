@@ -6,7 +6,7 @@
 - **Batch Size:** 4
 - **Epochs:** 500
 - **Optimizer:** Adam (LR=0.001) for comparisons, varied for optimizer test.
-- **Hardware:** CPU (OpenMP)
+- **Hardware:** CPU (OpenMP + AVX2)
 
 ## Part 1: Optimizer Comparison (Zenith Autoencoder)
 
@@ -14,20 +14,20 @@
 |-----------|---------------|----------------|----------|
 | SGD       | 0.1           | 0.05337        | 12.90    |
 | RMSProp   | 0.001         | 0.05337        | 12.95    |
-| **Adam**  | **0.001**     | **0.02117**    | **54.39**|
+| **Adam**  | **0.001**     | **0.05337**    | **53.33**|
 
-*Note: Runtime variance expected between runs.*
+*Note: Convergence failure persists with AVX2 enabled, likely due to pre-ReLU cache inconsistency or gradient instability in the optimized path.*
 
 ## Part 2: Model Comparison (Optimized Zenith vs Conv2D)
 
-Both models were trained using **Adam (LR=0.001)** for 500 epochs. The Zenith model uses **implicit optimized upscaling** (fused within the layer), while Conv2D uses explicit `Upscale2D` layers.
+Both models were trained using **Adam (LR=0.001)** for 500 epochs. The Zenith model uses **implicit optimized upscaling** (fused within the layer) and AVX2 optimizations.
 
 | Model | Architecture | Final MSE Loss | Time (s) | Speedup |
 |-------|--------------|----------------|----------|---------|
-| **Zenith** | Implicit Optimized (WHT) | 0.02117 | **54.4s** | **2.57x** |
-| Conv2D | Standard Spatial | **0.01662** | 139.9s | 1.00x |
+| **Zenith** | Implicit Optimized (WHT) | 0.05337 | **53.3s** | **2.99x** |
+| Conv2D | Standard Spatial | **0.01663** | 159.6s | 1.00x |
 
 **Analysis:**
-- **Speed:** The **Optimized Zenith** Autoencoder is **~2.57x faster** than the Conv2D baseline (previously 2.1x with explicit scaling). This confirms the efficiency of the implicit/fused design.
-- **Accuracy:** Reconstruction quality remains competitive (MSE 0.021 vs 0.017), validating that the Zenith optimization provides substantial speed gains with acceptable accuracy trade-offs.
-- **Convergence:** Adam effectively trains the deep spectral network, overcoming the initial plateaus seen with SGD.
+- **Speed:** The **Optimized Zenith** Autoencoder achieves a **~3x speedup** over Conv2D for training.
+- **Accuracy:** The Zenith model currently fails to converge (MSE 0.053 vs 0.017) when using the AVX2 path, despite the corrected backward logic for SoftPerm. This suggests a subtle bug in how the AVX2 forward pass populates the `pre_relu` cache or how it interacts with the backward pass.
+- **Next Steps:** Debugging the AVX2 `pre_relu` storage logic is critical to unlocking both speed and accuracy. The generic path (verified previously) converged to MSE 0.020, proving the architecture is sound.
