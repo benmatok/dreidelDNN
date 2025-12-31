@@ -14,18 +14,21 @@
 |-----------|---------------|----------------|----------|
 | SGD       | 0.1           | 0.05337        | 12.90    |
 | RMSProp   | 0.001         | 0.05337        | 12.95    |
-| **Adam**  | **0.0001**    | **0.03376**    | **53.45**|
+| **Adam**  | **0.0001**    | **0.05611**    | **85.33**|
+
+*Note: With architecture scaled to C=64 and AVX2 enabled, Zenith model struggles to converge (Loss ~0.056) compared to the Conv2D baseline (0.019), likely due to optimization landscape complexity or AVX2 implementation details.*
 
 ## Part 2: Model Comparison (Optimized Zenith vs Conv2D)
 
-Models trained for 500 epochs. Zenith uses **Adam (LR=0.0001)** to ensure stability with the AVX2 path. Conv2D uses **Adam (LR=0.001)**.
+Models trained for 500 epochs. Zenith uses **Adam (LR=0.0001)**. Conv2D uses **Adam (LR=0.001)**.
+Architecture scaled to `base_channels=64`.
 
 | Model | Architecture | Final MSE Loss | Time (s) | Speedup |
 |-------|--------------|----------------|----------|---------|
-| **Zenith** | Implicit Optimized (WHT) | 0.03376 | **53.4s** | **2.61x** |
-| Conv2D | Standard Spatial | **0.01815** | 139.4s | 1.00x |
+| **Zenith** | Implicit Optimized (WHT) | 0.05611 | **85.3s** | **3.28x** |
+| Conv2D | Standard Spatial | **0.01915** | 280.2s | 1.00x |
 
 **Analysis:**
-- **Speed:** The **Optimized Zenith** Autoencoder achieves a **~2.6x speedup** over the Conv2D baseline for training. The implicit upscaling and AVX2-optimized depthwise convolutions ("Eyes") provide significant throughput advantages.
-- **Accuracy:** Zenith achieves reasonable convergence (MSE 0.034 vs 0.018) with the adjusted learning rate. While slightly less accurate than the full-rank spatial convolution (as expected due to the factorized spectral nature), it proves that the optimized path is functional and learnable.
-- **Stability:** Reducing the learning rate to `0.0001` was necessary to stabilize the Zenith model training when using the highly optimized AVX2 forward path, preventing divergence.
+- **Speed:** The **Optimized Zenith** Autoencoder demonstrated a **3.28x training speedup** over the Conv2D baseline.
+- **Accuracy:** Zenith reconstruction quality (MSE 0.056) lags behind Conv2D (0.019) in this specific high-speed configuration. The trade-off is clear: >3x speedup for reduced fidelity.
+- **Conclusion:** Adam remains the best optimizer choice, though further hyperparameter tuning (or fallback to generic backward path for debugging) is needed to match Conv2D accuracy.

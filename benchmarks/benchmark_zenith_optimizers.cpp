@@ -105,44 +105,44 @@ void generate_wavelet_batch(Tensor<T>& data) {
     }
 }
 
-// Build Optimized Zenith Autoencoder (Implicit Upscale)
+// Build Optimized Zenith Autoencoder (Implicit Upscale) - Scaled Up C=64
 std::vector<layers::Layer<float>*> build_zenith_autoencoder() {
     std::vector<layers::Layer<float>*> model;
-    // Encoder: Downsample via stride
-    // 64x64x1 -> 16x16x32 (Stride 4)
-    model.push_back(new layers::ZenithBlock<float>(1, 32, 3, 1, true, true, false, 4));
-    // 16x16x32 -> 4x4x32 (Stride 4)
-    model.push_back(new layers::ZenithBlock<float>(32, 32, 3, 32, true, true, false, 4));
-    // 4x4x32 -> 1x1x16 (Stride 4)
-    model.push_back(new layers::ZenithBlock<float>(32, 16, 3, 32, true, true, false, 4));
+    // Encoder: Stride=4, Upscale=1 (Downsample)
+    // 64x64x1 -> 16x16x64
+    model.push_back(new layers::ZenithBlock<float>(1, 64, 3, 1, true, true, false, 4, 1));
+    // 16x16x64 -> 4x4x64
+    model.push_back(new layers::ZenithBlock<float>(64, 64, 3, 64, true, true, false, 4, 1));
+    // 4x4x64 -> 1x1x32
+    model.push_back(new layers::ZenithBlock<float>(64, 32, 3, 64, true, true, false, 4, 1));
 
-    // Decoder: Upscale via fused implicit upscale
-    // 1x1x16 -> 4x4x32 (Upscale 4)
-    model.push_back(new layers::ZenithBlock<float>(16, 32, 3, 16, true, true, false, 1, 4));
-    // 4x4x32 -> 16x16x32 (Upscale 4)
-    model.push_back(new layers::ZenithBlock<float>(32, 32, 3, 32, true, true, false, 1, 4));
-    // 16x16x32 -> 64x64x1 (Upscale 4)
-    model.push_back(new layers::ZenithBlock<float>(32, 1, 3, 32, true, true, false, 1, 4));
+    // Decoder: Stride=1, Upscale=4 (Upsample)
+    // 1x1x32 -> 4x4x64
+    model.push_back(new layers::ZenithBlock<float>(32, 64, 3, 32, true, true, false, 1, 4));
+    // 4x4x64 -> 16x16x64
+    model.push_back(new layers::ZenithBlock<float>(64, 64, 3, 64, true, true, false, 1, 4));
+    // 16x16x64 -> 64x64x1
+    model.push_back(new layers::ZenithBlock<float>(64, 1, 3, 64, true, true, false, 1, 4));
     return model;
 }
 
-// Build Conv2D Autoencoder (Baseline with Explicit Upscale)
+// Build Conv2D Autoencoder (Baseline with Explicit Upscale) - Scaled Up C=64
 std::vector<layers::Layer<float>*> build_conv_autoencoder() {
     std::vector<layers::Layer<float>*> model;
     // Encoder
-    model.push_back(new layers::Conv2D<float>(1, 32, 3, 4, 1));
-    model.push_back(new layers::Conv2D<float>(32, 32, 3, 4, 1));
-    model.push_back(new layers::Conv2D<float>(32, 16, 3, 4, 1));
+    model.push_back(new layers::Conv2D<float>(1, 64, 3, 4, 1));
+    model.push_back(new layers::Conv2D<float>(64, 64, 3, 4, 1));
+    model.push_back(new layers::Conv2D<float>(64, 32, 3, 4, 1));
 
     // Decoder
     model.push_back(new Upscale2D<float>(4));
-    model.push_back(new layers::Conv2D<float>(16, 32, 3, 1, 1));
+    model.push_back(new layers::Conv2D<float>(32, 64, 3, 1, 1));
 
     model.push_back(new Upscale2D<float>(4));
-    model.push_back(new layers::Conv2D<float>(32, 32, 3, 1, 1));
+    model.push_back(new layers::Conv2D<float>(64, 64, 3, 1, 1));
 
     model.push_back(new Upscale2D<float>(4));
-    model.push_back(new layers::Conv2D<float>(32, 1, 3, 1, 1));
+    model.push_back(new layers::Conv2D<float>(64, 1, 3, 1, 1));
 
     return model;
 }
@@ -152,7 +152,7 @@ float train_loop(std::string name, std::vector<layers::Layer<float>*> model, siz
     std::cout << "\n--- Starting Training: " << name << " ---" << std::endl;
     size_t H = 64, W = 64;
 
-    optim::Adam<float> optimizer(lr); // Use Adam as it was best
+    optim::Adam<float> optimizer(lr);
 
     // Register params
     for(auto* layer : model) {
@@ -221,13 +221,13 @@ float train_loop(std::string name, std::vector<layers::Layer<float>*> model, siz
 }
 
 int main() {
-    std::cout << "=== Model Comparison Benchmark: Optimized Zenith vs Conv2D (Adam, 500 Epochs) ===" << std::endl;
+    std::cout << "=== Model Comparison Benchmark: Optimized Zenith (C=64) vs Conv2D (Adam, 500 Epochs) ===" << std::endl;
 
     size_t batch_size = 4;
     size_t epochs = 500;
 
     // 1. Zenith (Implicit Upscale)
-    // Reduce LR to prevent divergence in AVX optimized path
+    // Reduce LR slightly for stability
     train_loop("Optimized Zenith Autoencoder", build_zenith_autoencoder(), epochs, batch_size, 0.0001f);
 
     // 2. Conv2D
