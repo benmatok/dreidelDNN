@@ -83,13 +83,18 @@ template <typename T>
 void generate_wavelet_batch(Tensor<T>& data) {
     auto shape = data.shape();
     size_t batch = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
+    // Re-seed every call for variety but consistent sequence if single thread,
+    // but here we want random data. Or consistent?
+    // Let's keep it somewhat random but deterministic per epoch if we reset seed.
+    // For now, simple random.
     static std::mt19937 gen(12345);
     T* ptr = data.data();
 
     #pragma omp parallel for
     for(size_t n=0; n<batch; ++n) {
-        T mu_x = 0.5 * W + 0.2 * W * std::sin(n);
-        T mu_y = 0.5 * H + 0.2 * H * std::cos(n);
+        // Simple distinct patterns per batch item
+        T mu_x = 0.5 * W + 0.2 * W * std::sin(n * 0.1);
+        T mu_y = 0.5 * H + 0.2 * H * std::cos(n * 0.1);
         T s_x = (W/10.0) * (1.0 + 0.5 * std::sin(n*0.5));
 
         for(size_t c=0; c<C; ++c) {
@@ -147,19 +152,26 @@ std::vector<layers::Layer<float>*> build_conv_autoencoder() {
     return model;
 }
 
+enum OptType { USE_ADAM, USE_RMSPROP };
+
 // Training Loop Helper
-float train_loop(std::string name, std::vector<layers::Layer<float>*> model, size_t epochs, size_t batch_size, float lr = 0.001f) {
-    std::cout << "\n--- Starting Training: " << name << " ---" << std::endl;
+float train_loop(std::string name, std::vector<layers::Layer<float>*> model, size_t epochs, size_t batch_size, float lr, OptType opt_type) {
+    std::cout << "\n--- Starting Training: " << name << " (" << (opt_type == USE_ADAM ? "Adam" : "RMSProp") << ", lr=" << lr << ") ---" << std::endl;
     size_t H = 64, W = 64;
 
-    optim::Adam<float> optimizer(lr);
+    optim::Optimizer<float>* optimizer = nullptr;
+    if (opt_type == USE_ADAM) {
+        optimizer = new optim::Adam<float>(lr);
+    } else {
+        optimizer = new optim::RMSProp<float>(lr);
+    }
 
     // Register params
     for(auto* layer : model) {
         auto params = layer->parameters();
         auto grads = layer->gradients();
         if (!params.empty() && params.size() == grads.size()) {
-            optimizer.add_parameters(params, grads);
+            optimizer->add_parameters(params, grads);
         }
     }
 
@@ -198,14 +210,14 @@ float train_loop(std::string name, std::vector<layers::Layer<float>*> model, siz
         final_loss = loss;
 
         // Backward
-        optimizer.zero_grad();
+        optimizer->zero_grad();
         Tensor<float> grad = grad_output;
         for(int i = model.size() - 1; i >= 0; --i) {
             grad = model[i]->backward(grad);
         }
 
         // Update
-        optimizer.step();
+        optimizer->step();
 
         if (epoch % 50 == 0 || epoch == epochs-1) {
             std::cout << "Epoch " << epoch << " Loss: " << loss << std::endl;
@@ -217,21 +229,24 @@ float train_loop(std::string name, std::vector<layers::Layer<float>*> model, siz
     std::cout << name << " | Final Loss: " << final_loss << " | Time: " << time_sec << "s" << std::endl;
 
     for(auto* l : model) delete l;
+    delete optimizer;
     return final_loss;
 }
 
 int main() {
-    std::cout << "=== Model Comparison Benchmark: Optimized Zenith (C=64) vs Conv2D (Adam, 500 Epochs) ===" << std::endl;
+    std::cout << "=== Model Comparison Benchmark: Optimized Zenith vs Conv2D ===" << std::endl;
 
     size_t batch_size = 4;
     size_t epochs = 500;
 
-    // 1. Zenith (Implicit Upscale)
-    // Reduce LR slightly for stability
-    train_loop("Optimized Zenith Autoencoder", build_zenith_autoencoder(), epochs, batch_size, 0.0001f);
+    // 1. Zenith with Adam (Tuned LR)
+    train_loop("Zenith", build_zenith_autoencoder(), epochs, batch_size, 0.0005f, USE_ADAM);
 
-    // 2. Conv2D
-    train_loop("Conv2D Autoencoder", build_conv_autoencoder(), epochs, batch_size, 0.001f);
+    // 2. Zenith with RMSProp
+    train_loop("Zenith", build_zenith_autoencoder(), epochs, batch_size, 0.0005f, USE_RMSPROP);
+
+    // 3. Conv2D with Adam (Baseline)
+    train_loop("Conv2D", build_conv_autoencoder(), epochs, batch_size, 0.001f, USE_ADAM);
 
     return 0;
 }

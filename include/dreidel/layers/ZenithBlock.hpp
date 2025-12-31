@@ -44,13 +44,17 @@ public:
         T stddev = std::sqrt(static_cast<T>(2.0) / (kernel_size * kernel_size));
         packed_weights_.random(0, stddev);
 
-        // Initialization update: Mean 1.0, std 0.2
+        // Initialization: Mean 1.0, std 0.2
         spectral_scales_.random(1.0, 0.2);
 
-        soft_perm_weights_.fill(0); soft_perm_weights_.data()[1] = 1.0;
+        // SoftPerm: Init with slight mixing to break symmetry
+        soft_perm_weights_.data()[0] = 0.05;
+        soft_perm_weights_.data()[1] = 0.90;
+        soft_perm_weights_.data()[2] = 0.05;
+
         dilated_perm_weights_.fill(0);
 
-        // Initialization update: Bias 0.01 to prevent dead ReLU
+        // Bias 0.01 to prevent dead ReLU
         bias_.fill(0.01);
 
         oracle_projection_.random(-1.0, 1.0);
@@ -464,17 +468,6 @@ public:
                 }
             }
         }
-
-        if (!printed_debug) {
-            T bias_g_sum = 0;
-            for(size_t i=0; i<grad_bias_.size(); ++i) bias_g_sum += grad_bias_.data()[i];
-            T eyes_g_sum = 0;
-            for(size_t i=0; i<grad_eyes.size(); ++i) eyes_g_sum += grad_eyes.data()[i];
-
-            std::cout << "[DEBUG BACKWARD] Bias Grad Sum: " << bias_g_sum << " Eyes Grad Sum: " << eyes_g_sum << std::endl;
-            printed_debug = true;
-        }
-
         return grad_input;
     }
 
