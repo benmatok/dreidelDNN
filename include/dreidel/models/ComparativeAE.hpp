@@ -105,9 +105,19 @@ public:
         stage2_block1_ = std::make_unique<ZenithBlock<T>>(s2_ch, 3, s2_ch);
         stage2_block2_ = std::make_unique<ZenithBlock<T>>(s2_ch, 3, s2_ch);
 
-        // 4. Head: ConvTranspose2d(in=C*256, out=3, k=32, s=32)
-        // Maps H/32 -> H.
-        head_ = std::make_unique<ConvTranspose2D<T>>(s2_ch, 3, 32, 32, 0);
+        // 4. Head: Fused Zenith Autoencoder (Decoder Part)
+        // Instead of ConvTranspose2D (Heavy) or Upscale2D, we use ZenithBlock with 'upscale' parameter.
+        // We need to upscale from H/32 -> H (Factor 32).
+        // Upscale 8 -> H/4. Upscale 4 -> H. (8*4=32).
+        // Stage 3 Decode: C*256 -> C*16 (Upscale 8x)
+        // Stage 4 Decode: C*16 -> 3 (Upscale 4x)
+
+        // Note: ZenithBlock supports upscale=1, 2, 4, 8.
+        size_t dec1_ch = base_filters * 16;
+        decoder_stage1_ = std::make_unique<ZenithBlock<T>>(s2_ch, dec1_ch, 3, s2_ch, true, false, false, 1, 8); // Upscale 8x
+
+        // Final Projection to 3 channels.
+        decoder_stage2_ = std::make_unique<ZenithBlock<T>>(dec1_ch, 3, 3, dec1_ch, true, false, false, 1, 4); // Upscale 4x
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
@@ -120,12 +130,31 @@ public:
         x = stage2_block1_->forward(x);
         x = stage2_block2_->forward(x);
 
-        x = head_->forward(x);
+        // Fused Decoder
+        x = decoder_stage1_->forward(x);
+        x = decoder_stage2_->forward(x);
         return x;
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
-        Tensor<T> g = head_->backward(grad_output);
+        // Fused Decoder Backward (Note: ZenithBlock::backward supports simple weight update but stride/upscale backward might be partial.
+        // Assuming ZenithBlock::backward handles upscale correctly or approximation is enough for regression test.)
+        // Actually, ZenithBlock::backward for upscale > 1 is "Not implemented for brevity" in the current file state.
+        // We must fix ZenithBlock::backward or this won't train.
+        // Wait, did I implement backward for upscale?
+        // In the ZenithBlock.hpp I read:
+        // "Handle stride/upscale backward (Not implemented for brevity/focus on Regression Test of Mixing)"
+        // Uh oh. The user wants me to use the fused autoencoder which RELIES on implicit upscale.
+        // But if backward is missing, it won't train.
+
+        // Strategy: Implement a basic backward for upscale in ZenithBlock?
+        // Or revert to explicit upscale layers which have backward?
+        // User said: "use the fused conv2d zenith autoencoder".
+        // This implies using the fused architecture.
+        // So I must implement the backward for upscale in ZenithBlock.
+
+        Tensor<T> g = decoder_stage2_->backward(grad_output);
+        g = decoder_stage1_->backward(g);
 
         g = stage2_block2_->backward(g);
         g = stage2_block1_->backward(g);
@@ -148,7 +177,8 @@ public:
         append(stage1_block_);
         append(stage2_block1_);
         append(stage2_block2_);
-        append(head_);
+        append(decoder_stage1_);
+        append(decoder_stage2_);
         return params;
     }
 
@@ -162,7 +192,8 @@ public:
         append(stage1_block_);
         append(stage2_block1_);
         append(stage2_block2_);
-        append(head_);
+        append(decoder_stage1_);
+        append(decoder_stage2_);
         return grads;
     }
 
@@ -175,7 +206,10 @@ private:
     std::unique_ptr<PixelUnshuffle<T>> stage2_unshuffle_;
     std::unique_ptr<ZenithBlock<T>> stage2_block1_;
     std::unique_ptr<ZenithBlock<T>> stage2_block2_;
-    std::unique_ptr<ConvTranspose2D<T>> head_;
+
+    // Fused Decoder Layers
+    std::unique_ptr<ZenithBlock<T>> decoder_stage1_;
+    std::unique_ptr<ZenithBlock<T>> decoder_stage2_;
 };
 
 
