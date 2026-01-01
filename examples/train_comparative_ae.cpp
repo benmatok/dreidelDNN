@@ -84,12 +84,12 @@ void save_tensor_as_png(const Tensor<T>& tensor, size_t batch_idx, size_t H, siz
 int main() {
     std::cout << "=== Training Comparative Autoencoders on Wavelets (32x32) ===\n";
 
-    // Config - REDUCED
+    // Config - INCREASED for Fused Kernel (base=16 -> max=4096)
     const size_t H = 32;
     const size_t W = 32;
-    const size_t C = 8;
-    const size_t BatchSize = 2; // Reduced to 2 to avoid OOM/Stack issues in sandbox
-    const size_t Epochs = 2; // Reduced for speed check
+    const size_t C = 16; // Base filters 16 -> Stage 2 is 16*256 = 4096 channels
+    const size_t BatchSize = 2;
+    const size_t Epochs = 2;
     const size_t StepsPerEpoch = 5;
 
     // Generator
@@ -103,19 +103,21 @@ int main() {
     std::cout << "Initializing ZenithHierarchicalAE..." << std::endl;
     ZenithHierarchicalAE<float> zenith_ae(C);
 
-    std::cout << "Initializing ConvBaselineAE..." << std::endl;
-    ConvBaselineAE<float> conv_ae(C);
+    std::cout << "Initializing ConvBaselineAE (Skipped)..." << std::endl;
+    // ConvBaselineAE<float> conv_ae(C); // OOM at C=16 (Max C=4096)
 
     // Optimizers
     std::cout << "Initializing Optimizers..." << std::endl;
     SimpleAdam<float> opt_zenith(1e-3);
     opt_zenith.add_parameters(zenith_ae.parameters(), zenith_ae.gradients());
 
-    SimpleAdam<float> opt_conv(1e-3);
-    opt_conv.add_parameters(conv_ae.parameters(), conv_ae.gradients());
+    // SimpleAdam<float> opt_conv(1e-3);
+    // opt_conv.add_parameters(conv_ae.parameters(), conv_ae.gradients());
 
     // Training Loop
     auto total_start = std::chrono::high_resolution_clock::now();
+    double total_time_z = 0;
+    double total_time_c = 0;
 
     for (size_t epoch = 0; epoch < Epochs; ++epoch) {
         float loss_z_acc = 0;
@@ -134,22 +136,18 @@ int main() {
             loss_z_acc += loss_z;
 
             // 3. Train Conv
-            opt_conv.zero_grad();
-            Tensor<float> out_c = conv_ae.forward(batch_input);
-            float loss_c = mse_loss(out_c, batch_input, batch_grad); // reuse grad buffer
-            conv_ae.backward(batch_grad);
-            opt_conv.step();
-            loss_c_acc += loss_c;
+            // opt_conv.zero_grad();
+            // Tensor<float> out_c = conv_ae.forward(batch_input);
+            // float loss_c = mse_loss(out_c, batch_input, batch_grad); // reuse grad buffer
+            // conv_ae.backward(batch_grad);
+            // opt_conv.step();
+            // loss_c_acc += loss_c;
         }
 
-        if ((epoch + 1) % 10 == 0 || epoch == 0 || epoch == Epochs - 1) {
-            auto current_time = std::chrono::high_resolution_clock::now();
-            double elapsed = std::chrono::duration_cast<std::chrono::seconds>(current_time - total_start).count();
-            std::cout << "Epoch " << epoch+1 << "/" << Epochs
-                      << " | Elapsed: " << elapsed << "s"
-                      << " | Loss Z: " << std::setprecision(5) << loss_z_acc / StepsPerEpoch
-                      << " | Loss C: " << std::setprecision(5) << loss_c_acc / StepsPerEpoch << std::endl;
-        }
+        std::cout << "Epoch " << epoch+1 << "/" << Epochs
+                  << " | Loss Z: " << std::setprecision(5) << loss_z_acc / StepsPerEpoch
+                  << " | Time Z: " << total_time_z << "s"
+                  << std::endl;
     }
 
     std::cout << "\nTraining Complete. Running Evaluation...\n";
