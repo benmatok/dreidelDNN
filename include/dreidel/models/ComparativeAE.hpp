@@ -43,11 +43,6 @@ public:
         // y = relu2(x + F(x))
         // dy = grad_output
         // d(x + F(x)) = dy * relu2'(y)
-        // Let's assume ReLU backward modifies in place or we call backward on relu layer
-
-        // This simple implementation might be tricky if layers don't cache inputs perfectly or handle branches.
-        // Conv2D etc cache input.
-        // But for the add: d(input) = d(out_before_relu) + d(F(x))/dx
 
         // 1. Backward through last ReLU
         Tensor<T> d_out_sum = relu2_->backward(grad_output);
@@ -99,8 +94,6 @@ public:
         // Input C, H/2. Output C*16, H/8.
         stage1_unshuffle_ = std::make_unique<PixelUnshuffle<T>>(4);
         // Body: 1x ZenithBlock(C*16)
-        // Kernel size? Let's assume 3. Spectral dim? C*16 or something smaller?
-        // Let's use spectral_dim = channels for full mixing.
         size_t s1_ch = base_filters * 16;
         stage1_block_ = std::make_unique<ZenithBlock<T>>(s1_ch, 3, s1_ch);
 
@@ -132,8 +125,17 @@ public:
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
-        // Not needed for inference benchmark, but required by interface
-        return Tensor<T>();
+        Tensor<T> g = head_->backward(grad_output);
+
+        g = stage2_block2_->backward(g);
+        g = stage2_block1_->backward(g);
+        g = stage2_unshuffle_->backward(g);
+
+        g = stage1_block_->backward(g);
+        g = stage1_unshuffle_->backward(g);
+
+        g = stem_->backward(g);
+        return g;
     }
 
     std::vector<Tensor<T>*> parameters() override {
@@ -150,7 +152,20 @@ public:
         return params;
     }
 
-    std::vector<Tensor<T>*> gradients() override { return {}; }
+    std::vector<Tensor<T>*> gradients() override {
+        std::vector<Tensor<T>*> grads;
+        auto append = [&](auto& layer) {
+            auto g = layer->gradients();
+            grads.insert(grads.end(), g.begin(), g.end());
+        };
+        append(stem_);
+        append(stage1_block_);
+        append(stage2_block1_);
+        append(stage2_block2_);
+        append(head_);
+        return grads;
+    }
+
     std::string name() const override { return "ZenithHierarchicalAE"; }
 
 private:
@@ -173,7 +188,6 @@ public:
         stem_ = std::make_unique<Conv2D<T>>(3, base_filters, 2, 2, 0);
 
         // 2. Stage 1 Equiv: Conv2d(C, C*16, k=4, s=4) -> H/8
-        // Note: PixelUnshuffle(4) reduces H by 4.
         stage1_conv_ = std::make_unique<Conv2D<T>>(base_filters, base_filters * 16, 4, 4, 0);
         stage1_relu_ = std::make_unique<ReLU<T>>();
         stage1_res_ = std::make_unique<ResidualBlock<T>>(base_filters * 16);
@@ -204,7 +218,21 @@ public:
         return x;
     }
 
-    Tensor<T> backward(const Tensor<T>& grad_output) override { return Tensor<T>(); }
+    Tensor<T> backward(const Tensor<T>& grad_output) override {
+        Tensor<T> g = head_->backward(grad_output);
+
+        g = stage2_res2_->backward(g);
+        g = stage2_res1_->backward(g);
+        g = stage2_relu_->backward(g);
+        g = stage2_conv_->backward(g);
+
+        g = stage1_res_->backward(g);
+        g = stage1_relu_->backward(g);
+        g = stage1_conv_->backward(g);
+
+        g = stem_->backward(g);
+        return g;
+    }
 
     std::vector<Tensor<T>*> parameters() override {
         std::vector<Tensor<T>*> params;
@@ -222,7 +250,22 @@ public:
         return params;
     }
 
-    std::vector<Tensor<T>*> gradients() override { return {}; }
+    std::vector<Tensor<T>*> gradients() override {
+        std::vector<Tensor<T>*> grads;
+        auto append = [&](auto& layer) {
+            auto g = layer->gradients();
+            grads.insert(grads.end(), g.begin(), g.end());
+        };
+        append(stem_);
+        append(stage1_conv_);
+        append(stage1_res_);
+        append(stage2_conv_);
+        append(stage2_res1_);
+        append(stage2_res2_);
+        append(head_);
+        return grads;
+    }
+
     std::string name() const override { return "ConvBaselineAE"; }
 
 private:

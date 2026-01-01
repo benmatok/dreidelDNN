@@ -63,18 +63,19 @@ public:
             for(size_t h_out=0; h_out<H_out; ++h_out) {
                 for(size_t w_out=0; w_out<W_out; ++w_out) {
 
-                    size_t h_in_start = h_out * stride_ - padding_;
-                    size_t w_in_start = w_out * stride_ - padding_;
+                    // Use long to prevent underflow during subtraction of padding
+                    long h_in_start = static_cast<long>(h_out * stride_) - static_cast<long>(padding_);
+                    long w_in_start = static_cast<long>(w_out * stride_) - static_cast<long>(padding_);
 
                     for(size_t c_out=0; c_out<C_out; ++c_out) {
                         T acc = b_ptr[c_out];
 
                         for(size_t ky=0; ky<kernel_size_; ++ky) {
                             for(size_t kx=0; kx<kernel_size_; ++kx) {
-                                int h_in = h_in_start + ky;
-                                int w_in = w_in_start + kx;
+                                long h_in = h_in_start + ky;
+                                long w_in = w_in_start + kx;
 
-                                if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+                                if (h_in >= 0 && h_in < static_cast<long>(H) && w_in >= 0 && w_in < static_cast<long>(W)) {
                                     for(size_t c_in=0; c_in<C_in; ++c_in) {
                                         // w index: c_out * (C_in*K*K) + c_in * (K*K) + ky*K + kx
                                         // in index: ((n*H + h_in)*W + w_in)*C_in + c_in
@@ -142,18 +143,18 @@ public:
             for(size_t h_out=0; h_out<H_out; ++h_out) {
                 for(size_t w_out=0; w_out<W_out; ++w_out) {
 
-                    int h_in_start = h_out * stride_ - padding_;
-                    int w_in_start = w_out * stride_ - padding_;
+                    long h_in_start = static_cast<long>(h_out * stride_) - static_cast<long>(padding_);
+                    long w_in_start = static_cast<long>(w_out * stride_) - static_cast<long>(padding_);
 
                     for(size_t c_out=0; c_out<out_channels_; ++c_out) {
                         T dy = go_ptr[((n*H_out+h_out)*W_out+w_out)*out_channels_ + c_out];
 
                         for(size_t ky=0; ky<kernel_size_; ++ky) {
                             for(size_t kx=0; kx<kernel_size_; ++kx) {
-                                int h_in = h_in_start + ky;
-                                int w_in = w_in_start + kx;
+                                long h_in = h_in_start + ky;
+                                long w_in = w_in_start + kx;
 
-                                if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+                                if (h_in >= 0 && h_in < static_cast<long>(H) && w_in >= 0 && w_in < static_cast<long>(W)) {
                                     for(size_t c_in=0; c_in<C_in; ++c_in) {
                                         size_t w_idx = ((c_out * in_channels_ + c_in) * kernel_size_ + ky) * kernel_size_ + kx;
                                         size_t in_idx = ((n*H + h_in)*W + w_in)*C_in + c_in;

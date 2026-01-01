@@ -10,39 +10,7 @@ namespace dreidel {
 namespace layers {
 
 // PixelShuffle: Rearranges elements in a tensor of shape (*, C*r^2, H, W) to (*, C, H*r, W*r)
-// But wait, our Tensor layout seems to be NHWC based on Conv2D and ZenithBlock.
-// (N, H, W, C).
-// Let's verify ZenithBlock: N, H, W, C.
-// So PixelShuffle for NHWC:
-// Input: (N, H, W, C*r^2) -> Output: (N, H*r, W*r, C)
-//
-// PyTorch PixelShuffle expects NCHW.
-// NCHW: (N, C*r^2, H, W) -> (N, C, H*r, W*r).
-//
-// Let's stick to NHWC which seems to be the convention here.
-// Logic for NHWC PixelShuffle (upscale):
-// We have r*r channels per pixel. We want to spread them into an r x r block.
-// Input[n, h, w, c_out * r * r + ry * r + rx]  --> Output[n, h*r + ry, w*r + rx, c_out]
-// Or some permutation thereof.
-// PyTorch: Channel dimension is split.
-// C_in = C_out * r * r.
-// Reshape to (C_out, r, r).
-// Output[n, c, h*r + ry, w*r + rx] = Input[n, c*r*r + ry*r + rx, h, w] (conceptually)
-//
-// For NHWC:
-// Input (N, H, W, C_in). C_in = C_out * r * r.
-// We want Output (N, H*r, W*r, C_out).
-//
-// Mapping:
-// For each n, h, w:
-//   For each c_out:
-//     For each ry in 0..r-1:
-//       For each rx in 0..r-1:
-//         // Which input channel maps to this spatial offset?
-//         // Usually, channels are [c0_00, c0_01, c0_10, c0_11, c1_00...]
-//         // c_in = c_out * (r*r) + ry*r + rx
-//         // output[n, h*r+ry, w*r+rx, c_out] = input[n, h, w, c_in]
-
+// NHWC Version
 template <typename T>
 class PixelShuffle : public Layer<T> {
 public:
@@ -83,7 +51,7 @@ public:
                                 size_t w_out_idx = w * r + rx;
 
                                 T val = in_ptr[((n * H + h) * W + w) * C_in + c_in];
-                                out_ptr[((n * H_out + h_out_idx) * W_out + w_out_idx) * C_out + c];
+                                out_ptr[((n * H_out + h_out_idx) * W_out + w_out_idx) * C_out + c] = val;
                             }
                         }
                     }
