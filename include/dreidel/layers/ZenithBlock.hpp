@@ -456,14 +456,10 @@ public:
                             size_t eyes_idx = ((n*H_out + h)*W_out + w)*in_channels_;
                             for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] = eyes_ptr[eyes_idx + c];
                         } else {
-                            // Recompute Depthwise Conv for this pixel (Gradient Checkpointing logic)
-                            // Assumes stride=1, upscale=1 (Fused path constraint)
+                            // Recompute Depthwise
                             int k_rad = kernel_size_ / 2;
-                            const T* w_base = packed_weights_.data(); // Use packed or optimized? Packed is simpler here unless we handle optimized layout.
-                            // If we repack in forward, optimized cache exists.
-                            // But for backward, let's use packed_weights_ (standard layout) for simplicity of implementation
-                            // unless performance is critical here. It is, but let's get correctness first.
-
+                            const T* w_base = packed_weights_.data();
+                            // std::cout << "Recomputing " << h << "," << w << std::endl;
                             std::fill(buf_eyes.begin(), buf_eyes.end(), 0);
                             for(int ky=-k_rad; ky<=k_rad; ++ky) {
                                 int ih = (int)h + ky;
@@ -473,12 +469,24 @@ public:
                                     if(iw < 0 || iw >= (int)W) continue;
 
                                     const T* in_p = input_ptr + ((n*H + ih)*W + iw)*in_channels_;
-                                    // Weight: [C, 1, K, K] -> [c, 0, ky+rad, kx+rad]
-                                    // But optimized layout is [K, K, C].
-                                    // If we use packed: c*K*K + (ky+rad)*K + (kx+rad)
 
+                                    // Optimized Inner Loop for cache locality
+                                    // w_base: [C, 1, K, K] (Planar)
+                                    // Accessing c stride 1 is bad for cache if stride is large.
+                                    // w_base[c*9 + ...] -> stride 9 floats. 36 bytes.
+                                    // in_p[c] -> stride 1 float.
+
+                                    // If C=4096.
+                                    // c=0: w[0], in[0]
+                                    // c=1: w[9], in[1]
+                                    // This is fine?
+
+                                    size_t w_offset = (ky+k_rad)*kernel_size_ + (kx+k_rad);
+                                    size_t w_stride = kernel_size_ * kernel_size_;
+
+                                    #pragma omp simd
                                     for(size_t c=0; c<in_channels_; ++c) {
-                                        T w_val = w_base[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
+                                        T w_val = w_base[c*w_stride + w_offset];
                                         buf_eyes[c] += in_p[c] * w_val;
                                     }
                                 }
