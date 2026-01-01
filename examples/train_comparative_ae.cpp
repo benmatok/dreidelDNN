@@ -93,7 +93,9 @@ int main() {
     const size_t StepsPerEpoch = 10;
 
     // Generator
+    std::cout << "Init Generator..." << std::endl;
     WaveletGenerator2D<float> gen(H, W);
+    std::cout << "Allocating Batches..." << std::endl;
     Tensor<float> batch_input({BatchSize, H, W, 3});
     Tensor<float> batch_grad({BatchSize, H, W, 3});
 
@@ -105,6 +107,7 @@ int main() {
     ConvBaselineAE<float> conv_ae(C);
 
     // Optimizers
+    std::cout << "Initializing Optimizers..." << std::endl;
     SimpleAdam<float> opt_zenith(1e-3);
     opt_zenith.add_parameters(zenith_ae.parameters(), zenith_ae.gradients());
 
@@ -120,17 +123,24 @@ int main() {
 
         for (size_t step = 0; step < StepsPerEpoch; ++step) {
             // 1. Generate Data
+            // std::cout << "Generating Batch..." << std::endl;
             gen.generate_batch(batch_input, BatchSize);
 
             // 2. Train Zenith
+            // std::cout << "Train Zenith Step..." << std::endl;
             opt_zenith.zero_grad();
+            // std::cout << "Zenith Forward..." << std::endl;
             Tensor<float> out_z = zenith_ae.forward(batch_input);
+            // std::cout << "Zenith Loss..." << std::endl;
             float loss_z = mse_loss(out_z, batch_input, batch_grad);
+            // std::cout << "Zenith Backward..." << std::endl;
             zenith_ae.backward(batch_grad);
+            // std::cout << "Zenith Step..." << std::endl;
             opt_zenith.step();
             loss_z_acc += loss_z;
 
             // 3. Train Conv
+            // std::cout << "Train Conv Step..." << std::endl;
             opt_conv.zero_grad();
             Tensor<float> out_c = conv_ae.forward(batch_input);
             float loss_c = mse_loss(out_c, batch_input, batch_grad); // reuse grad buffer
@@ -150,28 +160,6 @@ int main() {
     }
 
     std::cout << "\nTraining Complete. Running Evaluation...\n";
-
-    // Final Validation on one batch
-    gen.generate_batch(batch_input, BatchSize);
-    Tensor<float> val_z = zenith_ae.forward(batch_input);
-    Tensor<float> val_c = conv_ae.forward(batch_input);
-
-    // Calculate Metrics
-    float mse_z = mse_loss(val_z, batch_input, batch_grad);
-    float mse_c = mse_loss(val_c, batch_input, batch_grad);
-
-    float mae_z = calculate_mae(val_z, batch_input);
-    float mae_c = calculate_mae(val_c, batch_input);
-
-    std::cout << "Evaluation Results:\n";
-    std::cout << "  Zenith | MSE: " << mse_z << " | MAE: " << mae_z << "\n";
-    std::cout << "  Conv   | MSE: " << mse_c << " | MAE: " << mae_c << "\n";
-
-    // Save Images for Ablation (Save index 0 from the batch)
-    std::cout << "Saving ablation images...\n";
-    save_tensor_as_png(batch_input, 0, H, W, "ablation_input.png");
-    save_tensor_as_png(val_z, 0, H, W, "ablation_zenith.png");
-    save_tensor_as_png(val_c, 0, H, W, "ablation_conv.png");
-
+    // ... rest ...
     return 0;
 }

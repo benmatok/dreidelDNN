@@ -12,6 +12,7 @@
 #include <iostream>
 #include <omp.h>
 #include <cassert>
+#include <cstring> // for std::memset, std::memcpy
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -74,6 +75,7 @@ public:
 
 
     Tensor<T> forward(const Tensor<T>& input) override {
+        // std::cout << "ZenithBlock::forward " << in_channels_ << "->" << out_channels_ << std::endl;
         input_cached_ = input;
         auto shape = input.shape();
         size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
@@ -108,12 +110,25 @@ public:
             }
         }
 
-        if (eyes_out_cached_.shape().size() != 4 ||
-            eyes_out_cached_.shape()[0] != N ||
-            eyes_out_cached_.shape()[1] != H_out ||
-            eyes_out_cached_.shape()[2] != W_out ||
-            eyes_out_cached_.shape()[3] != in_channels_) {
-             eyes_out_cached_ = Tensor<T>({N, H_out, W_out, in_channels_});
+        // Optimization: Skip Eyes Cache allocation for Fused Path
+        bool use_fused_path = false;
+#ifdef __AVX2__
+        if constexpr (std::is_same_v<T, float>) {
+            if (in_channels_ == 4096 && out_channels_ == 4096 && kernel_size_ == 3 && stride_ == 1 && upscale_ == 1) {
+                use_fused_path = true;
+            }
+        }
+#endif
+
+        if (!use_fused_path) {
+            if (eyes_out_cached_.shape().size() != 4 ||
+                eyes_out_cached_.shape()[0] != N ||
+                eyes_out_cached_.shape()[1] != H_out ||
+                eyes_out_cached_.shape()[2] != W_out ||
+                eyes_out_cached_.shape()[3] != in_channels_) {
+                 // std::cout << "Allocating eyes_out_cached_: " << N << "x" << H_out << "x" << W_out << "x" << in_channels_ << std::endl;
+                 eyes_out_cached_ = Tensor<T>({N, H_out, W_out, in_channels_});
+            }
         }
 
         int k_rad = kernel_size_ / 2;
@@ -132,8 +147,15 @@ public:
 
 #ifdef __AVX2__
         if constexpr (std::is_same_v<T, float>) {
+            // Strategy 1: Fused L1-Resident Path for C=4096
+            if (in_channels_ == 4096 && out_channels_ == 4096 && kernel_size_ == 3 && stride_ == 1 && upscale_ == 1) {
+                repack_weights();
+                forward_avx2_fused_c4096(N, H, W, out_ptr, in_ptr, scale_ptr, mix_w, bias_ptr, active_mask);
+                eyes_done = true;
+                mixer_done = true;
+            }
             // Eyes Optimization: Only for C >= 8 and multiples of 8 for now
-            if (in_channels_ >= 8 && in_channels_ % 8 == 0 && kernel_size_ == 3 && stride_ == 1) {
+            else if (in_channels_ >= 8 && in_channels_ % 8 == 0 && kernel_size_ == 3 && stride_ == 1) {
                 repack_weights();
 
                 if (upscale_ == 1) {
@@ -580,32 +602,29 @@ public:
                             if (dy == 0) continue;
 
                             // For upscaling, we need to map out (h,w) to input coords.
-                            // If upscale=1, stride=1:
-                            if (upscale_ == 1 && stride_ == 1) {
-                                for(int ky=-k_rad; ky<=k_rad; ++ky) {
-                                    int ih = (int)h + ky;
-                                    if(ih < 0 || ih >= (int)H) continue;
-                                    for(int kx=-k_rad; kx<=k_rad; ++kx) {
-                                        int iw = (int)w + kx;
-                                        if(iw < 0 || iw >= (int)W) continue;
+                            // General Backward for Stride/Upscale
+                            int ih_center = (upscale_ > 1) ? (int)h / (int)upscale_ : (int)h * (int)stride_;
+                            int iw_center = (upscale_ > 1) ? (int)w / (int)upscale_ : (int)w * (int)stride_;
 
-                                        size_t in_idx = ((n*H + ih)*W + iw)*in_channels_ + c;
-                                        T val = input_ptr[in_idx];
+                            for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                                int ih = ih_center + ky;
+                                if(ih < 0 || ih >= (int)H) continue;
+                                for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                                    int iw = iw_center + kx;
+                                    if(iw < 0 || iw >= (int)W) continue;
 
-                                        // Weight Grad (need atomic or local accumulation)
-                                        // We'll skip local accumulation logic here and use atomic for correctness first.
-                                        #pragma omp atomic
-                                        g_pack[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)] += dy * val;
+                                    size_t in_idx = ((n*H + ih)*W + iw)*in_channels_ + c;
+                                    T val = input_ptr[in_idx];
 
-                                        // Input Grad
-                                        T w_val = w_pack[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
-                                        #pragma omp atomic
-                                        gi_ptr[in_idx] += dy * w_val;
-                                    }
+                                    // Weight Grad
+                                    #pragma omp atomic
+                                    g_pack[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)] += dy * val;
+
+                                    // Input Grad
+                                    T w_val = w_pack[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
+                                    #pragma omp atomic
+                                    gi_ptr[in_idx] += dy * w_val;
                                 }
-                            } else {
-                                // Handle stride/upscale backward (Not implemented for brevity/focus on Regression Test of Mixing)
-                                // The regression test uses default stride/upscale.
                             }
                         }
                     }
@@ -1229,7 +1248,201 @@ private:
 
     // Cache for optimized weight layout
     std::vector<float, core::AlignedAllocator<float>> optimized_weights_cache_;
-};
+
+    // --- Fused 4096 Kernel ---
+    void forward_avx2_fused_c4096(
+        size_t N, size_t H, size_t W,
+        float* out_ptr, const float* in_ptr,
+        const float* scale_ptr, const float* mix_w, const float* bias_ptr,
+        const std::vector<bool>& active_mask
+    ) {
+        using namespace dreidel::hal::x86;
+        constexpr int C = 4096;
+
+        // Pointers for mixing weights
+        const float* w_L = mix_w;
+        const float* w_C = mix_w + C;
+        const float* w_R = mix_w + 2*C;
+
+        __m256 norm = _mm256_set1_ps(1.0f/4096.0f);
+        __m256 zero = _mm256_setzero_ps();
+
+        const float* w_base = optimized_weights_cache_.data(); // Repacked Depthwise Weights
+
+        #pragma omp parallel
+        {
+            // Scratchpad in L1 (Stack)
+            // 4096 floats = 16KB. Fits in 32KB L1 D-Cache.
+            alignas(64) float l1_buffer[C];
+
+            // Temporary buffer for Mixing source (need copy of FWHT result)
+            // Also L1? If we use 2 buffers, 32KB. Might spill to L2 if L1 is 32KB.
+            // But L1 is often 32KB or 48KB.
+            // If we spill, it's L2, which is still fast (12 cycles).
+            // We need a temp buffer for Locally Connected Mixing (dependency on neighbors).
+            alignas(64) float mix_temp[C];
+
+            // Padding Buffer (L2 resident, per thread? No, per image)
+            // We process one image at a time per thread?
+            // "Pad the input map in L2 with zeros before starting."
+            // Since H, W are variable, we allocate on heap (L2/L3).
+            // (W+2)*(H+2)*C.
+            // For 64x64: 66*66*4096*4 = ~70MB. Too big for L2.
+            // Wait. The feature map is H*W*C.
+            // 64*64*4096*4 = 64MB.
+            // "Your entire feature map fits in L2 Cache." -> User said "The entire feature map fits in L2".
+            // 30MB L3. L2 is 1-2MB.
+            // 64x64x4096 is HUGE. 16M floats = 64MB.
+            // Maybe H, W are small?
+            // If H=7, W=7 (Bottleneck): 49*4096*4 = 800KB. Fits in L2.
+            // If H=64, W=64: 64MB. Does not fit in L2.
+            // The user said: "You have a feature map of size 7x7x4096."
+            // Ah, MAP_W=7 in the snippet.
+            // So this optimization is crucial for bottlenecks.
+
+            // We will dynamically allocate padded buffer.
+            std::vector<float, core::AlignedAllocator<float>> padded_input;
+
+            #pragma omp for
+            for(size_t n=0; n<N; ++n) {
+                if (!active_mask[n]) {
+                    // Zero output
+                    size_t total = H * W * C;
+                    std::memset(out_ptr + n*total, 0, total * sizeof(float));
+                    continue;
+                }
+
+                // 1. Prepare Padded Input (L2)
+                // We copy the current image to a padded buffer.
+                // size: (H+2)*(W+2)*C
+                size_t H_pad = H + 2;
+                size_t W_pad = W + 2;
+                padded_input.resize(H_pad * W_pad * C);
+
+                // Zero init padding
+                // Efficient zeroing?
+                // Just zero the borders? Or memset all.
+                // Memset is safe.
+                std::memset(padded_input.data(), 0, padded_input.size() * sizeof(float));
+
+                // Copy center
+                const float* img_in = in_ptr + (n*H*W)*C;
+                float* pad_ptr = padded_input.data();
+                for(size_t h=0; h<H; ++h) {
+                    const float* src_row = img_in + (h*W)*C;
+                    float* dst_row = pad_ptr + ((h+1)*W_pad + 1)*C;
+                    std::memcpy(dst_row, src_row, W*C*sizeof(float));
+                }
+
+                // 2. Iterate "Fat Pixels"
+                for(size_t h=0; h<H; ++h) {
+                    for(size_t w=0; w<W; ++w) {
+                        // Coordinates in padded input
+                        size_t ph = h + 1;
+                        size_t pw = w + 1;
+
+                        // --- STEP 1: DEPTHWISE CONV (Gather -> L1) ---
+                        // Accumulate into l1_buffer
+                        // Clear buffer
+                        _mm256_store_ps(l1_buffer, zero); // First chunk clear logic inside loop
+                        // Actually we can just set to 0.
+                        // Better: Use first neighbor to overwrite, others accumulate.
+                        // But weight might be 0?
+                        // Safe: set to 0.
+                        for(int i=0; i<C; i+=8) _mm256_store_ps(l1_buffer+i, zero);
+
+                        // 3x3 Loop unrolled?
+                        // ky, kx from -1 to 1.
+                        // Input indices: (ph+ky, pw+kx)
+                        for(int ky=-1; ky<=1; ++ky) {
+                            for(int kx=-1; kx<=1; ++kx) {
+                                // Padded buffer index
+                                size_t ny = ph + ky;
+                                size_t nx = pw + kx;
+                                const float* neighbor_pixel = pad_ptr + (ny * W_pad + nx) * C;
+
+                                // Weight index: repacked as [ky][kx][C]
+                                // ky+1 -> 0..2, kx+1 -> 0..2
+                                // Flat index: ((ky+1)*3 + (kx+1)) * C
+                                const float* w_ptr_k = w_base + ((ky+1)*3 + (kx+1)) * C;
+
+                                for(int i=0; i<C; i+=8) {
+                                    __m256 v_acc = _mm256_load_ps(l1_buffer + i);
+                                    __m256 v_in  = _mm256_load_ps(neighbor_pixel + i); // Aligned? Yes, padded buffer is aligned.
+                                    __m256 v_w   = _mm256_load_ps(w_ptr_k + i);
+                                    v_acc = _mm256_fmadd_ps(v_in, v_w, v_acc);
+                                    _mm256_store_ps(l1_buffer + i, v_acc);
+                                }
+                            }
+                        }
+
+                        // --- STEP 2: SPECTRAL TRANSFORM (In-Place L1) ---
+                        algo::WHT::fwht_1d(l1_buffer, C);
+
+                        // --- STEP 3: SPECTRAL MIXING (In-Place L1) ---
+                        // Scale
+                         for(int i=0; i<C; i+=8) {
+                             __m256 v = _mm256_load_ps(l1_buffer + i);
+                             __m256 s = _mm256_loadu_ps(scale_ptr + i);
+                             _mm256_store_ps(l1_buffer + i, _mm256_mul_ps(v, s));
+                         }
+
+                         // Locally Connected Mixing
+                         // Need copy to mix_temp to read neighbors safely
+                         // Or copy l1_buffer to mix_temp, read mix_temp, write l1_buffer.
+                         std::memcpy(mix_temp, l1_buffer, C*sizeof(float));
+
+                         for(int i=0; i<C; i+=8) {
+                             __m256 curr = _mm256_load_ps(mix_temp + i);
+                             __m256 prev, next;
+
+                             // Helper for boundaries
+                             // i=0: prev is 0. i=C-8: next is 0.
+                             if (i == 0) {
+                                 prev = shift_right_1(curr, zero);
+                             } else {
+                                 prev = _mm256_loadu_ps(mix_temp + i - 1);
+                             }
+
+                             if (i + 8 >= C) {
+                                 next = shift_left_1(curr, zero);
+                             } else {
+                                 next = _mm256_loadu_ps(mix_temp + i + 1);
+                             }
+
+                             __m256 wl = _mm256_load_ps(w_L + i);
+                             __m256 wc = _mm256_load_ps(w_C + i);
+                             __m256 wr = _mm256_load_ps(w_R + i);
+
+                             __m256 res = _mm256_mul_ps(curr, wc);
+                             res = _mm256_fmadd_ps(prev, wl, res);
+                             res = _mm256_fmadd_ps(next, wr, res);
+
+                             _mm256_store_ps(l1_buffer + i, res);
+                         }
+
+                        // --- STEP 4: INVERSE TRANSFORM (In-Place L1) ---
+                        // IFWHT
+                        algo::WHT::fwht_1d(l1_buffer, C);
+
+                        // --- STEP 5: STORE (L1 -> L2 Output) ---
+                        // Apply Bias, Norm, ReLU
+                        float* dst_pixel = out_ptr + ((n*H + h)*W + w)*C;
+                        for(int i=0; i<C; i+=8) {
+                            __m256 v = _mm256_load_ps(l1_buffer + i);
+                            __m256 b = _mm256_loadu_ps(bias_ptr + i);
+                            v = _mm256_mul_ps(v, norm); // IFWHT Norm
+                            v = _mm256_add_ps(v, b);
+                            v = _mm256_max_ps(v, zero); // ReLU
+                            _mm256_storeu_ps(dst_pixel + i, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+}; // Close class ZenithBlock
 
 } // namespace layers
 } // namespace dreidel
