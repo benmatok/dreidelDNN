@@ -137,22 +137,6 @@ public:
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
-        // Fused Decoder Backward (Note: ZenithBlock::backward supports simple weight update but stride/upscale backward might be partial.
-        // Assuming ZenithBlock::backward handles upscale correctly or approximation is enough for regression test.)
-        // Actually, ZenithBlock::backward for upscale > 1 is "Not implemented for brevity" in the current file state.
-        // We must fix ZenithBlock::backward or this won't train.
-        // Wait, did I implement backward for upscale?
-        // In the ZenithBlock.hpp I read:
-        // "Handle stride/upscale backward (Not implemented for brevity/focus on Regression Test of Mixing)"
-        // Uh oh. The user wants me to use the fused autoencoder which RELIES on implicit upscale.
-        // But if backward is missing, it won't train.
-
-        // Strategy: Implement a basic backward for upscale in ZenithBlock?
-        // Or revert to explicit upscale layers which have backward?
-        // User said: "use the fused conv2d zenith autoencoder".
-        // This implies using the fused architecture.
-        // So I must implement the backward for upscale in ZenithBlock.
-
         Tensor<T> g = decoder_stage2_->backward(grad_output);
         g = decoder_stage1_->backward(g);
 
