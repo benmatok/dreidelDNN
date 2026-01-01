@@ -623,6 +623,16 @@ public:
             }
         }
 
+        // Scale mixing gradients for stability (slower learning)
+        // Factor 0.1 ensures the spectral topology remains stable while fine-tuning
+        T mix_lr_scale = static_cast<T>(0.1);
+        size_t mw_size = grad_mixing_weights_.size();
+        T* g_mix_ptr = grad_mixing_weights_.data();
+        #pragma omp parallel for
+        for(size_t i=0; i<mw_size; ++i) {
+            g_mix_ptr[i] *= mix_lr_scale;
+        }
+
         return grad_input;
     }
 
