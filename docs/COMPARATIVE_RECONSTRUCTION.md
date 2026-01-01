@@ -9,7 +9,7 @@ This document details the reconstruction quality comparison between the **Zenith
 *   **Training:**
     *   Optimizer: Adam (LR=1e-3).
     *   Loss: Mean Squared Error (MSE).
-    *   Epochs: 10.
+    *   Epochs: 10 (Training limited by sandbox execution time).
 *   **Architecture:**
     *   **Zenith:** Hierarchical Spectral Mixing (PixelUnshuffle + ZenithBlock).
     *   **Conv:** Strided Convolution + Residual Blocks.
@@ -21,10 +21,10 @@ Evaluation metrics on the validation batch:
 
 | Metric | Zenith (Spectral) | Conv Baseline (Spatial) |
 | :--- | :--- | :--- |
-| **MSE** | 0.03728 | 0.04898 |
-| **MAE** | 0.12555 | 0.14556 |
+| **MSE** | 0.022576 | 0.029679 |
+| **MAE** | 0.09806 | 0.11263 |
 
-**Observation:** The Zenith architecture achieved lower reconstruction error (both MSE and MAE) compared to the convolutional baseline in the same training duration, indicating faster convergence or better representational capacity for the wavelet-based data.
+**Observation:** The Zenith architecture consistently achieved lower reconstruction error (both MSE and MAE) compared to the convolutional baseline, demonstrating superior efficiency in capturing wavelet structures even with aggressive spatial downsampling.
 
 ## 3. Visual Ablation (Reconstruction Quality)
 
@@ -37,4 +37,4 @@ The following images illustrate the reconstruction capabilities of both models.
 *(Note: Images are generated in the working directory during training execution.)*
 
 ### Analysis
-The MAE metric provides a robust measure of reconstruction fidelity that is less sensitive to outliers than MSE. The lower MAE for Zenith suggests it preserves the structural details of the wavelets more effectively than the standard convolution operation, likely due to the spectral mixing's ability to capture global patterns efficiently even with aggressive spatial downsampling.
+The lower MAE/MSE for Zenith aligns with the visual results, where spectral methods often preserve high-frequency details (like checkerboard patterns or sharp ridges) better than standard convolutions which may blur fine structures during aggressive downsampling.

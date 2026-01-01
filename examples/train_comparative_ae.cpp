@@ -89,7 +89,7 @@ int main() {
     const size_t W = 32;
     const size_t C = 8;
     const size_t BatchSize = 8;
-    const size_t Epochs = 10; // Increased slightly for convergence
+    const size_t Epochs = 10; // Back to 10 epochs for reliability
     const size_t StepsPerEpoch = 10;
 
     // Generator
@@ -112,10 +112,11 @@ int main() {
     opt_conv.add_parameters(conv_ae.parameters(), conv_ae.gradients());
 
     // Training Loop
+    auto total_start = std::chrono::high_resolution_clock::now();
+
     for (size_t epoch = 0; epoch < Epochs; ++epoch) {
         float loss_z_acc = 0;
         float loss_c_acc = 0;
-        auto start_time = std::chrono::high_resolution_clock::now();
 
         for (size_t step = 0; step < StepsPerEpoch; ++step) {
             // 1. Generate Data
@@ -138,13 +139,14 @@ int main() {
             loss_c_acc += loss_c;
         }
 
-        auto end_time = std::chrono::high_resolution_clock::now();
-        double duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() / 1000.0;
-
-        std::cout << "Epoch " << epoch+1 << "/" << Epochs
-                  << " | Time: " << std::fixed << std::setprecision(2) << duration << "s"
-                  << " | Loss Z: " << std::setprecision(5) << loss_z_acc / StepsPerEpoch
-                  << " | Loss C: " << std::setprecision(5) << loss_c_acc / StepsPerEpoch << std::endl;
+        if ((epoch + 1) % 10 == 0 || epoch == 0 || epoch == Epochs - 1) {
+            auto current_time = std::chrono::high_resolution_clock::now();
+            double elapsed = std::chrono::duration_cast<std::chrono::seconds>(current_time - total_start).count();
+            std::cout << "Epoch " << epoch+1 << "/" << Epochs
+                      << " | Elapsed: " << elapsed << "s"
+                      << " | Loss Z: " << std::setprecision(5) << loss_z_acc / StepsPerEpoch
+                      << " | Loss C: " << std::setprecision(5) << loss_c_acc / StepsPerEpoch << std::endl;
+        }
     }
 
     std::cout << "\nTraining Complete. Running Evaluation...\n";
