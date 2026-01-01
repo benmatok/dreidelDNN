@@ -110,6 +110,8 @@ void run_autoencoder_benchmark(size_t base_channels) {
         auto out = z_d3.forward(d2); // Implicit upscale 4x
     }
 
+    if (base_channels >= 1024) loops = 1; // Reduce loops for large channels
+
     auto start_z = std::chrono::high_resolution_clock::now();
     for(size_t i=0; i<loops; ++i) {
         auto t1 = z_e1.forward(input);
@@ -139,39 +141,46 @@ void run_autoencoder_benchmark(size_t base_channels) {
     layers::Conv2D<float> c_d3(C1, 1, 3, 1, 1);
 
     // Warmup Conv
-    {
-        auto t1 = c_e1.forward(input);
-        auto t2 = c_e2.forward(t1);
-        auto t3 = c_e3.forward(t2);
+    double time_c = -1.0;
+    if (base_channels < 1024) { // Skip Conv2D for C=4096 as it will likely OOM or take forever
+        {
+            auto t1 = c_e1.forward(input);
+            auto t2 = c_e2.forward(t1);
+            auto t3 = c_e3.forward(t2);
 
-        auto d1 = c_up1.forward(t3);
-        auto d2 = c_d1.forward(d1);
-        auto d3 = c_up2.forward(d2);
-        auto d4 = c_d2.forward(d3);
-        auto d5 = c_up3.forward(d4);
-        auto out = c_d3.forward(d5);
+            auto d1 = c_up1.forward(t3);
+            auto d2 = c_d1.forward(d1);
+            auto d3 = c_up2.forward(d2);
+            auto d4 = c_d2.forward(d3);
+            auto d5 = c_up3.forward(d4);
+            auto out = c_d3.forward(d5);
+        }
+
+        auto start_c = std::chrono::high_resolution_clock::now();
+        for(size_t i=0; i<loops; ++i) {
+            auto t1 = c_e1.forward(input);
+            auto t2 = c_e2.forward(t1);
+            auto t3 = c_e3.forward(t2);
+
+            auto d1 = c_up1.forward(t3);
+            auto d2 = c_d1.forward(d1);
+            auto d3 = c_up2.forward(d2);
+            auto d4 = c_d2.forward(d3);
+            auto d5 = c_up3.forward(d4);
+            auto out = c_d3.forward(d5);
+        }
+        auto end_c = std::chrono::high_resolution_clock::now();
+        time_c = std::chrono::duration<double>(end_c - start_c).count();
     }
-
-    auto start_c = std::chrono::high_resolution_clock::now();
-    for(size_t i=0; i<loops; ++i) {
-        auto t1 = c_e1.forward(input);
-        auto t2 = c_e2.forward(t1);
-        auto t3 = c_e3.forward(t2);
-
-        auto d1 = c_up1.forward(t3);
-        auto d2 = c_d1.forward(d1);
-        auto d3 = c_up2.forward(d2);
-        auto d4 = c_d2.forward(d3);
-        auto d5 = c_up3.forward(d4);
-        auto out = c_d3.forward(d5);
-    }
-    auto end_c = std::chrono::high_resolution_clock::now();
-    double time_c = std::chrono::duration<double>(end_c - start_c).count();
 
     // --- Report ---
     std::cout << std::left << std::setw(20) << "Zenith AE Time:" << time_z << " s" << std::endl;
-    std::cout << std::left << std::setw(20) << "Conv2D AE Time:" << time_c << " s" << std::endl;
-    std::cout << "Speedup: " << time_c / time_z << "x" << std::endl;
+    if (time_c > 0) {
+        std::cout << std::left << std::setw(20) << "Conv2D AE Time:" << time_c << " s" << std::endl;
+        std::cout << "Speedup: " << time_c / time_z << "x" << std::endl;
+    } else {
+        std::cout << "Conv2D AE Time: N/A (Skipped)" << std::endl;
+    }
 }
 
 int main() {
