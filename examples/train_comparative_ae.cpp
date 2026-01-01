@@ -1,3 +1,6 @@
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../include/stb_image_write.h"
+
 #include "../include/dreidel/models/ComparativeAE.hpp"
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/utils/WaveletGen2D.hpp"
@@ -6,13 +9,16 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
+#include <numeric>
+#include <algorithm>
+#include <string>
 
 using namespace dreidel;
 using namespace dreidel::models;
 using namespace dreidel::utils;
 using namespace dreidel::optim;
 
-// MSE Loss
+// MSE Loss with Gradient
 template <typename T>
 T mse_loss(const Tensor<T>& pred, const Tensor<T>& target, Tensor<T>& grad_input) {
     size_t size = pred.size();
@@ -35,16 +41,56 @@ T mse_loss(const Tensor<T>& pred, const Tensor<T>& target, Tensor<T>& grad_input
     return sum_sq / size;
 }
 
+// MAE Calculation (Metric only)
+template <typename T>
+T calculate_mae(const Tensor<T>& pred, const Tensor<T>& target) {
+    size_t size = pred.size();
+    const T* p_ptr = pred.data();
+    const T* t_ptr = target.data();
+    T sum_abs = 0;
+
+    #pragma omp parallel for reduction(+:sum_abs)
+    for (size_t i = 0; i < size; ++i) {
+        sum_abs += std::abs(p_ptr[i] - t_ptr[i]);
+    }
+    return sum_abs / size;
+}
+
+// Helper to save tensor as image
+template <typename T>
+void save_tensor_as_png(const Tensor<T>& tensor, size_t batch_idx, size_t H, size_t W, const std::string& filename) {
+    // Tensor is NHWC
+    std::vector<unsigned char> image(H * W * 3);
+    const T* data = tensor.data();
+    size_t C = 3;
+    size_t offset = batch_idx * H * W * C;
+
+    for (size_t i = 0; i < H * W; ++i) {
+        for (size_t c = 0; c < 3; ++c) {
+            float val = data[offset + i * 3 + c];
+            // Normalize roughly from [-1, 1] or [0, 1] to [0, 255]
+            // Input data from WaveletGen is roughly -1 to 1 based on previous runs stats
+            // Let's assume [-1, 1] mapped to [0, 255]
+            val = (val + 1.0f) * 0.5f;
+            val = std::max(0.0f, std::min(1.0f, val));
+            image[i * 3 + c] = static_cast<unsigned char>(val * 255.0f);
+        }
+    }
+
+    stbi_write_png(filename.c_str(), W, H, 3, image.data(), W * 3);
+    std::cout << "Saved " << filename << std::endl;
+}
+
 int main() {
     std::cout << "=== Training Comparative Autoencoders on Wavelets (32x32) ===\n";
 
-    // Config
+    // Config - REDUCED
     const size_t H = 32;
     const size_t W = 32;
     const size_t C = 8;
     const size_t BatchSize = 8;
-    const size_t Epochs = 5;
-    const size_t StepsPerEpoch = 20;
+    const size_t Epochs = 10; // Increased slightly for convergence
+    const size_t StepsPerEpoch = 10;
 
     // Generator
     WaveletGenerator2D<float> gen(H, W);
@@ -101,18 +147,29 @@ int main() {
                   << " | Loss C: " << std::setprecision(5) << loss_c_acc / StepsPerEpoch << std::endl;
     }
 
-    std::cout << "\nTraining Complete.\n";
+    std::cout << "\nTraining Complete. Running Evaluation...\n";
 
     // Final Validation on one batch
-    std::cout << "Final Validation (One Batch):\n";
     gen.generate_batch(batch_input, BatchSize);
     Tensor<float> val_z = zenith_ae.forward(batch_input);
     Tensor<float> val_c = conv_ae.forward(batch_input);
-    float lz = mse_loss(val_z, batch_input, batch_grad);
-    float lc = mse_loss(val_c, batch_input, batch_grad);
 
-    std::cout << "  Zenith MSE: " << lz << "\n";
-    std::cout << "  Conv   MSE: " << lc << "\n";
+    // Calculate Metrics
+    float mse_z = mse_loss(val_z, batch_input, batch_grad);
+    float mse_c = mse_loss(val_c, batch_input, batch_grad);
+
+    float mae_z = calculate_mae(val_z, batch_input);
+    float mae_c = calculate_mae(val_c, batch_input);
+
+    std::cout << "Evaluation Results:\n";
+    std::cout << "  Zenith | MSE: " << mse_z << " | MAE: " << mae_z << "\n";
+    std::cout << "  Conv   | MSE: " << mse_c << " | MAE: " << mae_c << "\n";
+
+    // Save Images for Ablation (Save index 0 from the batch)
+    std::cout << "Saving ablation images...\n";
+    save_tensor_as_png(batch_input, 0, H, W, "ablation_input.png");
+    save_tensor_as_png(val_z, 0, H, W, "ablation_zenith.png");
+    save_tensor_as_png(val_c, 0, H, W, "ablation_conv.png");
 
     return 0;
 }
