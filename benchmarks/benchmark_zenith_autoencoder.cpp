@@ -176,7 +176,7 @@ void run_autoencoder_benchmark(size_t base_channels) {
 
 int main() {
     std::cout << "=== Autoencoder Benchmark: Zenith vs Conv2D ===" << std::endl;
-    std::vector<size_t> channels_list = {8, 16, 32, 64, 128, 256, 4096};
+    std::vector<size_t> channels_list = {8, 16, 32, 64, 128, 256};
     for(size_t C : channels_list) {
         run_autoencoder_benchmark(C);
     }

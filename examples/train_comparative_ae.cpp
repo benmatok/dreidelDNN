@@ -88,9 +88,9 @@ int main() {
     const size_t H = 32;
     const size_t W = 32;
     const size_t C = 8;
-    const size_t BatchSize = 8;
-    const size_t Epochs = 10; // Back to 10 epochs for reliability
-    const size_t StepsPerEpoch = 10;
+    const size_t BatchSize = 2; // Reduced to 2 to avoid OOM/Stack issues in sandbox
+    const size_t Epochs = 2; // Reduced for speed check
+    const size_t StepsPerEpoch = 5;
 
     // Generator
     std::cout << "Init Generator..." << std::endl;
@@ -123,24 +123,17 @@ int main() {
 
         for (size_t step = 0; step < StepsPerEpoch; ++step) {
             // 1. Generate Data
-            // std::cout << "Generating Batch..." << std::endl;
             gen.generate_batch(batch_input, BatchSize);
 
             // 2. Train Zenith
-            // std::cout << "Train Zenith Step..." << std::endl;
             opt_zenith.zero_grad();
-            // std::cout << "Zenith Forward..." << std::endl;
             Tensor<float> out_z = zenith_ae.forward(batch_input);
-            // std::cout << "Zenith Loss..." << std::endl;
             float loss_z = mse_loss(out_z, batch_input, batch_grad);
-            // std::cout << "Zenith Backward..." << std::endl;
             zenith_ae.backward(batch_grad);
-            // std::cout << "Zenith Step..." << std::endl;
             opt_zenith.step();
             loss_z_acc += loss_z;
 
             // 3. Train Conv
-            // std::cout << "Train Conv Step..." << std::endl;
             opt_conv.zero_grad();
             Tensor<float> out_c = conv_ae.forward(batch_input);
             float loss_c = mse_loss(out_c, batch_input, batch_grad); // reuse grad buffer

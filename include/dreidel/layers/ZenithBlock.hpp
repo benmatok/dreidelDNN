@@ -25,6 +25,9 @@ namespace layers {
 template <typename T>
 class ZenithBlock : public Layer<T> {
 public:
+    // Global flag to toggle fused kernels for testing/debugging
+    static inline bool use_fused_kernels = true;
+
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim,
                 bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1)
         : in_channels_(in_channels), out_channels_(out_channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
@@ -66,7 +69,7 @@ public:
         grad_bias_.fill(0);
         grad_oracle_projection_.fill(0);
 
-        optimized_weights_cache_.resize(in_channels * kernel_size * kernel_size);
+        // optimized_weights_cache_.resize(in_channels * kernel_size * kernel_size); // Lazy init
     }
 
     ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim,
@@ -114,7 +117,7 @@ public:
         bool use_fused_path = false;
 #ifdef __AVX2__
         if constexpr (std::is_same_v<T, float>) {
-            if (in_channels_ == 4096 && out_channels_ == 4096 && kernel_size_ == 3 && stride_ == 1 && upscale_ == 1) {
+            if (use_fused_kernels && in_channels_ == 4096 && out_channels_ == 4096 && kernel_size_ == 3 && stride_ == 1 && upscale_ == 1) {
                 use_fused_path = true;
             }
         }
@@ -148,7 +151,7 @@ public:
 #ifdef __AVX2__
         if constexpr (std::is_same_v<T, float>) {
             // Strategy 1: Fused L1-Resident Path for C=4096
-            if (in_channels_ == 4096 && out_channels_ == 4096 && kernel_size_ == 3 && stride_ == 1 && upscale_ == 1) {
+            if (use_fused_kernels && in_channels_ == 4096 && out_channels_ == 4096 && kernel_size_ == 3 && stride_ == 1 && upscale_ == 1) {
                 repack_weights();
                 forward_avx2_fused_c4096(N, H, W, out_ptr, in_ptr, scale_ptr, mix_w, bias_ptr, active_mask);
                 eyes_done = true;
@@ -448,9 +451,39 @@ public:
                         // Recomputing forward pass for this pixel is cheap.
 
                         // Recompute Mixer Forward to get pre-relu
-                        // Load eyes
-                        size_t eyes_idx = ((n*H_out + h)*W_out + w)*in_channels_;
-                        for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] = eyes_ptr[eyes_idx + c];
+                        // Load eyes (Recompute if not cached)
+                        if (eyes_ptr) {
+                            size_t eyes_idx = ((n*H_out + h)*W_out + w)*in_channels_;
+                            for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] = eyes_ptr[eyes_idx + c];
+                        } else {
+                            // Recompute Depthwise Conv for this pixel (Gradient Checkpointing logic)
+                            // Assumes stride=1, upscale=1 (Fused path constraint)
+                            int k_rad = kernel_size_ / 2;
+                            const T* w_base = packed_weights_.data(); // Use packed or optimized? Packed is simpler here unless we handle optimized layout.
+                            // If we repack in forward, optimized cache exists.
+                            // But for backward, let's use packed_weights_ (standard layout) for simplicity of implementation
+                            // unless performance is critical here. It is, but let's get correctness first.
+
+                            std::fill(buf_eyes.begin(), buf_eyes.end(), 0);
+                            for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                                int ih = (int)h + ky;
+                                if(ih < 0 || ih >= (int)H) continue;
+                                for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                                    int iw = (int)w + kx;
+                                    if(iw < 0 || iw >= (int)W) continue;
+
+                                    const T* in_p = input_ptr + ((n*H + ih)*W + iw)*in_channels_;
+                                    // Weight: [C, 1, K, K] -> [c, 0, ky+rad, kx+rad]
+                                    // But optimized layout is [K, K, C].
+                                    // If we use packed: c*K*K + (ky+rad)*K + (kx+rad)
+
+                                    for(size_t c=0; c<in_channels_; ++c) {
+                                        T w_val = w_base[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
+                                        buf_eyes[c] += in_p[c] * w_val;
+                                    }
+                                }
+                            }
+                        }
 
                         // FWHT
                         algo::WHT::fwht_1d(buf_eyes.data(), in_channels_);
@@ -547,13 +580,30 @@ public:
                         // 4. Backward Scale
                         // dL/dScale[c] = d_eyes[c] * fwht_out[c]
                         // We need fwht_out. buf_eyes currently holds scaled values.
-                        // Unscaling is tricky if scale is 0.
-                        // Better to re-load eyes_ptr, FWHT it, then use it.
-                        // Or assume we can divide by scale? No.
-                        // Let's re-run FWHT on eyes_ptr.
+                        // We need to recover unscaled FWHT output.
 
-                        // Load eyes again
-                        for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] = eyes_ptr[eyes_idx + c];
+                        if (eyes_ptr) {
+                            size_t eyes_idx = ((n*H_out + h)*W_out + w)*in_channels_;
+                            for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] = eyes_ptr[eyes_idx + c];
+                        } else {
+                            // Recompute Depthwise again
+                            int k_rad = kernel_size_ / 2;
+                            const T* w_base = packed_weights_.data();
+                            std::fill(buf_eyes.begin(), buf_eyes.end(), 0);
+                            for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                                int ih = (int)h + ky;
+                                if(ih < 0 || ih >= (int)H) continue;
+                                for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                                    int iw = (int)w + kx;
+                                    if(iw < 0 || iw >= (int)W) continue;
+                                    const T* in_p = input_ptr + ((n*H + ih)*W + iw)*in_channels_;
+                                    for(size_t c=0; c<in_channels_; ++c) {
+                                        T w_val = w_base[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
+                                        buf_eyes[c] += in_p[c] * w_val;
+                                    }
+                                }
+                            }
+                        }
                         algo::WHT::fwht_1d(buf_eyes.data(), in_channels_); // Now buf_eyes is unscaled FWHT output
 
                         for(size_t c=0; c<in_channels_; ++c) {

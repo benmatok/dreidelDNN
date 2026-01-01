@@ -76,8 +76,9 @@ public:
     }
 
     void random(T mean, T stddev) {
-        static std::random_device rd;
-        static std::mt19937 gen(rd());
+        // static std::random_device rd;
+        // static std::mt19937 gen(rd());
+        static std::mt19937 gen(42); // Fixed seed to avoid random_device issues and ensure reproducibility
         std::normal_distribution<T> d(mean, stddev);
         for (auto& v : data_) v = d(gen);
     }
