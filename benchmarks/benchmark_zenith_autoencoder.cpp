@@ -5,6 +5,7 @@
 #include <fstream>
 #include <chrono>
 #include <iomanip>
+#include <algorithm> // For std::max
 
 // Include Dreidel headers
 #include "../include/dreidel/core/Tensor.hpp"
@@ -175,20 +176,108 @@ void run_autoencoder_benchmark(size_t base_channels) {
 
     // --- Report ---
     std::cout << std::left << std::setw(20) << "Zenith AE Time:" << time_z << " s" << std::endl;
+    double speedup = 0.0;
     if (time_c > 0) {
+        speedup = time_c / time_z;
         std::cout << std::left << std::setw(20) << "Conv2D AE Time:" << time_c << " s" << std::endl;
-        std::cout << "Speedup: " << time_c / time_z << "x" << std::endl;
+        std::cout << "Speedup: " << speedup << "x" << std::endl;
     } else {
         std::cout << "Conv2D AE Time: N/A (Skipped)" << std::endl;
     }
+
+    // CSV Output
+    static bool header_printed = false;
+    std::ofstream csv("benchmark_results.csv", std::ios::app);
+    if (!header_printed) {
+        csv << "Channels,Time_Zenith,Time_Conv,Speedup\n";
+        header_printed = true;
+    }
+    csv << base_channels << "," << time_z << "," << time_c << "," << speedup << "\n";
+}
+
+void generate_benchmark_graph() {
+    std::ifstream csv("benchmark_results.csv");
+    if (!csv.is_open()) return;
+
+    std::string line;
+    std::getline(csv, line); // Skip header
+
+    std::vector<size_t> channels;
+    std::vector<double> time_z, time_c;
+
+    while (std::getline(csv, line)) {
+        std::stringstream ss(line);
+        std::string val;
+        std::vector<std::string> row;
+        while (std::getline(ss, val, ',')) row.push_back(val);
+        if (row.size() < 3) continue;
+
+        channels.push_back(std::stoul(row[0]));
+        time_z.push_back(std::stod(row[1]));
+        double tc = std::stod(row[2]);
+        if (tc > 0) time_c.push_back(tc);
+        else time_c.push_back(0); // Placeholder
+    }
+
+    if (channels.empty()) return;
+
+    std::ofstream svg("benchmark_graph.svg");
+    double width = 800, height = 600, padding = 60;
+    svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << width << "\" height=\"" << height << "\">\n";
+    svg << "<rect width=\"100%\" height=\"100%\" fill=\"white\" />\n";
+
+    // Axes
+    svg << "<line x1=\"" << padding << "\" y1=\"" << height - padding << "\" x2=\"" << width - padding << "\" y2=\"" << height - padding << "\" stroke=\"black\" />\n";
+    svg << "<line x1=\"" << padding << "\" y1=\"" << height - padding << "\" x2=\"" << padding << "\" y2=\"" << padding << "\" stroke=\"black\" />\n";
+
+    // Max values
+    size_t max_ch = channels.back();
+    double max_time = 0;
+    for (double t : time_c) if (t > max_time) max_time = t;
+    if (max_time == 0) for(double t : time_z) if(t > max_time) max_time = t;
+
+    auto map_x = [&](size_t c) { return padding + (double)c / max_ch * (width - 2*padding); };
+    auto map_y = [&](double t) { return height - padding - (t / max_time * (height - 2*padding)); };
+
+    // Zenith Line (Blue)
+    svg << "<path d=\"M";
+    for(size_t i=0; i<channels.size(); ++i) {
+        svg << map_x(channels[i]) << " " << map_y(time_z[i]);
+        if(i < channels.size()-1) svg << " L ";
+    }
+    svg << "\" fill=\"none\" stroke=\"blue\" stroke-width=\"2\" />\n";
+
+    // Conv Line (Red)
+    svg << "<path d=\"M";
+    bool first = true;
+    for(size_t i=0; i<channels.size(); ++i) {
+        if (time_c[i] > 0) {
+            if (!first) svg << " L ";
+            svg << map_x(channels[i]) << " " << map_y(time_c[i]);
+            first = false;
+        }
+    }
+    svg << "\" fill=\"none\" stroke=\"red\" stroke-width=\"2\" />\n";
+
+    // Legend
+    svg << "<text x=\"" << width - 150 << "\" y=\"50\" fill=\"blue\">Zenith (Fused)</text>\n";
+    svg << "<text x=\"" << width - 150 << "\" y=\"70\" fill=\"red\">Conv2D</text>\n";
+
+    svg << "</svg>\n";
+    std::cout << "Graph saved to benchmark_graph.svg" << std::endl;
 }
 
 int main() {
+    // Clear CSV
+    std::ofstream("benchmark_results.csv"); // Truncate
+
     std::cout << "=== Autoencoder Benchmark: Zenith vs Conv2D ===" << std::endl;
     // C > 128 removed as requested
     std::vector<size_t> channels_list = {8, 16, 32, 64, 128};
     for(size_t C : channels_list) {
         run_autoencoder_benchmark(C);
     }
+
+    generate_benchmark_graph();
     return 0;
 }
