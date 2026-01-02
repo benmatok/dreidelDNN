@@ -435,8 +435,9 @@ public:
             std::vector<T> local_gw_R(in_channels_, 0);
             std::vector<T> local_g_bias(out_channels_, 0);
 
-            std::vector<T, core::AlignedAllocator<T>> buf_grad(std::max(in_channels_, out_channels_));
-            std::vector<T, core::AlignedAllocator<T>> buf_eyes(in_channels_); // To store reconstructed/cached eyes output
+            // Use default allocator to avoid potential aligned_alloc issues in threads
+            std::vector<T> buf_grad(std::max(in_channels_, out_channels_));
+            std::vector<T> buf_eyes(in_channels_);
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
