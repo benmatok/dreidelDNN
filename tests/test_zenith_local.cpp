@@ -1,5 +1,6 @@
 #include <dreidel/layers/ZenithBlock.hpp>
 #include <dreidel/core/Tensor.hpp>
+#include <dreidel/utils/WaveletGen2D.hpp>
 #include <iostream>
 #include <vector>
 #include <cassert>
@@ -14,8 +15,6 @@ void run_test(size_t C, size_t H, size_t W, size_t loops) {
     std::cout << "Testing C=" << C << " (" << H << "x" << W << ")..." << std::endl;
 
     layers::ZenithBlock<float> layer(C, 3, C);
-    // Note: Weights are random (Depthwise) but Mixing is Identity.
-    // Scales are 1.0. Bias is 0.
 
     Tensor<float> input({1, H, W, C});
     input.fill(1.0f); // Uniform input
@@ -30,7 +29,7 @@ void run_test(size_t C, size_t H, size_t W, size_t loops) {
     auto end = std::chrono::high_resolution_clock::now();
     double elapsed = std::chrono::duration<double>(end - start).count();
 
-    // Check Accuracy (Stability/Mean)
+    // Stats
     Tensor<float> output = layer.forward(input);
     double mean = 0;
     double sq_sum = 0;
@@ -48,47 +47,97 @@ void run_test(size_t C, size_t H, size_t W, size_t loops) {
     std::cout << "Status: PASSED" << std::endl;
 }
 
-void run_fused_check() {
+void run_wavelet_identity_test(size_t C, size_t H, size_t W, size_t loops) {
     std::cout << "--------------------------------------------------" << std::endl;
-    std::cout << "Testing C=4096 (Fused Kernel)..." << std::endl;
-    size_t C = 4096;
-    size_t H = 4, W = 4;
+    std::cout << "Testing Wavelet Reconstruction (Identity) C=" << C << " (" << H << "x" << W << ")..." << std::endl;
 
     layers::ZenithBlock<float> layer(C, 3, C);
+
+    // Set Depthwise Weights to Identity to check reconstruction accuracy
+    auto params = layer.parameters();
+    Tensor<float>* weights = params[0]; // packed_weights_ [C, 1, K, K]
+    weights->fill(0.0f);
+
+    // Set Center (1,1) to 1.0 for each channel
+    size_t K = 3;
+    float* w_ptr = weights->data();
+    for(size_t c=0; c<C; ++c) {
+        // Index: c*K*K + 1*K + 1 = c*9 + 4
+        w_ptr[c*K*K + 4] = 1.0f;
+    }
+
+    // Generate Input
     Tensor<float> input({1, H, W, C});
-    input.fill(1.0f);
+    // WaveletGenerator2D generates 3 channels. We repeat them?
+    // Or just use the generator directly to fill C channels?
+    // generator::generate_batch fills (Batch, H, W, 3).
+    // We have C=128.
+    // Let's manually fill with random wavelets.
+    // Or modify WaveletGen to support C.
+    // Let's just use `generate_wavelet_images` logic from benchmark helper if possible,
+    // or reimplement simple generator here.
+
+    {
+        static std::mt19937 gen(42);
+        std::uniform_real_distribution<float> dist_param(0.5, 2.0);
+        std::uniform_real_distribution<float> dist_pos(0.2, 0.8);
+        float* d = input.data();
+        for(size_t c=0; c<C; ++c) {
+            float mu_x = dist_pos(gen) * W;
+            float mu_y = dist_pos(gen) * H;
+            float s_x = dist_param(gen) * (W/10.0);
+            for(size_t h=0; h<H; ++h) {
+                for(size_t w_idx=0; w_idx<W; ++w_idx) {
+                     float x = (float)w_idx - mu_x;
+                     float y = (float)h - mu_y;
+                     float val = std::exp(-(x*x + y*y)/(2*s_x*s_x)); // Gaussian
+                     d[((0*H + h)*W + w_idx)*C + c] = val;
+                }
+            }
+        }
+    }
+
+    // Warmup
+    layer.forward(input);
 
     auto start = std::chrono::high_resolution_clock::now();
-    auto out = layer.forward(input);
+    for(size_t i=0; i<loops; ++i) {
+        auto out = layer.forward(input);
+    }
     auto end = std::chrono::high_resolution_clock::now();
-    double elapsed = std::chrono::duration<double, std::milli>(end - start).count();
+    double elapsed = std::chrono::duration<double>(end - start).count();
 
-    std::cout << "Forward Time: " << elapsed << " ms" << std::endl;
+    // Accuracy
+    Tensor<float> output = layer.forward(input);
 
-    // Stats
-    double mean = 0;
-    size_t count = out.size();
-    const float* ptr = out.data();
-    for(size_t i=0; i<count; ++i) mean += ptr[i];
-    mean /= count;
-    std::cout << "Output Mean: " << mean << std::endl;
+    // MSE
+    double mse = 0;
+    size_t count = output.size();
+    const float* in_ptr = input.data();
+    const float* out_ptr = output.data();
+    for(size_t i=0; i<count; ++i) {
+        float diff = in_ptr[i] - out_ptr[i];
+        mse += diff * diff;
+    }
+    mse /= count;
 
-    // Fused Logic requires: C=4096, K=3, Stride=1, Upscale=1.
-    // If mean is > 0, it works (ReLU passes positive values, Identity mixing passes values).
-    if (mean > 0) std::cout << "Status: PASSED" << std::endl;
-    else std::cout << "Status: FAILED (Zero/Neg Output?)" << std::endl;
+    std::cout << "Time per iter: " << (elapsed / loops) * 1000.0 << " ms" << std::endl;
+    std::cout << "MSE (Accuracy): " << mse << std::endl;
+    if (mse < 1e-5) std::cout << "Status: PASSED (Identity Verified)" << std::endl;
+    else std::cout << "Status: FAILED (High MSE)" << std::endl;
 }
 
 int main() {
     try {
         std::cout << "=== ZenithBlock Local Tests & Benchmarks ===" << std::endl;
 
-        run_test(32, 32, 32, 100);
-        run_test(64, 32, 32, 100);
-        run_test(128, 16, 16, 100);
-        run_test(256, 8, 8, 100); // Generic Large
+        run_test(32, 32, 32, 10);
+        run_test(64, 32, 32, 10);
+        run_test(128, 16, 16, 10);
+        // Skipped > 128 as requested
 
-        run_fused_check();
+        run_wavelet_identity_test(128, 512, 512, 10); // 512x512, C=128
+
     } catch (const std::exception& e) {
         std::cerr << "Exception: " << e.what() << std::endl;
         return 1;
