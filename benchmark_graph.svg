@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600">
+<rect width="100%" height="100%" fill="white" />
+<line x1="60" y1="540" x2="740" y2="540" stroke="black" />
+<line x1="60" y1="540" x2="60" y2="60" stroke="black" />
+<path d="M102.5 536.789 L 145 537.146 L 230 535.44 L 400 533.843 L 740 526.014" fill="none" stroke="blue" stroke-width="2" />
+<path d="M102.5 526.154 L 145 509.508 L 230 493.625 L 400 396.989 L 740 60" fill="none" stroke="red" stroke-width="2" />
+<text x="650" y="50" fill="blue">Zenith (Fused)</text>
+<text x="650" y="70" fill="red">Conv2D</text>
+</svg>
