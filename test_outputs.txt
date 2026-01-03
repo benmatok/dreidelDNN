@@ -1,13 +1,13 @@
 Running Regression Suite...
-Date: Sat Jan  3 17:47:54 UTC 2026
+Date: Sat Jan  3 18:14:09 UTC 2026
 --------------------------------------------------
 Running Test benchmark_alien...
 Disk Usage:
-/dev/vdb                  98G   62M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   62M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       368Mi       7.2Gi       528Ki       436Mi       7.4Gi
+Mem:           7.8Gi       372Mi       7.2Gi       536Ki       439Mi       7.4Gi
 Swap:             0B          0B          0B
 Compiling tests/benchmark_alien.cpp...
 Running tests/benchmark_alien...
@@ -15,30 +15,30 @@ Running tests/benchmark_alien...
 
 [Test 1] L1 Resident Eye Test (vpermb throughput)
   - Iterations: 10000
-  - Time: 0.379438s
-  - Throughput: 26354.7 passes/sec
-  - Est. GOps/s (Equiv): 0.971541
+  - Time: 0.353153s
+  - Throughput: 28316.3 passes/sec
+  - Est. GOps/s (Equiv): 1.04385
 
 [Test 2] Memory Wall Test (100MB Image)
   - Input Size: 64 MB
-  - Time: 2.09957s
-  - Bandwidth: 304.825 MB/s (Read)
+  - Time: 4.09695s
+  - Bandwidth: 156.214 MB/s (Read)
 
 [Test 3] Sparsity Breakeven Analysis
   Comparing Gating ON vs OFF on Random Noise (Approx 50% sparsity)
-  - Gating OFF Time: 0.229233s
-  - Gating ON Time:  0.234208s
-  - Speedup: 0.978757x
-  -> Oracle overhead is higher than savings (or sparsity low).
+  - Gating OFF Time: 0.622036s
+  - Gating ON Time:  0.473748s
+  - Speedup: 1.31301x
+  -> Oracle is providing speedup.
 [PASS] Test benchmark_alien
 --------------------------------------------------
 Running Test test_allocator...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       545Mi       7.0Gi       532Ki       436Mi       7.2Gi
+Mem:           7.8Gi       530Mi       7.0Gi       540Ki       439Mi       7.3Gi
 Swap:             0B          0B          0B
 Compiling tests/test_allocator.cpp...
 Running tests/test_allocator...
@@ -48,18 +48,18 @@ PASS
 --------------------------------------------------
 Running Test test_alsh...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       530Mi       7.0Gi       532Ki       436Mi       7.3Gi
+Mem:           7.8Gi       514Mi       7.1Gi       540Ki       439Mi       7.3Gi
 Swap:             0B          0B          0B
 Compiling tests/test_alsh.cpp...
 Running tests/test_alsh...
 Running ALSH Test...
-Index build time: 93 ms
-Brute Force Time: 3372 us
-ALSH Query Time (incl. re-rank): 149 us
+Index build time: 94 ms
+Brute Force Time: 3289 us
+ALSH Query Time (incl. re-rank): 137 us
 Candidates count: 115 / 10000
 Recall @ 10: 10 / 10 (100%)
 Test Passed: Retrieved at least some relevant items.
@@ -67,11 +67,11 @@ Test Passed: Retrieved at least some relevant items.
 --------------------------------------------------
 Running Test test_audio...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       449Mi       7.1Gi       532Ki       436Mi       7.3Gi
+Mem:           7.8Gi       430Mi       7.1Gi       540Ki       439Mi       7.4Gi
 Swap:             0B          0B          0B
 Compiling tests/test_audio.cpp...
 Running tests/test_audio...
@@ -79,17 +79,17 @@ Testing FFT...
 FFT Passed.
 Testing AudioEncoder...
 Output shape: 1 80 101
-Max Mel Value: 9.45786
+Max Mel Value: 3.97276
 AudioEncoder Passed.
 [PASS] Test test_audio
 --------------------------------------------------
 Running Test test_conv3d_spectral...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       529Mi       7.0Gi       532Ki       437Mi       7.3Gi
+Mem:           7.8Gi       499Mi       7.1Gi       540Ki       439Mi       7.3Gi
 Swap:             0B          0B          0B
 Compiling tests/test_conv3d_spectral.cpp...
 Running tests/test_conv3d_spectral...
@@ -105,11 +105,11 @@ PASS
 --------------------------------------------------
 Running Test test_deep_spectral...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       513Mi       7.1Gi       532Ki       437Mi       7.3Gi
+Mem:           7.8Gi       512Mi       7.1Gi       540Ki       439Mi       7.3Gi
 Swap:             0B          0B          0B
 Compiling tests/test_deep_spectral.cpp...
 Running tests/test_deep_spectral...
@@ -117,26 +117,26 @@ Testing DeepSpectralLinear Forward/Backward...
 Forward Pass Complete.
 Backward Pass Complete.
 Testing Overfitting Random Matrix...
-Epoch 0 MSE: 3.08869
-Epoch 50 MSE: 2.02879
-Epoch 100 MSE: 1.61913
-Epoch 150 MSE: 1.41321
-Epoch 200 MSE: 1.45226
-Epoch 250 MSE: 1.18521
-Epoch 300 MSE: 1.20609
-Epoch 350 MSE: 1.20417
-Epoch 400 MSE: 1.21879
-Epoch 450 MSE: 1.06944
+Epoch 0 MSE: 2.97014
+Epoch 50 MSE: 2.04712
+Epoch 100 MSE: 1.49209
+Epoch 150 MSE: 1.45444
+Epoch 200 MSE: 1.48526
+Epoch 250 MSE: 1.24254
+Epoch 300 MSE: 1.18538
+Epoch 350 MSE: 1.15595
+Epoch 400 MSE: 1.14756
+Epoch 450 MSE: 1.05317
 Training Complete.
 [PASS] Test test_deep_spectral
 --------------------------------------------------
 Running Test test_linear_wht...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       600Mi       7.0Gi       532Ki       437Mi       7.2Gi
+Mem:           7.8Gi       520Mi       7.1Gi       540Ki       439Mi       7.3Gi
 Swap:             0B          0B          0B
 Compiling tests/test_linear_wht.cpp...
 Running tests/test_linear_wht...
@@ -155,11 +155,11 @@ PASS
 --------------------------------------------------
 Running Test test_mnist_mock...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       647Mi       6.9Gi       532Ki       437Mi       7.1Gi
+Mem:           7.8Gi       605Mi       7.0Gi       540Ki       439Mi       7.2Gi
 Swap:             0B          0B          0B
 Compiling tests/test_mnist_mock.cpp...
 Running tests/test_mnist_mock...
@@ -171,11 +171,11 @@ PASS: Training loop ran successfully.
 --------------------------------------------------
 Running Test test_phase8...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       549Mi       7.0Gi       532Ki       437Mi       7.2Gi
+Mem:           7.8Gi       458Mi       7.1Gi       540Ki       439Mi       7.3Gi
 Swap:             0B          0B          0B
 Compiling tests/test_phase8.cpp...
 Running tests/test_phase8...
@@ -185,19 +185,19 @@ PASS: Hasher preserves locality.
 --- Testing Sparse Gather ---
 PASS: Sparse Gather correct.
 --- Benchmarking Filter Pruning (Simulation) ---
-Sparse Compute Time (Gather+Dot): 0.0128449 s
-Dense Compute Time (Full Dot): 0.0627134 s
-Speedup: 4.88235x
+Sparse Compute Time (Gather+Dot): 0.0115735 s
+Dense Compute Time (Full Dot): 0.062214 s
+Speedup: 5.37555x
 PASS: Speedup observed.
 [PASS] Test test_phase8
 --------------------------------------------------
 Running Test test_rosenbrock...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       572Mi       7.0Gi       532Ki       437Mi       7.2Gi
+Mem:           7.8Gi       576Mi       7.0Gi       540Ki       439Mi       7.2Gi
 Swap:             0B          0B          0B
 Compiling tests/test_rosenbrock.cpp...
 Running tests/test_rosenbrock...
@@ -211,11 +211,11 @@ PASS (Instant Convergence)
 --------------------------------------------------
 Running Test test_spectral_whisper...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       632Mi       6.9Gi       532Ki       437Mi       7.2Gi
+Mem:           7.8Gi       567Mi       7.0Gi       540Ki       439Mi       7.2Gi
 Swap:             0B          0B          0B
 Compiling tests/test_spectral_whisper.cpp...
 Running tests/test_spectral_whisper...
@@ -226,11 +226,11 @@ Output shape: 1 10 128
 --------------------------------------------------
 Running Test test_tensor...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       492Mi       7.1Gi       532Ki       437Mi       7.3Gi
+Mem:           7.8Gi       479Mi       7.1Gi       540Ki       439Mi       7.3Gi
 Swap:             0B          0B          0B
 Compiling tests/test_tensor.cpp...
 Running tests/test_tensor...
@@ -247,11 +247,11 @@ All Tensor tests passed!
 --------------------------------------------------
 Running Test test_whisper_recast...
 Disk Usage:
-/dev/vdb                  98G   63M   93G   1% /rom/overlay
-overlayfs:/overlay/root   98G   63M   93G   1% /
+/dev/vdb                  98G   65M   93G   1% /rom/overlay
+overlayfs:/overlay/root   98G   65M   93G   1% /
 Memory Usage:
                total        used        free      shared  buff/cache   available
-Mem:           7.8Gi       501Mi       7.1Gi       532Ki       437Mi       7.3Gi
+Mem:           7.8Gi       543Mi       7.0Gi       540Ki       439Mi       7.2Gi
 Swap:             0B          0B          0B
 Compiling tests/test_whisper_recast.cpp...
 Running tests/test_whisper_recast...
