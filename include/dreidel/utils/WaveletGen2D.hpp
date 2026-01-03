@@ -27,12 +27,16 @@ public:
         static std::random_device rd;
         static std::mt19937 gen(rd());
 
-        std::uniform_real_distribution<T> dist_x(width_ * 0.2, width_ * 0.8);
-        std::uniform_real_distribution<T> dist_y(height_ * 0.2, height_ * 0.8);
-        std::uniform_real_distribution<T> dist_s(2.0, 10.0); // Size
+        // We use local generator copies per thread if possible, or just generate params upfront.
+        // For simplicity and thread safety, let's generate params serially then fill parallel.
+
+        std::uniform_real_distribution<T> dist_x(width_ * 0.1, width_ * 0.9);
+        std::uniform_real_distribution<T> dist_y(height_ * 0.1, height_ * 0.9);
+        std::uniform_real_distribution<T> dist_s(2.0, 30.0); // Size range
         std::uniform_real_distribution<T> dist_w(0.1, 0.8); // Frequency
         std::uniform_real_distribution<T> dist_theta(0.0, 3.14159); // Orientation
         std::uniform_int_distribution<int> dist_type(0, 5); // Subset of nice 2D kernels
+        std::uniform_int_distribution<int> dist_count(5, 15); // Number of wavelets per image
 
         T* ptr = data.data();
         size_t C = 3;
@@ -42,66 +46,83 @@ public:
         // Clear
         data.fill(0);
 
+        // Pre-generate parameters to avoid random inside parallel loop
+        struct WaveletParams {
+            int type;
+            T cx, cy, s, w, theta;
+        };
+
+        std::vector<std::vector<WaveletParams>> batch_wavelets(batch_size);
+        for(size_t i=0; i<batch_size; ++i) {
+            int count = dist_count(gen);
+            for(int k=0; k<count; ++k) {
+                batch_wavelets[i].push_back({
+                    dist_type(gen), dist_x(gen), dist_y(gen),
+                    dist_s(gen), dist_w(gen), dist_theta(gen)
+                });
+            }
+        }
+
         #pragma omp parallel for
         for (size_t i = 0; i < batch_size; ++i) {
-            int type = dist_type(gen);
-            T cx = dist_x(gen);
-            T cy = dist_y(gen);
-            T s = dist_s(gen);
-            T w = dist_w(gen);
-            T theta = dist_theta(gen);
+            const auto& wavelets = batch_wavelets[i];
 
-            T cos_t = std::cos(theta);
-            T sin_t = std::sin(theta);
+            for (const auto& wp : wavelets) {
+                T cos_t = std::cos(wp.theta);
+                T sin_t = std::sin(wp.theta);
 
-            for (size_t h = 0; h < H; ++h) {
-                for (size_t w_coord = 0; w_coord < W; ++w_coord) {
-                    // Coordinates relative to center
-                    T dx = static_cast<T>(w_coord) - cx;
-                    T dy = static_cast<T>(h) - cy;
+                // Bounding box optimization: only iterate pixels near center?
+                // For now iterate all for correctness.
 
-                    // Rotate
-                    T rx = dx * cos_t + dy * sin_t;
-                    T ry = -dx * sin_t + dy * cos_t;
+                for (size_t h = 0; h < H; ++h) {
+                    for (size_t w_coord = 0; w_coord < W; ++w_coord) {
+                        // Coordinates relative to center
+                        T dx = static_cast<T>(w_coord) - wp.cx;
+                        T dy = static_cast<T>(h) - wp.cy;
 
-                    T val = 0;
+                        // Rotate
+                        T rx = dx * cos_t + dy * sin_t;
+                        T ry = -dx * sin_t + dy * cos_t;
 
-                    // 2D Function definitions
-                    switch(type) {
-                        case 0: // Gabor 2D
-                            val = std::cos(w * rx) * std::exp(-(rx*rx + ry*ry) / (2 * s * s));
-                            break;
-                        case 1: // Mexican Hat 2D (Laplacian of Gaussian)
-                            {
-                                T r2 = (rx*rx + ry*ry) / (s*s);
-                                val = (1.0 - r2) * std::exp(-r2 / 2.0);
-                            }
-                            break;
-                        case 2: // Gaussian
-                            val = std::exp(-(rx*rx + ry*ry) / (2 * s * s));
-                            break;
-                        case 3: // DoG (Difference of Gaussians)
-                            val = std::exp(-(rx*rx + ry*ry) / (2 * s * s)) - 0.5 * std::exp(-(rx*rx + ry*ry) / (2 * s * s * 4));
-                            break;
-                        case 4: // Ridge
-                             val = std::exp(-rx*rx / (2*s*s)); // Infinite in y direction (local ridge)
-                             // Mask with bounds? No, let it be a line.
-                             // Add Gaussian envelope in y to make it a segment?
-                             val *= std::exp(-ry*ry / (2*s*s*9)); // Elongated
-                             break;
-                        case 5: // Checkerboard / High Freq
-                            if (std::abs(rx) < s && std::abs(ry) < s) {
-                                val = std::cos(w*rx) * std::cos(w*ry);
-                            }
-                            break;
+                        T val = 0;
+
+                        // 2D Function definitions
+                        switch(wp.type) {
+                            case 0: // Gabor 2D
+                                val = std::cos(wp.w * rx) * std::exp(-(rx*rx + ry*ry) / (2 * wp.s * wp.s));
+                                break;
+                            case 1: // Mexican Hat 2D (Laplacian of Gaussian)
+                                {
+                                    T r2 = (rx*rx + ry*ry) / (wp.s*wp.s);
+                                    val = (1.0 - r2) * std::exp(-r2 / 2.0);
+                                }
+                                break;
+                            case 2: // Gaussian
+                                val = std::exp(-(rx*rx + ry*ry) / (2 * wp.s * wp.s));
+                                break;
+                            case 3: // DoG (Difference of Gaussians)
+                                val = std::exp(-(rx*rx + ry*ry) / (2 * wp.s * wp.s)) - 0.5 * std::exp(-(rx*rx + ry*ry) / (2 * wp.s * wp.s * 4));
+                                break;
+                            case 4: // Ridge
+                                 val = std::exp(-rx*rx / (2*wp.s*wp.s)); // Infinite in y direction (local ridge)
+                                 // Add Gaussian envelope in y to make it a segment
+                                 val *= std::exp(-ry*ry / (2*wp.s*wp.s*9)); // Elongated
+                                 break;
+                            case 5: // Checkerboard / High Freq
+                                if (std::abs(rx) < wp.s && std::abs(ry) < wp.s) {
+                                    val = std::cos(wp.w*rx) * std::cos(wp.w*ry);
+                                }
+                                break;
+                        }
+
+                        // Accumulate
+                        size_t idx = ((i * H + h) * W + w_coord) * C;
+                        // Assuming 3 channels are same (grayscale wavelets)
+                        // Add to existing
+                        ptr[idx + 0] += val;
+                        ptr[idx + 1] += val;
+                        ptr[idx + 2] += val;
                     }
-
-                    // Fill channels (Grayscale for now, or slight tint?)
-                    // Let's do grayscale + noise
-                    size_t idx = ((i * H + h) * W + w_coord) * C;
-                    ptr[idx + 0] = val;
-                    ptr[idx + 1] = val;
-                    ptr[idx + 2] = val;
                 }
             }
         }
