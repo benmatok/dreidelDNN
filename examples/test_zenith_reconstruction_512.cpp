@@ -146,7 +146,7 @@ int main() {
     const size_t W = 512;
     const size_t C = 3;
     const size_t BATCH_SIZE = 1; // Keep it small for speed in this test
-    const size_t EPOCHS = 5;
+    const size_t EPOCHS = 100;
 
     // 1. Initialize Model
     ZenithHierarchicalAE<float> model(2); // Base filters 2 (Stage1=32, Stage2=512)
