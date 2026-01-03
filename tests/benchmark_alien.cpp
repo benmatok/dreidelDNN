@@ -36,7 +36,14 @@ void test_l1_resident_eye() {
     size_t H = 8, W = 8; // Small spatial to fit in L1 (8*8*64*4 = 16KB)
 
     // Create Zenith Block
-    layers::ZenithBlock<float> zenith(C, K, C, 1024*1024, false); // No gating
+    // ZenithBlock(channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating)
+    // Here we map 1024*1024 to 'use_ifwht' which is bool? That seems wrong.
+    // Assuming original intent was spectral_dim = C, and 1024*1024 was some arena size parameter removed?
+    // Or spectral_dim is 1024*1024?
+    // If spectral_dim is 1024*1024, we use:
+    // ZenithBlock(in, out, k, spectral_dim, ifwht, ...)
+    // Explicitly cast spectral_dim to size_t to avoid int -> bool ambiguity
+    layers::ZenithBlock<float> zenith(C, C, K, (size_t)(1024*1024), false); // Explicit in, out, k, spectral, ifwht
 
     // Input Tensor (Random)
     Tensor<float> input({1, H, W, C});
@@ -75,7 +82,7 @@ void test_memory_wall() {
     size_t W = 512;
     size_t K = 3;
 
-    layers::ZenithBlock<float> zenith(C, K, C, 10*1024*1024, false); // Larger arena
+    layers::ZenithBlock<float> zenith(C, C, K, (size_t)(10*1024*1024), false); // Larger arena -> spectral_dim
 
     Tensor<float> input({1, H, W, C});
     input.random(-1.0, 1.0);
@@ -121,11 +128,11 @@ void test_sparsity_breakeven() {
     input.random(-1.0, 1.0);
 
     // Gating OFF
-    layers::ZenithBlock<float> zenith_off(C, K, C, 1024*1024, false);
+    layers::ZenithBlock<float> zenith_off(C, C, K, 1024*1024, false, false, false); // ... ifwht, dilated, gating
     double t_off = time_execution([&]() { zenith_off.forward(input); }, 100);
 
     // Gating ON
-    layers::ZenithBlock<float> zenith_on(C, K, C, 1024*1024, true);
+    layers::ZenithBlock<float> zenith_on(C, C, K, 1024*1024, false, false, true); // ... ifwht, dilated, gating
     double t_on = time_execution([&]() { zenith_on.forward(input); }, 100);
 
     std::cout << "  - Gating OFF Time: " << t_off << "s" << std::endl;
