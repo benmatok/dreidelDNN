@@ -1,3 +1,6 @@
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../include/stb_image_write.h"
+
 #include "../include/dreidel/models/ComparativeAE.hpp"
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/utils/WaveletGen2D.hpp"
@@ -10,6 +13,7 @@
 #include <string>
 #include <fstream>
 #include <cmath>
+#include <algorithm>
 
 using namespace dreidel;
 using namespace dreidel::models;
@@ -103,8 +107,88 @@ void generate_loss_svg(const std::vector<float>& losses, size_t epochs) {
     svg.close();
 }
 
+// Simple Model Serializer
+template <typename T>
+void save_model(ZenithHierarchicalAE<T>& model, const std::string& filename) {
+    std::ofstream out(filename, std::ios::binary);
+    if (!out) {
+        std::cerr << "Failed to save model to " << filename << std::endl;
+        return;
+    }
+    auto params = model.parameters();
+    size_t count = params.size();
+    out.write((char*)&count, sizeof(size_t));
+    for (auto* p : params) {
+        size_t sz = p->size();
+        out.write((char*)&sz, sizeof(size_t));
+        out.write((char*)p->data(), sz * sizeof(T));
+    }
+    out.close();
+}
+
+template <typename T>
+void load_model(ZenithHierarchicalAE<T>& model, const std::string& filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) {
+        std::cerr << "Failed to load model from " << filename << std::endl;
+        return;
+    }
+    auto params = model.parameters();
+    size_t count;
+    in.read((char*)&count, sizeof(size_t));
+    if (count != params.size()) {
+        std::cerr << "Model parameter count mismatch!" << std::endl;
+        return;
+    }
+    for (auto* p : params) {
+        size_t sz;
+        in.read((char*)&sz, sizeof(size_t));
+        if (sz != p->size()) {
+             std::cerr << "Tensor size mismatch!" << std::endl;
+             // Skip reading or abort? Abort for safety.
+             return;
+        }
+        in.read((char*)p->data(), sz * sizeof(T));
+    }
+    in.close();
+    std::cout << "Model loaded from " << filename << std::endl;
+}
+
+// Helper to save tensor as image
+template <typename T>
+void save_tensor_as_png(const Tensor<T>& tensor, size_t batch_idx, size_t H, size_t W, const std::string& filename) {
+    // Tensor is NHWC. 3 Channels.
+    std::vector<unsigned char> image(H * W * 3);
+    const T* data = tensor.data();
+    size_t C = 3;
+    size_t offset = batch_idx * H * W * C;
+
+    // Auto-normalization
+    float min_val = 1e9, max_val = -1e9;
+    for (size_t i = 0; i < H * W * C; ++i) {
+        float val = data[offset + i];
+        if (val < min_val) min_val = val;
+        if (val > max_val) max_val = val;
+    }
+
+    // Avoid div by zero
+    if (max_val - min_val < 1e-6) max_val = min_val + 1.0f;
+
+    for (size_t i = 0; i < H * W; ++i) {
+        for (size_t c = 0; c < 3; ++c) {
+            float val = data[offset + i * 3 + c];
+            val = (val - min_val) / (max_val - min_val); // Normalize to [0, 1]
+            val = std::max(0.0f, std::min(1.0f, val));
+            image[i * 3 + c] = static_cast<unsigned char>(val * 255.0f);
+        }
+    }
+
+    stbi_write_png(filename.c_str(), W, H, 3, image.data(), W * 3);
+    std::cout << "Saved " << filename << std::endl;
+}
+
 int main() {
-    std::cout << "=== Zenith Wavelet Denoise (100 Epochs, Default Init) ===\n";
+    std::cout << "=== Zenith Wavelet Denoise (100 Epochs, Best Save) ===\n";
 
     // Disable Fused Kernels for stability
     ZenithBlock<float>::use_fused_kernels = false;
@@ -128,6 +212,9 @@ int main() {
     std::vector<float> loss_history;
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    float best_loss = 1e9;
+    std::string best_model_path = "best_zenith_model.bin";
+
     for (size_t epoch = 0; epoch < Epochs; ++epoch) {
         float epoch_loss = 0;
         for (size_t step = 0; step < StepsPerEpoch; ++step) {
@@ -141,17 +228,37 @@ int main() {
             epoch_loss += loss;
             loss_history.push_back(loss);
         }
+        float avg_loss = epoch_loss / StepsPerEpoch;
+
+        if (avg_loss < best_loss) {
+            best_loss = avg_loss;
+            save_model(model, best_model_path);
+            // std::cout << "New best loss: " << best_loss << " (Saved)\n";
+        }
+
         if (epoch % 10 == 0 || epoch == Epochs - 1) {
-            std::cout << "Epoch " << epoch + 1 << " Loss: " << epoch_loss / StepsPerEpoch << std::endl;
+            std::cout << "Epoch " << epoch + 1 << " Loss: " << avg_loss << " Best: " << best_loss << std::endl;
         }
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
     std::cout << "Total Time: " << std::chrono::duration<double>(end_time - start_time).count() << "s\n";
     std::cout << "Final Loss: " << loss_history.back() << std::endl;
+    std::cout << "Best Loss: " << best_loss << std::endl;
 
     generate_loss_svg(loss_history, Epochs);
     std::cout << "Saved zenith_100_loss.svg\n";
+
+    // Load Best Model
+    load_model(model, best_model_path);
+
+    // Generate Reconstruction Example
+    std::cout << "Generating Reconstruction Examples...\n";
+    gen.generate_batch(batch_input, BatchSize); // Generate fresh batch
+    Tensor<float> out = model.forward(batch_input);
+
+    save_tensor_as_png(batch_input, 0, H, W, "input.png");
+    save_tensor_as_png(out, 0, H, W, "reconstruction.png");
 
     return 0;
 }
