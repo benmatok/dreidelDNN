@@ -9,6 +9,8 @@
 #include <numeric>
 #include <string>
 #include <map>
+#include <fstream>
+#include <cmath>
 
 using namespace dreidel;
 using namespace dreidel::models;
@@ -35,10 +37,101 @@ T mse_loss(const Tensor<T>& pred, const Tensor<T>& target, Tensor<T>& grad_input
     return sum_sq / size;
 }
 
+// SVG Generator for Convergence Plot
+void generate_convergence_svg(const std::map<std::string, std::vector<float>>& results, size_t total_steps) {
+    std::ofstream svg("init_convergence.svg");
+    if (!svg.is_open()) {
+        std::cerr << "Error: Could not open init_convergence.svg for writing.\n";
+        return;
+    }
+
+    double width = 800;
+    double height = 600;
+    double padding = 60;
+
+    // Find min/max for scaling
+    double max_loss = -1e9;
+    double min_loss = 1e9;
+
+    for (const auto& [scheme, losses] : results) {
+        for (float l : losses) {
+            if (l > max_loss) max_loss = l;
+            if (l < min_loss) min_loss = l;
+        }
+    }
+
+    // Log scale for Y
+    // Handle 0 or negative (shouldn't happen for MSE)
+    if (min_loss <= 0) min_loss = 1e-6;
+    double log_min = std::log10(min_loss);
+    double log_max = std::log10(max_loss);
+    double log_range = log_max - log_min;
+    if (log_range == 0) log_range = 1;
+
+    svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << width << "\" height=\"" << height << "\">\n";
+    svg << "<rect width=\"100%\" height=\"100%\" fill=\"white\" />\n";
+
+    // Axes
+    svg << "<line x1=\"" << padding << "\" y1=\"" << height - padding << "\" x2=\"" << width - padding << "\" y2=\"" << height - padding << "\" stroke=\"black\" />\n"; // X axis
+    svg << "<line x1=\"" << padding << "\" y1=\"" << height - padding << "\" x2=\"" << padding << "\" y2=\"" << padding << "\" stroke=\"black\" />\n"; // Y axis
+
+    // Labels
+    svg << "<text x=\"" << width/2 << "\" y=\"" << height - 10 << "\" text-anchor=\"middle\">Steps</text>\n";
+    svg << "<text x=\"20\" y=\"" << height/2 << "\" text-anchor=\"middle\" transform=\"rotate(-90 20 " << height/2 << ")\">Log10 Loss</text>\n";
+
+    auto map_x = [&](size_t step) {
+        return padding + (double)step / (total_steps - 1) * (width - 2*padding);
+    };
+    auto map_y = [&](float loss) {
+        if (loss <= 0) loss = 1e-6;
+        double log_l = std::log10(loss);
+        double norm = (log_l - log_min) / log_range;
+        return height - padding - (norm * (height - 2*padding));
+    };
+
+    // Colors
+    std::map<std::string, std::string> colors;
+    colors["he"] = "red";
+    colors["identity"] = "black";
+    colors["scaled_he_0.1"] = "green";
+    colors["scaled_he_0.5"] = "blue";
+
+    // Plot Lines
+    for (const auto& [scheme, losses] : results) {
+        std::string color = colors.count(scheme) ? colors[scheme] : "gray";
+        svg << "<path d=\"M";
+        for (size_t i = 0; i < losses.size(); ++i) {
+            svg << map_x(i) << " " << map_y(losses[i]);
+            if (i < losses.size() - 1) svg << " L ";
+        }
+        svg << "\" fill=\"none\" stroke=\"" << color << "\" stroke-width=\"2\" />\n";
+    }
+
+    // Legend
+    double leg_x = width - 200;
+    double leg_y = 50;
+    double lh = 20;
+
+    svg << "<rect x=\"" << leg_x - 10 << "\" y=\"" << leg_y - 10 << "\" width=\"180\" height=\"" << (results.size() * lh + 20) << "\" fill=\"white\" stroke=\"black\" opacity=\"0.8\" />\n";
+
+    int i = 0;
+    for (const auto& [scheme, _] : results) {
+        std::string color = colors.count(scheme) ? colors[scheme] : "gray";
+        double y = leg_y + i * lh;
+        svg << "<line x1=\"" << leg_x << "\" y1=\"" << y << "\" x2=\"" << leg_x + 30 << "\" y2=\"" << y << "\" stroke=\"" << color << "\" stroke-width=\"2\" />\n";
+        svg << "<text x=\"" << leg_x + 40 << "\" y=\"" << y + 5 << "\">" << scheme << "</text>\n";
+        i++;
+    }
+
+    svg << "</svg>\n";
+    svg.close();
+    std::cout << "Graph saved to init_convergence.svg" << std::endl;
+}
+
 int main() {
     std::cout << "=== Zenith Meta-Train: Initialization Benchmark ===\n" << std::flush;
 
-    // Disable Fused Kernels to isolate crash
+    // Disable Fused Kernels for stability
     std::cout << "Disabling Fused Kernels for stability...\n" << std::flush;
     ZenithBlock<float>::use_fused_kernels = false;
 
@@ -65,41 +158,32 @@ int main() {
         std::cout << "\n--- Testing Initialization: " << scheme << " ---\n" << std::flush;
 
         // Instantiate fresh model
-        std::cout << "Creating model...\n" << std::flush;
         ZenithHierarchicalAE<float> model(C);
-
-        std::cout << "Reinitializing model...\n" << std::flush;
         model.reinit(scheme);
 
-        std::cout << "Creating optimizer...\n" << std::flush;
         SimpleAdam<float> optimizer(1e-3);
         optimizer.add_parameters(model.parameters(), model.gradients());
 
         std::vector<float> loss_history;
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        std::cout << "Starting Training...\n" << std::flush;
         for (size_t epoch = 0; epoch < Epochs; ++epoch) {
             float epoch_loss = 0;
             for (size_t step = 0; step < StepsPerEpoch; ++step) {
-                // std::cout << "Step " << step << " Gen batch...\n" << std::flush;
                 gen.generate_batch(batch_input, BatchSize);
 
-                // std::cout << "Step " << step << " Zero grad...\n" << std::flush;
                 optimizer.zero_grad();
-                // std::cout << "Step " << step << " Forward...\n" << std::flush;
                 Tensor<float> out = model.forward(batch_input);
-                // std::cout << "Step " << step << " Loss...\n" << std::flush;
                 float loss = mse_loss(out, batch_input, batch_grad);
-                // std::cout << "Step " << step << " Backward...\n" << std::flush;
                 model.backward(batch_grad);
-                // std::cout << "Step " << step << " Step...\n" << std::flush;
                 optimizer.step();
 
                 epoch_loss += loss;
+
+                // Store step loss for detailed plot
+                loss_history.push_back(loss);
             }
             float avg_loss = epoch_loss / StepsPerEpoch;
-            loss_history.push_back(avg_loss);
             std::cout << "Epoch " << epoch+1 << " Loss: " << avg_loss << std::endl;
         }
 
@@ -124,6 +208,9 @@ int main() {
     }
 
     std::cout << "\nFastest to Converge (Lowest Final Loss): " << best_scheme << std::endl;
+
+    // Generate Plot
+    generate_convergence_svg(results, Epochs * StepsPerEpoch);
 
     return 0;
 }
