@@ -68,6 +68,14 @@ The core of dreidelDNN is the **Zenith Block**, a hyper-optimized primitive that
 
 👉 **[Read the Full Zenith Technology Guide](docs/ZENITH_TECHNOLOGY.md)**
 
+### "Secret Sauce" Optimizations
+The Zenith architecture incorporates several advanced algorithmic tricks to ensure stability and performance in Deep Spectral Networks:
+
+1.  **Delta-Orthogonal Initialization**: Depthwise kernels are initialized as Identity mappings to preserve signal variance across deep networks, preventing vanishing/exploding gradients in the spectral domain.
+2.  **Spectral Dropout**: Regularization is applied by dropping random frequencies in the Hadamard domain, forcing the network to learn robust global features.
+3.  **GroupNorm Integration**: Replaces standard BatchNorm with Group Normalization (32 groups), ensuring stable convergence even with small micro-batches typical of CPU training.
+4.  **Coordinate-Wise Clipping**: The `SimpleAdam` optimizer supports clipping gradients per-element rather than by global norm, preventing high-frequency noise from destabilizing the DC component.
+
 ---
 
 ## 🗺️ Roadmap & Status
@@ -108,7 +116,7 @@ The framework is organized into the following components within `include/dreidel
 
 | Component | Description |
 |-----------|-------------|
-| **`layers/`** | **`ZenithBlock`** (Primary), `LinearWHT`, `DeepSpectralLinear`, `ALSHSparseDense`. |
+| **`layers/`** | **`ZenithBlock`** (Primary), `LinearWHT`, `DeepSpectralLinear`, `ALSHSparseDense`, `GroupNorm`. |
 | **`core/`** | `Tensor`, `Allocator` (SIMD-aligned memory management). |
 | **`algo/`** | `WHT` (Spectral Transforms), `ALSH` (Hashing Engine). |
 | **`optim/`** | `DiagonalNewton` (2nd Order Spectral), `KFAC`. |

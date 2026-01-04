@@ -47,8 +47,6 @@ public:
         size_t C_per_G = C / num_groups_;
         size_t spatial_size = H * W;
 
-        // We need to cache mean and inv_std for backward
-        // Shape: [N, G]
         if (mean_cached_.shape().size() == 0 || mean_cached_.shape()[0] != N) {
             mean_cached_ = Tensor<T>({N, num_groups_});
             inv_std_cached_ = Tensor<T>({N, num_groups_});
@@ -64,8 +62,6 @@ public:
                 size_t start_c = g * C_per_G;
                 size_t end_c = start_c + C_per_G;
 
-                // Loop over spatial and channels in group
-                // Optim: This iteration pattern is strided (channels last)
                 for (size_t hw = 0; hw < spatial_size; ++hw) {
                     const T* pixel = in_ptr + ((n * spatial_size) + hw) * C;
                     for (size_t c = start_c; c < end_c; ++c) {
@@ -124,114 +120,70 @@ public:
         const T* mean_ptr = mean_cached_.data();
         const T* inv_std_ptr = inv_std_cached_.data();
 
-        // Accumulate gradients for Gamma and Beta
-        // And compute gradient wrt input
-        // Standard GroupNorm Backward logic
+        #pragma omp parallel
+        {
+            // Thread-local accumulation buffers to avoid atomic contention in inner loop
+            std::vector<T> local_grad_gamma(C, 0.0);
+            std::vector<T> local_grad_beta(C, 0.0);
 
-        #pragma omp parallel for
-        for (size_t n = 0; n < N; ++n) {
-            for (size_t g = 0; g < num_groups_; ++g) {
-                size_t start_c = g * C_per_G;
-                size_t end_c = start_c + C_per_G;
-                T mean = mean_ptr[n * num_groups_ + g];
-                T inv_std = inv_std_ptr[n * num_groups_ + g];
+            #pragma omp for collapse(2)
+            for (size_t n = 0; n < N; ++n) {
+                for (size_t g = 0; g < num_groups_; ++g) {
+                    size_t start_c = g * C_per_G;
+                    size_t end_c = start_c + C_per_G;
+                    T mean = mean_ptr[n * num_groups_ + g];
+                    T inv_std = inv_std_ptr[n * num_groups_ + g];
+                    T M = static_cast<T>(spatial_size * C_per_G);
 
-                T d_std = 0;
-                T d_mean = 0;
+                    // Local sums for group statistics gradients
+                    T sum_dy_gamma = 0;
+                    T sum_dy_gamma_xhat = 0;
 
-                // First pass: dL/dGamma, dL/dBeta, and accumulate dL/dx_hat
-                // Also compute dL/dVar and dL/dMean helpers
+                    // First pass: Accumulate gradients and compute sums
+                    for (size_t hw = 0; hw < spatial_size; ++hw) {
+                        size_t offset = ((n * spatial_size) + hw) * C;
+                        const T* pi = in_ptr + offset;
+                        const T* pgo = go_ptr + offset;
 
-                for (size_t hw = 0; hw < spatial_size; ++hw) {
-                    size_t offset = ((n * spatial_size) + hw) * C;
-                    const T* pi = in_ptr + offset;
-                    const T* pgo = go_ptr + offset;
+                        for (size_t c = start_c; c < end_c; ++c) {
+                            T dy = pgo[c];
+                            T x_hat = (pi[c] - mean) * inv_std;
 
-                    for (size_t c = start_c; c < end_c; ++c) {
-                        T x_hat = (pi[c] - mean) * inv_std;
-                        T dy = pgo[c];
+                            // Accumulate to thread-local buffer
+                            local_grad_gamma[c] += dy * x_hat;
+                            local_grad_beta[c] += dy;
 
-                        // Grads for affine
-                        // Need atomic or reduction?
-                        // We are in parallel per N, G.
-                        // Gamma/Beta are global [C].
-                        // Multiple threads write to same Gamma[c] if N > 1.
-                        // We need atomic add for gamma/beta.
-                        #pragma omp atomic
-                        gg_ptr[c] += dy * x_hat;
-                        #pragma omp atomic
-                        gb_ptr[c] += dy;
+                            T dy_gamma = dy * g_ptr[c];
+                            sum_dy_gamma += dy_gamma;
+                            sum_dy_gamma_xhat += dy_gamma * x_hat;
+                        }
+                    }
 
-                        // Backprop through affine to get dx_hat
-                        T dx_hat = dy * g_ptr[c];
+                    T mean_dy_gamma = sum_dy_gamma / M;
+                    T mean_dy_gamma_xhat = sum_dy_gamma_xhat / M;
 
-                        // dL/dVar calculation involves x_hat
-                        // dL/dStd = sum(dL/dx_hat * (x-mu)) * -1/std^2
-                        // x-mu = x_hat * std
-                        // dL/dStd = sum(dL/dx_hat * x_hat * std) * -1/std^2 = -sum(dL/dx_hat * x_hat) / std
-                        // dL/dVar = dL/dStd * 0.5 / std
-
-                        d_std += dx_hat * (pi[c] - mean); // This is sum(dL/dx_hat * (x-mu))
-                        d_mean += dx_hat;
+                    // Second pass: Compute input gradients
+                    for (size_t hw = 0; hw < spatial_size; ++hw) {
+                        size_t offset = ((n * spatial_size) + hw) * C;
+                        const T* pi = in_ptr + offset;
+                        const T* pgo = go_ptr + offset;
+                        T* pgi = gi_ptr + offset;
+                        for (size_t c = start_c; c < end_c; ++c) {
+                            T dy_gamma = pgo[c] * g_ptr[c];
+                            T x_hat = (pi[c] - mean) * inv_std;
+                            pgi[c] = inv_std * (dy_gamma - mean_dy_gamma - x_hat * mean_dy_gamma_xhat);
+                        }
                     }
                 }
+            }
 
-                T d_var = d_std * (-0.5f * inv_std * inv_std * inv_std);
-
-                // Second pass: dL/dx
-                // dL/dx = dL/dx_hat * dx_hat/dx + dL/dVar * dVar/dx + dL/dMean * dMean/dx
-
-                T M = static_cast<T>(spatial_size * C_per_G);
-
-                // Correction for mean gradient part from variance
-                // dL/dMean_total = d_mean * (-inv_std) + dL/dVar * (-2/M * sum(x-mu))
-                // sum(x-mu) is 0 by definition. So second term vanishes.
-                T d_mean_final = 0;
-                // Wait. dL/dx = (1/std) * ( dL/dx_hat - mean(dL/dx_hat) - x_hat * mean(dL/dx_hat * x_hat) ) ?
-                // Let's use the explicit expansion.
-
-                T term1 = d_var * 2.0f / M;
-                T term2 = 0; // accumulated for mean part
-
-                // Re-iterate to calculate d_mean_total properly
-                // dMean/dx = 1/M
-                // dVar/dx = 2(x-mu)/M
-                // dx_hat/dx = 1/std
-
-                // Actually, let's use the standard formula for BN/GN backward:
-                // dx = (1/std) * ( dy*gamma - mean(dy*gamma) - x_hat * mean(dy*gamma*x_hat) )
-                // where means are taken over the group.
-
-                // Calculate means of gradients
-                T sum_dy_gamma = 0;
-                T sum_dy_gamma_xhat = 0;
-
-                 for (size_t hw = 0; hw < spatial_size; ++hw) {
-                    size_t offset = ((n * spatial_size) + hw) * C;
-                    const T* pi = in_ptr + offset;
-                    const T* pgo = go_ptr + offset;
-                    for (size_t c = start_c; c < end_c; ++c) {
-                        T dy_gamma = pgo[c] * g_ptr[c];
-                        T x_hat = (pi[c] - mean) * inv_std;
-                        sum_dy_gamma += dy_gamma;
-                        sum_dy_gamma_xhat += dy_gamma * x_hat;
-                    }
-                 }
-
-                 T mean_dy_gamma = sum_dy_gamma / M;
-                 T mean_dy_gamma_xhat = sum_dy_gamma_xhat / M;
-
-                 for (size_t hw = 0; hw < spatial_size; ++hw) {
-                    size_t offset = ((n * spatial_size) + hw) * C;
-                    const T* pi = in_ptr + offset;
-                    const T* pgo = go_ptr + offset;
-                    T* pgi = gi_ptr + offset;
-                    for (size_t c = start_c; c < end_c; ++c) {
-                        T dy_gamma = pgo[c] * g_ptr[c];
-                        T x_hat = (pi[c] - mean) * inv_std;
-                        pgi[c] = inv_std * (dy_gamma - mean_dy_gamma - x_hat * mean_dy_gamma_xhat);
-                    }
-                 }
+            // Reduction of thread-local gradients
+            #pragma omp critical
+            {
+                for (size_t c = 0; c < C; ++c) {
+                    gg_ptr[c] += local_grad_gamma[c];
+                    gb_ptr[c] += local_grad_beta[c];
+                }
             }
         }
 
