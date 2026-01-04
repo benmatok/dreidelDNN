@@ -722,6 +722,41 @@ public:
         return {&grad_packed_weights_, &grad_spectral_scales_, &grad_mixing_weights_, &grad_bias_, &grad_oracle_projection_};
     }
 
+    void reinit(const std::string& scheme) {
+        if (scheme == "he") {
+             T stddev = std::sqrt(static_cast<T>(2.0) / (kernel_size_ * kernel_size_));
+             packed_weights_.random(0, stddev);
+        } else if (scheme == "identity") {
+             packed_weights_.fill(0);
+             T* w = packed_weights_.data();
+             size_t K = kernel_size_;
+             size_t C = in_channels_;
+             size_t center = K / 2;
+             // Shape [C, 1, K, K]
+             for(size_t c=0; c<C; ++c) {
+                 w[c*K*K + center*K + center] = 1.0;
+             }
+        } else if (scheme == "scaled_he_0.1") {
+             T stddev = std::sqrt(static_cast<T>(2.0) / (kernel_size_ * kernel_size_)) * 0.1;
+             packed_weights_.random(0, stddev);
+        } else if (scheme == "scaled_he_0.5") {
+             T stddev = std::sqrt(static_cast<T>(2.0) / (kernel_size_ * kernel_size_)) * 0.5;
+             packed_weights_.random(0, stddev);
+        }
+
+        // Always reset mixing to Identity + small noise? Or pure Identity?
+        // Constructor does Pure Identity.
+        mixing_weights_.fill(0);
+        T* mw = mixing_weights_.data();
+        std::fill(mw + in_channels_, mw + 2 * in_channels_, 1.0f);
+
+        // Reset scales to 1
+        spectral_scales_.fill(1.0);
+
+        // Reset Bias
+        bias_.fill(0);
+    }
+
     std::string name() const override { return "ZenithBlock"; }
 
 private:
