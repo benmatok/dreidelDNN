@@ -7,6 +7,7 @@
 #include "../layers/ConvTranspose2D.hpp"
 #include "../layers/PixelShuffle.hpp" // For PixelUnshuffle
 #include "../layers/ReLU.hpp"
+#include "../layers/PositionalEmbedding.hpp"
 #include <vector>
 #include <memory>
 #include <iostream>
@@ -89,21 +90,27 @@ public:
     ZenithHierarchicalAE(size_t base_filters = 16) {
 
         // 1. Stem: Conv2d -> H/2, W/2
+        // Removed CoordConv injection here (3 channels standard)
         stem_ = std::make_unique<Conv2D<T>>(3, base_filters, 2, 2, 0);
 
         // 2. Stage 1: PixelUnshuffle(4) -> C*16, H/8
-        // Input C, H/2. Output C*16, H/8.
         stage1_unshuffle_ = std::make_unique<PixelUnshuffle<T>>(4);
 
         // Body: 1x ZenithBlock(C*16)
         size_t s1_ch = base_filters * 16;
         stage1_block_ = std::make_unique<ZenithBlock<T>>(s1_ch, 3, s1_ch);
-        // Default Dropout 0.1
+        // Default Settings (GN=32, Drop=0.1) apply
 
         // 3. Stage 2: PixelUnshuffle(4) -> C*256, H/32
-        // Input C*16, H/8. Output (C*16)*16 = C*256, H/32.
+        // This leads to the bottleneck.
         stage2_unshuffle_ = std::make_unique<PixelUnshuffle<T>>(4);
-        size_t s2_ch = base_filters * 256;
+        size_t s2_ch = base_filters * 256; // 16 * 256 = 4096
+
+        // Inject 2D Positional Embedding here (Bottleneck)
+        // Assume standard input 224x224 -> H/32 = 7x7.
+        // We initialize for 7x7. If input size changes, this will break or need dynamic logic.
+        // For benchmarks, we ensure 224 input.
+        stage2_pe_ = std::make_unique<SinusoidalPositionalEmbedding2D<T>>(7, 7, s2_ch);
 
         // Body: 2x ZenithBlock(C*256)
         stage2_block1_ = std::make_unique<ZenithBlock<T>>(s2_ch, 3, s2_ch);
@@ -114,7 +121,6 @@ public:
         stage2_block2_->set_spectral_dropout(0.2f);
 
         // 4. Head: Fused Zenith Autoencoder (Decoder Part)
-        // Note: ZenithBlock supports upscale=1, 2, 4, 8.
         size_t dec1_ch = base_filters * 16;
         decoder_stage1_ = std::make_unique<ZenithBlock<T>>(s2_ch, dec1_ch, 3, s2_ch, true, false, false, 1, 8); // Upscale 8x
 
@@ -129,6 +135,10 @@ public:
         x = stage1_block_->forward(x);
 
         x = stage2_unshuffle_->forward(x);
+
+        // Inject PE
+        x = stage2_pe_->forward(x);
+
         x = stage2_block1_->forward(x);
         x = stage2_block2_->forward(x);
 
@@ -144,6 +154,10 @@ public:
 
         g = stage2_block2_->backward(g);
         g = stage2_block1_->backward(g);
+
+        // PE Backward (Pass-through)
+        g = stage2_pe_->backward(g);
+
         g = stage2_unshuffle_->backward(g);
 
         g = stage1_block_->backward(g);
@@ -190,6 +204,9 @@ private:
     std::unique_ptr<PixelUnshuffle<T>> stage1_unshuffle_;
     std::unique_ptr<ZenithBlock<T>> stage1_block_;
     std::unique_ptr<PixelUnshuffle<T>> stage2_unshuffle_;
+
+    std::unique_ptr<SinusoidalPositionalEmbedding2D<T>> stage2_pe_;
+
     std::unique_ptr<ZenithBlock<T>> stage2_block1_;
     std::unique_ptr<ZenithBlock<T>> stage2_block2_;
 
