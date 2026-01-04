@@ -750,8 +750,12 @@ public:
         T* mw = mixing_weights_.data();
         std::fill(mw + in_channels_, mw + 2 * in_channels_, 1.0f);
 
-        // Reset scales to 1
-        spectral_scales_.fill(1.0);
+        // Reset scales to 1 or random around 1
+        if (scheme.find("noisy") != std::string::npos) {
+            spectral_scales_.random(0.9, 1.1);
+        } else {
+            spectral_scales_.fill(1.0);
+        }
 
         // Reset Bias
         bias_.fill(0);
