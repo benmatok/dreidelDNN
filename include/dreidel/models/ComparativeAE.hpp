@@ -87,41 +87,86 @@ template <typename T>
 class ZenithHierarchicalAE : public Layer<T> {
 public:
     ZenithHierarchicalAE(size_t base_filters = 16) {
-        // 1. Stem: Conv2d(3, C, k=2, s=2) -> H/2, W/2
-        stem_ = std::make_unique<Conv2D<T>>(3, base_filters, 2, 2, 0);
+        // 3. Positional Encoding Injection
+        // We will modify Stem to accept 5 channels (R, G, B, X, Y)
+
+        // 1. Stem: Conv2d(5, C, k=2, s=2) -> H/2, W/2
+        stem_ = std::make_unique<Conv2D<T>>(5, base_filters, 2, 2, 0);
 
         // 2. Stage 1: PixelUnshuffle(4) -> C*16, H/8
         // Input C, H/2. Output C*16, H/8.
         stage1_unshuffle_ = std::make_unique<PixelUnshuffle<T>>(4);
+
         // Body: 1x ZenithBlock(C*16)
         size_t s1_ch = base_filters * 16;
         stage1_block_ = std::make_unique<ZenithBlock<T>>(s1_ch, 3, s1_ch);
+
+        // Apply "Secret Sauce" configs
+        stage1_block_->set_group_norm(true, 32);
+        stage1_block_->set_spectral_dropout(0.1f); // Mild dropout for Stage 1
 
         // 3. Stage 2: PixelUnshuffle(4) -> C*256, H/32
         // Input C*16, H/8. Output (C*16)*16 = C*256, H/32.
         stage2_unshuffle_ = std::make_unique<PixelUnshuffle<T>>(4);
         size_t s2_ch = base_filters * 256;
+
         // Body: 2x ZenithBlock(C*256)
         stage2_block1_ = std::make_unique<ZenithBlock<T>>(s2_ch, 3, s2_ch);
         stage2_block2_ = std::make_unique<ZenithBlock<T>>(s2_ch, 3, s2_ch);
 
-        // 4. Head: Fused Zenith Autoencoder (Decoder Part)
-        // Instead of ConvTranspose2D (Heavy) or Upscale2D, we use ZenithBlock with 'upscale' parameter.
-        // We need to upscale from H/32 -> H (Factor 32).
-        // Upscale 8 -> H/4. Upscale 4 -> H. (8*4=32).
-        // Stage 3 Decode: C*256 -> C*16 (Upscale 8x)
-        // Stage 4 Decode: C*16 -> 3 (Upscale 4x)
+        // Secret Sauce: Gradient Checkpointing for Stage 2 (Fat Channels)
+        stage2_block1_->set_group_norm(true, 32);
+        stage2_block1_->set_spectral_dropout(0.2f);
+        stage2_block1_->set_gradient_checkpointing(true); // Enable Checkpointing!
 
+        stage2_block2_->set_group_norm(true, 32);
+        stage2_block2_->set_spectral_dropout(0.2f);
+        stage2_block2_->set_gradient_checkpointing(true);
+
+        // 4. Head: Fused Zenith Autoencoder (Decoder Part)
         // Note: ZenithBlock supports upscale=1, 2, 4, 8.
         size_t dec1_ch = base_filters * 16;
         decoder_stage1_ = std::make_unique<ZenithBlock<T>>(s2_ch, dec1_ch, 3, s2_ch, true, false, false, 1, 8); // Upscale 8x
+        decoder_stage1_->set_group_norm(true, 32);
 
         // Final Projection to 3 channels.
         decoder_stage2_ = std::make_unique<ZenithBlock<T>>(dec1_ch, 3, 3, dec1_ch, true, false, false, 1, 4); // Upscale 4x
+        // Output layer usually doesn't have Norm? Or maybe yes.
+        // We want raw pixels? Or sigmoided?
+        // Original code didn't have Sigmoid. Just ZenithBlock.
+        // ZenithBlock has ReLU at end.
+        // For Image Recon, ReLU output means only positive pixels. Valid for [0, 255] or [0, 1].
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
-        Tensor<T> x = stem_->forward(input);
+        // Inject CoordConv
+        // Input: N, H, W, 3
+        auto shape = input.shape();
+        size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3]; // C=3
+
+        Tensor<T> input_aug({N, H, W, 5});
+        T* aug_ptr = input_aug.data();
+        const T* in_ptr = input.data();
+
+        #pragma omp parallel for collapse(3)
+        for(size_t n=0; n<N; ++n) {
+            for(size_t h=0; h<H; ++h) {
+                for(size_t w=0; w<W; ++w) {
+                    size_t idx_src = ((n*H + h)*W + w)*3;
+                    size_t idx_dst = ((n*H + h)*W + w)*5;
+
+                    aug_ptr[idx_dst + 0] = in_ptr[idx_src + 0];
+                    aug_ptr[idx_dst + 1] = in_ptr[idx_src + 1];
+                    aug_ptr[idx_dst + 2] = in_ptr[idx_src + 2];
+
+                    // Normalized Coords [-1, 1]
+                    aug_ptr[idx_dst + 3] = 2.0f * (static_cast<float>(w) / (W - 1)) - 1.0f; // X
+                    aug_ptr[idx_dst + 4] = 2.0f * (static_cast<float>(h) / (H - 1)) - 1.0f; // Y
+                }
+            }
+        }
+
+        Tensor<T> x = stem_->forward(input_aug);
 
         x = stage1_unshuffle_->forward(x);
         x = stage1_block_->forward(x);
@@ -148,6 +193,7 @@ public:
         g = stage1_unshuffle_->backward(g);
 
         g = stem_->backward(g);
+        // g is now 5 channels. We can slice it if needed, but usually backward stops here.
         return g;
     }
 
@@ -196,8 +242,7 @@ private:
     std::unique_ptr<ZenithBlock<T>> decoder_stage2_;
 };
 
-
-// II. Conv Baseline Autoencoder
+// ... ConvBaselineAE remains unchanged ...
 template <typename T>
 class ConvBaselineAE : public Layer<T> {
 public:
