@@ -32,12 +32,13 @@ public:
 
         std::uniform_real_distribution<T> dist_x(width_ * 0.1, width_ * 0.9);
         std::uniform_real_distribution<T> dist_y(height_ * 0.1, height_ * 0.9);
-        std::uniform_real_distribution<T> dist_s(2.0, 30.0); // Size range
-        std::uniform_real_distribution<T> dist_w(0.1, 0.8); // Frequency
+        // Increase size and reduce frequency for "cleaner" targets
+        std::uniform_real_distribution<T> dist_s(20.0, 80.0); // Larger Size
+        std::uniform_real_distribution<T> dist_w(0.05, 0.3); // Lower Frequency (Smoother)
         std::uniform_real_distribution<T> dist_theta(0.0, 3.14159); // Orientation
-        std::uniform_real_distribution<T> dist_amp(0.2, 0.6); // Amplitude scaling
-        std::uniform_int_distribution<int> dist_type(0, 3); // Subset of nice 2D kernels (Removed Ridge/Checkerboard)
-        std::uniform_int_distribution<int> dist_count(5, 15); // Number of wavelets per image
+        std::uniform_real_distribution<T> dist_amp(0.3, 0.8); // Amplitude scaling
+        std::uniform_int_distribution<int> dist_type(0, 3); // Subset of nice 2D kernels
+        std::uniform_int_distribution<int> dist_count(3, 8); // Fewer wavelets (Less clutter)
 
         T* ptr = data.data();
         size_t C = 3;
