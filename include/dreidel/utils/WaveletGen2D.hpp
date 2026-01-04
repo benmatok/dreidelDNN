@@ -35,7 +35,8 @@ public:
         std::uniform_real_distribution<T> dist_s(2.0, 30.0); // Size range
         std::uniform_real_distribution<T> dist_w(0.1, 0.8); // Frequency
         std::uniform_real_distribution<T> dist_theta(0.0, 3.14159); // Orientation
-        std::uniform_int_distribution<int> dist_type(0, 5); // Subset of nice 2D kernels
+        std::uniform_real_distribution<T> dist_amp(0.2, 0.6); // Amplitude scaling
+        std::uniform_int_distribution<int> dist_type(0, 3); // Subset of nice 2D kernels (Removed Ridge/Checkerboard)
         std::uniform_int_distribution<int> dist_count(5, 15); // Number of wavelets per image
 
         T* ptr = data.data();
@@ -49,7 +50,7 @@ public:
         // Pre-generate parameters to avoid random inside parallel loop
         struct WaveletParams {
             int type;
-            T cx, cy, s, w, theta;
+            T cx, cy, s, w, theta, amp;
         };
 
         std::vector<std::vector<WaveletParams>> batch_wavelets(batch_size);
@@ -58,7 +59,7 @@ public:
             for(int k=0; k<count; ++k) {
                 batch_wavelets[i].push_back({
                     dist_type(gen), dist_x(gen), dist_y(gen),
-                    dist_s(gen), dist_w(gen), dist_theta(gen)
+                    dist_s(gen), dist_w(gen), dist_theta(gen), dist_amp(gen)
                 });
             }
         }
@@ -103,17 +104,10 @@ public:
                             case 3: // DoG (Difference of Gaussians)
                                 val = std::exp(-(rx*rx + ry*ry) / (2 * wp.s * wp.s)) - 0.5 * std::exp(-(rx*rx + ry*ry) / (2 * wp.s * wp.s * 4));
                                 break;
-                            case 4: // Ridge
-                                 val = std::exp(-rx*rx / (2*wp.s*wp.s)); // Infinite in y direction (local ridge)
-                                 // Add Gaussian envelope in y to make it a segment
-                                 val *= std::exp(-ry*ry / (2*wp.s*wp.s*9)); // Elongated
-                                 break;
-                            case 5: // Checkerboard / High Freq
-                                if (std::abs(rx) < wp.s && std::abs(ry) < wp.s) {
-                                    val = std::cos(wp.w*rx) * std::cos(wp.w*ry);
-                                }
-                                break;
                         }
+
+                        // Apply Amplitude
+                        val *= wp.amp;
 
                         // Accumulate
                         size_t idx = ((i * H + h) * W + w_coord) * C;
