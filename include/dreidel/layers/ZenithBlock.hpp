@@ -435,9 +435,9 @@ public:
             std::vector<T> local_gw_R(in_channels_, 0);
             std::vector<T> local_g_bias(out_channels_, 0);
 
-            // Use default allocator to avoid potential aligned_alloc issues in threads
-            std::vector<T> buf_grad(std::max(in_channels_, out_channels_));
-            std::vector<T> buf_eyes(in_channels_);
+            // Use aligned allocator to ensure SIMD compatibility
+            std::vector<T, core::AlignedAllocator<T>> buf_grad(std::max(in_channels_, out_channels_));
+            std::vector<T, core::AlignedAllocator<T>> buf_eyes(in_channels_);
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
@@ -500,7 +500,7 @@ public:
                         for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] *= scale_ptr[c];
 
                         // Mix
-                        std::vector<T> mixed(out_channels_);
+                        std::vector<T, core::AlignedAllocator<T>> mixed(out_channels_);
                         if (in_channels_ == out_channels_) {
                             for(size_t c=0; c<in_channels_; ++c) {
                                 T prev = (c==0)?0:buf_eyes[c-1];
@@ -548,7 +548,7 @@ public:
                         // buf_grad holds dL/dy. buf_eyes holds inputs to mixing (scaled wht).
                         // We need to compute dL/d_buf_eyes (grad wrt scaled wht).
 
-                        std::vector<T> d_eyes(in_channels_, 0);
+                        std::vector<T, core::AlignedAllocator<T>> d_eyes(in_channels_, 0);
 
                         if (in_channels_ == out_channels_) {
                             for(size_t c=0; c<in_channels_; ++c) {
@@ -1085,8 +1085,18 @@ private:
                         }
 
                         // Load & FWHT
-                        std::copy(eyes_ptr + idx, eyes_ptr + idx + C, buf.begin());
-                        algo::WHT::fwht_1d(buf.data(), C);
+                        const float* in_p = eyes_ptr + idx;
+                        float* buf_p = buf.data();
+
+                        // Bounds check
+                        // if (idx + C > eyes_ptr_size) ... but we assume tensor is correct.
+                        // eyes_ptr is from eyes_out_cached_.
+
+                        // Manual loop to avoid std::copy with potentially weird iterators in OpenMP
+                        for(size_t i=0; i<C; ++i) {
+                             buf_p[i] = in_p[i];
+                        }
+                        algo::WHT::fwht_1d(buf_p, C);
 
                         // Scale
                         for(size_t i=0; i<C; i+=8) {
@@ -1096,40 +1106,12 @@ private:
                         }
 
                         // Copy to temp for mixing source
-                        std::copy(buf.begin(), buf.end(), t_buf.begin());
+                        float* t_buf_p = t_buf.data();
+                        for(size_t i=0; i<C; ++i) t_buf_p[i] = buf_p[i];
 
                         // Vectorized Mixing Loop
                         for(size_t i=0; i<C; i+=8) {
-                             __m256 curr = _mm256_load_ps(t_buf.data() + i);
-                             __m256 prev, next;
-
-                             if (i > 0) prev = _mm256_loadu_ps(t_buf.data() + i - 1); // Unaligned load of [i-1...i+6]
-                             else {
-                                 // Boundary 0. Prev is 0?
-                                 // shift_right_1 needs prev reg.
-                                 // We need specific unaligned logic or use scalar fallback for boundary?
-                                 // Actually, simpler:
-                                 // Construct 'prev' from Zero and curr?
-                                 // shift_right_1(curr, zero) gives [0, c0, c1...c6]. Correct.
-                                 prev = zero;
-                             }
-
-                             if (i + 8 < C) next = _mm256_loadu_ps(t_buf.data() + i + 1); // Unaligned [i+1...i+8]
-                             else {
-                                 // Boundary end. Next is 0?
-                                 // shift_left_1(curr, zero) gives [c1...c7, 0]. Correct.
-                                 next = zero;
-                             }
-
-                             // BUT wait. `shift_right_1` uses a register as prev.
-                             // `_mm256_loadu_ps` loads a block of memory.
-                             // If I load `t_buf + i - 1` (valid pointer), it contains `[c-1, c0... c6]`.
-                             // This IS the shifted data directly! I don't need `shift_right_1`.
-                             // `shift_right_1` is for when data is in registers and we can't unaligned load across them easily.
-                             // Here we are in memory!
-                             // So:
-                             // val = w_C * curr + w_L * loadu(i-1) + w_R * loadu(i+1)
-                             // This is much faster.
+                             __m256 curr = _mm256_load_ps(t_buf_p + i);
 
                              __m256 wl = _mm256_load_ps(w_L + i);
                              __m256 wc = _mm256_load_ps(w_C + i);
@@ -1137,28 +1119,20 @@ private:
 
                              __m256 p_vec, n_vec;
 
-                             // Handle Boundary i=0 for loadu(i-1) - unsafe pointer
+                             // Handle Boundary i=0
                              if (i == 0) {
-                                 // loadu at -1 is invalid.
                                  // Construct p_vec manually: [0, t[0], t[1]...t[6]]
-                                 // shift_right_1(curr, zero) does exactly this.
                                  p_vec = shift_right_1(curr, zero);
                              } else {
-                                 p_vec = _mm256_loadu_ps(t_buf.data() + i - 1);
+                                 p_vec = _mm256_loadu_ps(t_buf_p + i - 1);
                              }
 
-                             // Handle Boundary i=C-8 for loadu(i+1) - unsafe pointer if C aligned?
-                             // t_buf is size C. t_buf[C] is end. t_buf + i + 1 + 7 = t_buf + C - 8 + 1 + 7 = t_buf + C.
-                             // So loadu at C-8+1 reads up to t_buf[C]. This is 1 float past end?
-                             // No. Range is [i+1, i+8]. Last element is at i+8.
-                             // If i = C-8. Indices are C-7 ... C.
-                             // t_buf has indices 0...C-1.
-                             // So accessing index C is out of bounds.
-                             // So for last block, we cannot use loadu(i+1).
+                             // Handle Boundary i=C-8
                              if (i + 8 >= C) {
+                                 // Construct n_vec manually: [t[C-7], ... t[C-1], 0]
                                  n_vec = shift_left_1(curr, zero);
                              } else {
-                                 n_vec = _mm256_loadu_ps(t_buf.data() + i + 1);
+                                 n_vec = _mm256_loadu_ps(t_buf_p + i + 1);
                              }
 
                              __m256 res = _mm256_mul_ps(curr, wc);
@@ -1458,13 +1432,13 @@ private:
                              // Helper for boundaries
                              // i=0: prev is 0. i=C-8: next is 0.
                              if (i == 0) {
-                                 prev = shift_right_1(curr, zero);
+                                 prev = ZenithBlock::shift_right_1(curr, zero);
                              } else {
                                  prev = _mm256_loadu_ps(mix_temp + i - 1);
                              }
 
                              if (i + 8 >= C) {
-                                 next = shift_left_1(curr, zero);
+                                 next = ZenithBlock::shift_left_1(curr, zero);
                              } else {
                                  next = _mm256_loadu_ps(mix_temp + i + 1);
                              }
