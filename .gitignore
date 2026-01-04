@@ -23,3 +23,5 @@ tests/test_xor
 tests/verify_spectral
 test_outputs.txt
 test_results.txt
+build/
+build/
