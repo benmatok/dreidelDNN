@@ -170,18 +170,23 @@ int main() {
 
         // Apply Augmentations (Rotate through types or apply mix)
         // For this test, let's apply a mix to the single batch item
+
+        // Always add some Grain (Gaussian Noise) to ensure input looks "Noisy"
+        add_gaussian_noise(inputs, 0.05f); // Base noise floor
+
         if (epoch % 4 == 0) {
             std::cout << "Augmentation: Text Overlay" << std::endl;
             add_text_overlay(inputs);
         } else if (epoch % 4 == 1) {
-            std::cout << "Augmentation: Correlated Noise" << std::endl;
-            add_correlated_noise(inputs, 0.2f);
+            std::cout << "Augmentation: Correlated Noise (Heavy)" << std::endl;
+            add_correlated_noise(inputs, 0.3f); // Heavier blur
+            add_gaussian_noise(inputs, 0.1f); // Add more grain on top
         } else if (epoch % 4 == 2) {
             std::cout << "Augmentation: Missing Pixels" << std::endl;
             add_missing_pixels(inputs, 0.3f); // 30% dropout
         } else {
-             std::cout << "Augmentation: Mixed (Noise + Text)" << std::endl;
-             add_gaussian_noise(inputs, 0.1f);
+             std::cout << "Augmentation: Mixed (Correlated + Text)" << std::endl;
+             add_correlated_noise(inputs, 0.2f);
              add_text_overlay(inputs);
         }
 
