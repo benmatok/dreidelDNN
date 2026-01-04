@@ -5,6 +5,7 @@
 #include <vector>
 #include <cmath>
 #include <map>
+#include <iostream>
 
 namespace dreidel {
 namespace optim {
@@ -13,7 +14,12 @@ template <typename T>
 class SimpleAdam {
 public:
     SimpleAdam(T lr = 1e-3, T beta1 = 0.9, T beta2 = 0.999, T epsilon = 1e-8)
-        : lr_(lr), beta1_(beta1), beta2_(beta2), epsilon_(epsilon), t_(0) {}
+        : lr_(lr), beta1_(beta1), beta2_(beta2), epsilon_(epsilon), t_(0), use_coord_clipping_(false), clip_threshold_(1.0) {}
+
+    void set_coordinate_wise_clipping(bool enable, T threshold = 1.0) {
+        use_coord_clipping_ = enable;
+        clip_threshold_ = threshold;
+    }
 
     void add_parameters(const std::vector<Tensor<T>*>& params, const std::vector<Tensor<T>*>& grads) {
         if (params.size() != grads.size()) throw std::invalid_argument("Params and Grads size mismatch");
@@ -40,7 +46,7 @@ public:
             Tensor<T>& v = v_[i];
 
             T* p_ptr = p->data();
-            const T* g_ptr = g->data();
+            T* g_ptr = g->data(); // Not const because we might clip in-place
             T* m_ptr = m.data();
             T* v_ptr = v.data();
 
@@ -49,6 +55,18 @@ public:
             #pragma omp parallel for
             for (size_t k = 0; k < size; ++k) {
                 T grad = g_ptr[k];
+
+                // Coordinate-Wise Clipping (The "Gem")
+                // Clip gradients per frequency band / element.
+                if (use_coord_clipping_) {
+                    if (std::abs(grad) > clip_threshold_) {
+                        grad = (grad > 0) ? clip_threshold_ : -clip_threshold_;
+                        // We modify the gradient used for update.
+                        // Optionally write back to g_ptr if we want to persist clipping?
+                        // Usually clipping modifies the gradient tensor.
+                        g_ptr[k] = grad;
+                    }
+                }
 
                 // Update moments
                 m_ptr[k] = beta1_ * m_ptr[k] + (1.0 - beta1_) * grad;
@@ -69,6 +87,8 @@ public:
 private:
     T lr_, beta1_, beta2_, epsilon_;
     size_t t_;
+    bool use_coord_clipping_;
+    T clip_threshold_;
     std::vector<Tensor<T>*> params_;
     std::vector<Tensor<T>*> grads_;
     std::vector<Tensor<T>> m_;
