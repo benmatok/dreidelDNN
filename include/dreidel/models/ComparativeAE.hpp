@@ -86,12 +86,15 @@ private:
 template <typename T>
 class ZenithHierarchicalAE : public Layer<T> {
 public:
-    ZenithHierarchicalAE(size_t base_filters = 16) {
-        // 3. Positional Encoding Injection
-        // We will modify Stem to accept 5 channels (R, G, B, X, Y)
+    ZenithHierarchicalAE(size_t base_filters = 16, bool use_coordconv = true)
+        : use_coordconv_(use_coordconv) {
 
-        // 1. Stem: Conv2d(5, C, k=2, s=2) -> H/2, W/2
-        stem_ = std::make_unique<Conv2D<T>>(5, base_filters, 2, 2, 0);
+        // 3. Positional Encoding Injection
+        // If enabled, Stem accepts 5 channels (R, G, B, X, Y), else 3
+        size_t stem_in_ch = use_coordconv_ ? 5 : 3;
+
+        // 1. Stem: Conv2d -> H/2, W/2
+        stem_ = std::make_unique<Conv2D<T>>(stem_in_ch, base_filters, 2, 2, 0);
 
         // 2. Stage 1: PixelUnshuffle(4) -> C*16, H/8
         // Input C, H/2. Output C*16, H/8.
@@ -131,54 +134,57 @@ public:
 
         // Final Projection to 3 channels.
         decoder_stage2_ = std::make_unique<ZenithBlock<T>>(dec1_ch, 3, 3, dec1_ch, true, false, false, 1, 4); // Upscale 4x
-        // Output layer usually doesn't have Norm? Or maybe yes.
-        // We want raw pixels? Or sigmoided?
-        // Original code didn't have Sigmoid. Just ZenithBlock.
-        // ZenithBlock has ReLU at end.
-        // For Image Recon, ReLU output means only positive pixels. Valid for [0, 255] or [0, 1].
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
         // Inject CoordConv
         // Input: N, H, W, 3
-        auto shape = input.shape();
-        size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3]; // C=3
 
-        Tensor<T> input_aug({N, H, W, 5});
-        T* aug_ptr = input_aug.data();
-        const T* in_ptr = input.data();
+        if (use_coordconv_) {
+            auto shape = input.shape();
+            size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3]; // C=3
 
-        #pragma omp parallel for collapse(3)
-        for(size_t n=0; n<N; ++n) {
-            for(size_t h=0; h<H; ++h) {
-                for(size_t w=0; w<W; ++w) {
-                    size_t idx_src = ((n*H + h)*W + w)*3;
-                    size_t idx_dst = ((n*H + h)*W + w)*5;
+            Tensor<T> input_aug({N, H, W, 5});
+            T* aug_ptr = input_aug.data();
+            const T* in_ptr = input.data();
 
-                    aug_ptr[idx_dst + 0] = in_ptr[idx_src + 0];
-                    aug_ptr[idx_dst + 1] = in_ptr[idx_src + 1];
-                    aug_ptr[idx_dst + 2] = in_ptr[idx_src + 2];
+            #pragma omp parallel for collapse(3)
+            for(size_t n=0; n<N; ++n) {
+                for(size_t h=0; h<H; ++h) {
+                    for(size_t w=0; w<W; ++w) {
+                        size_t idx_src = ((n*H + h)*W + w)*3;
+                        size_t idx_dst = ((n*H + h)*W + w)*5;
 
-                    // Normalized Coords [-1, 1]
-                    aug_ptr[idx_dst + 3] = 2.0f * (static_cast<float>(w) / (W - 1)) - 1.0f; // X
-                    aug_ptr[idx_dst + 4] = 2.0f * (static_cast<float>(h) / (H - 1)) - 1.0f; // Y
+                        aug_ptr[idx_dst + 0] = in_ptr[idx_src + 0];
+                        aug_ptr[idx_dst + 1] = in_ptr[idx_src + 1];
+                        aug_ptr[idx_dst + 2] = in_ptr[idx_src + 2];
+
+                        // Normalized Coords [-1, 1]
+                        aug_ptr[idx_dst + 3] = 2.0f * (static_cast<float>(w) / (W - 1)) - 1.0f; // X
+                        aug_ptr[idx_dst + 4] = 2.0f * (static_cast<float>(h) / (H - 1)) - 1.0f; // Y
+                    }
                 }
             }
+            Tensor<T> x = stem_->forward(input_aug);
+            x = stage1_unshuffle_->forward(x);
+            x = stage1_block_->forward(x);
+            x = stage2_unshuffle_->forward(x);
+            x = stage2_block1_->forward(x);
+            x = stage2_block2_->forward(x);
+            x = decoder_stage1_->forward(x);
+            x = decoder_stage2_->forward(x);
+            return x;
+        } else {
+             Tensor<T> x = stem_->forward(input);
+             x = stage1_unshuffle_->forward(x);
+             x = stage1_block_->forward(x);
+             x = stage2_unshuffle_->forward(x);
+             x = stage2_block1_->forward(x);
+             x = stage2_block2_->forward(x);
+             x = decoder_stage1_->forward(x);
+             x = decoder_stage2_->forward(x);
+             return x;
         }
-
-        Tensor<T> x = stem_->forward(input_aug);
-
-        x = stage1_unshuffle_->forward(x);
-        x = stage1_block_->forward(x);
-
-        x = stage2_unshuffle_->forward(x);
-        x = stage2_block1_->forward(x);
-        x = stage2_block2_->forward(x);
-
-        // Fused Decoder
-        x = decoder_stage1_->forward(x);
-        x = decoder_stage2_->forward(x);
-        return x;
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
@@ -193,7 +199,6 @@ public:
         g = stage1_unshuffle_->backward(g);
 
         g = stem_->backward(g);
-        // g is now 5 channels. We can slice it if needed, but usually backward stops here.
         return g;
     }
 
@@ -230,6 +235,7 @@ public:
     std::string name() const override { return "ZenithHierarchicalAE"; }
 
 private:
+    bool use_coordconv_;
     std::unique_ptr<Conv2D<T>> stem_;
     std::unique_ptr<PixelUnshuffle<T>> stage1_unshuffle_;
     std::unique_ptr<ZenithBlock<T>> stage1_block_;
