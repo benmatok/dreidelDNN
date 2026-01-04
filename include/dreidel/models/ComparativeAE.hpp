@@ -16,6 +16,15 @@ namespace models {
 
 using namespace layers;
 
+struct ZenithConfig {
+    bool use_identity_init = true;
+    bool use_spectral_dropout = false;
+    bool use_coordconv = false;
+    bool use_groupnorm = false;
+    bool use_checkpointing = false;
+    float dropout_rate = 0.1f;
+};
+
 // Helper: Residual Block
 template <typename T>
 class ResidualBlock : public Layer<T> {
@@ -86,12 +95,11 @@ private:
 template <typename T>
 class ZenithHierarchicalAE : public Layer<T> {
 public:
-    ZenithHierarchicalAE(size_t base_filters = 16, bool use_coordconv = true)
-        : use_coordconv_(use_coordconv) {
+    ZenithHierarchicalAE(size_t base_filters = 16, ZenithConfig config = ZenithConfig())
+        : config_(config) {
 
         // 3. Positional Encoding Injection
-        // If enabled, Stem accepts 5 channels (R, G, B, X, Y), else 3
-        size_t stem_in_ch = use_coordconv_ ? 5 : 3;
+        size_t stem_in_ch = config_.use_coordconv ? 5 : 3;
 
         // 1. Stem: Conv2d -> H/2, W/2
         stem_ = std::make_unique<Conv2D<T>>(stem_in_ch, base_filters, 2, 2, 0);
@@ -104,12 +112,13 @@ public:
         size_t s1_ch = base_filters * 16;
         stage1_block_ = std::make_unique<ZenithBlock<T>>(s1_ch, 3, s1_ch);
 
-        // Apply "Secret Sauce" configs
-        stage1_block_->set_group_norm(true, 32);
-        stage1_block_->set_spectral_dropout(0.1f); // Mild dropout for Stage 1
+        // Apply Configs
+        std::string init_scheme = config_.use_identity_init ? "identity" : "he";
+        stage1_block_->reinit(init_scheme);
+        stage1_block_->set_group_norm(config_.use_groupnorm, 32);
+        if (config_.use_spectral_dropout) stage1_block_->set_spectral_dropout(config_.dropout_rate);
 
         // 3. Stage 2: PixelUnshuffle(4) -> C*256, H/32
-        // Input C*16, H/8. Output (C*16)*16 = C*256, H/32.
         stage2_unshuffle_ = std::make_unique<PixelUnshuffle<T>>(4);
         size_t s2_ch = base_filters * 256;
 
@@ -117,30 +126,29 @@ public:
         stage2_block1_ = std::make_unique<ZenithBlock<T>>(s2_ch, 3, s2_ch);
         stage2_block2_ = std::make_unique<ZenithBlock<T>>(s2_ch, 3, s2_ch);
 
-        // Secret Sauce: Gradient Checkpointing for Stage 2 (Fat Channels)
-        stage2_block1_->set_group_norm(true, 32);
-        stage2_block1_->set_spectral_dropout(0.2f);
-        stage2_block1_->set_gradient_checkpointing(true); // Enable Checkpointing!
+        stage2_block1_->reinit(init_scheme);
+        stage2_block1_->set_group_norm(config_.use_groupnorm, 32);
+        if (config_.use_spectral_dropout) stage2_block1_->set_spectral_dropout(config_.dropout_rate * 2); // Higher dropout for deep?
+        if (config_.use_checkpointing) stage2_block1_->set_gradient_checkpointing(true);
 
-        stage2_block2_->set_group_norm(true, 32);
-        stage2_block2_->set_spectral_dropout(0.2f);
-        stage2_block2_->set_gradient_checkpointing(true);
+        stage2_block2_->reinit(init_scheme);
+        stage2_block2_->set_group_norm(config_.use_groupnorm, 32);
+        if (config_.use_spectral_dropout) stage2_block2_->set_spectral_dropout(config_.dropout_rate * 2);
+        if (config_.use_checkpointing) stage2_block2_->set_gradient_checkpointing(true);
 
         // 4. Head: Fused Zenith Autoencoder (Decoder Part)
-        // Note: ZenithBlock supports upscale=1, 2, 4, 8.
         size_t dec1_ch = base_filters * 16;
         decoder_stage1_ = std::make_unique<ZenithBlock<T>>(s2_ch, dec1_ch, 3, s2_ch, true, false, false, 1, 8); // Upscale 8x
-        decoder_stage1_->set_group_norm(true, 32);
+        decoder_stage1_->reinit(init_scheme);
+        decoder_stage1_->set_group_norm(config_.use_groupnorm, 32);
 
         // Final Projection to 3 channels.
         decoder_stage2_ = std::make_unique<ZenithBlock<T>>(dec1_ch, 3, 3, dec1_ch, true, false, false, 1, 4); // Upscale 4x
+        decoder_stage2_->reinit(init_scheme);
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
-        // Inject CoordConv
-        // Input: N, H, W, 3
-
-        if (use_coordconv_) {
+        if (config_.use_coordconv) {
             auto shape = input.shape();
             size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3]; // C=3
 
@@ -235,7 +243,7 @@ public:
     std::string name() const override { return "ZenithHierarchicalAE"; }
 
 private:
-    bool use_coordconv_;
+    ZenithConfig config_;
     std::unique_ptr<Conv2D<T>> stem_;
     std::unique_ptr<PixelUnshuffle<T>> stage1_unshuffle_;
     std::unique_ptr<ZenithBlock<T>> stage1_block_;
