@@ -2,12 +2,36 @@
 <rect width="100%" height="100%" fill="white" />
 <line x1="60" y1="540" x2="740" y2="540" stroke="black" />
 <line x1="60" y1="540" x2="60" y2="60" stroke="black" />
-<text x="400" y="590" text-anchor="middle">Steps</text>
-<text x="20" y="300" text-anchor="middle" transform="rotate(-90 20 300)">Log10 Loss</text>
-<path d="M60 300.741 L 88.3333 289.997 L 116.667 273.333 L 145 305.173 L 173.333 304.059 L 201.667 352.471 L 230 328.043 L 258.333 349.123 L 286.667 295.355 L 315 313.136 L 343.333 337.06 L 371.667 316.083 L 400 316.748 L 428.333 349.653 L 456.667 324.161 L 485 316.657 L 513.333 370.481 L 541.667 326.947 L 570 390.404 L 598.333 319.698 L 626.667 379.805 L 655 325.846 L 683.333 333.621 L 711.667 373.119 L 740 362.694" fill="none" stroke="red" stroke-width="2" />
-<path d="M60 60 L 88.3333 60.4581 L 116.667 75.0546 L 145 67.7089 L 173.333 70.1999 L 201.667 78.588 L 230 74.4306 L 258.333 104.375 L 286.667 71.2204 L 315 76.654 L 343.333 108.725 L 371.667 74.877 L 400 79.5392 L 428.333 95.4061 L 456.667 87.4671 L 485 114.125 L 513.333 109.549 L 541.667 102.613 L 570 106.4 L 598.333 94.006 L 626.667 107.969 L 655 119.36 L 683.333 110.261 L 711.667 109.592 L 740 101.318" fill="none" stroke="black" stroke-width="2" />
-<path d="M60 514.173 L 88.3333 517.915 L 116.667 530.476 L 145 513.738 L 173.333 510.993 L 201.667 528.358 L 230 520.233 L 258.333 523.457 L 286.667 521.893 L 315 519.601 L 343.333 525.486 L 371.667 519.477 L 400 528.887 L 428.333 531.65 L 456.667 520.166 L 485 515.096 L 513.333 513.181 L 541.667 512.818 L 570 526.309 L 598.333 540 L 626.667 518.435 L 655 526.629 L 683.333 528.178 L 711.667 526.249 L 740 532.73" fill="none" stroke="green" stroke-width="2" />
-<path d="M60 361.424 L 88.3333 396.052 L 116.667 448.976 L 145 429.673 L 173.333 422.157 L 201.667 410.377 L 230 419.275 L 258.333 409.733 L 286.667 420.075 L 315 431.888 L 343.333 406.927 L 371.667 455.444 L 400 449.865 L 428.333 437.3 L 456.667 413.642 L 485 415.197 L 513.333 422.193 L 541.667 430.41 L 570 416.425 L 598.333 459.514 L 626.667 420.331 L 655 436.457 L 683.333 422.922 L 711.667 439.298 L 740 412.788" fill="none" stroke="blue" stroke-width="2" />
+<text x="400" y="590" text-anchor="middle" font-family="Arial" font-size="14">Steps</text>
+<text x="20" y="300" text-anchor="middle" transform="rotate(-90 20 300)" font-family="Arial" font-size="14">Log10 Loss</text>
+<line x1="60" y1="540" x2="60" y2="545" stroke="black" />
+<text x="60" y="560" text-anchor="middle" font-family="Arial" font-size="12">0</text>
+<line x1="173.333" y1="540" x2="173.333" y2="545" stroke="black" />
+<text x="173.333" y="560" text-anchor="middle" font-family="Arial" font-size="12">4</text>
+<line x1="315" y1="540" x2="315" y2="545" stroke="black" />
+<text x="315" y="560" text-anchor="middle" font-family="Arial" font-size="12">9</text>
+<line x1="456.667" y1="540" x2="456.667" y2="545" stroke="black" />
+<text x="456.667" y="560" text-anchor="middle" font-family="Arial" font-size="12">14</text>
+<line x1="598.333" y1="540" x2="598.333" y2="545" stroke="black" />
+<text x="598.333" y="560" text-anchor="middle" font-family="Arial" font-size="12">19</text>
+<line x1="740" y1="540" x2="740" y2="545" stroke="black" />
+<text x="740" y="560" text-anchor="middle" font-family="Arial" font-size="12">24</text>
+<line x1="55" y1="540" x2="60" y2="540" stroke="black" />
+<text x="50" y="544" text-anchor="end" font-family="Arial" font-size="12">-0.5</text>
+<line x1="55" y1="444" x2="60" y2="444" stroke="black" />
+<text x="50" y="448" text-anchor="end" font-family="Arial" font-size="12">1.8</text>
+<line x1="55" y1="348" x2="60" y2="348" stroke="black" />
+<text x="50" y="352" text-anchor="end" font-family="Arial" font-size="12">4.0</text>
+<line x1="55" y1="252" x2="60" y2="252" stroke="black" />
+<text x="50" y="256" text-anchor="end" font-family="Arial" font-size="12">6.3</text>
+<line x1="55" y1="156" x2="60" y2="156" stroke="black" />
+<text x="50" y="160" text-anchor="end" font-family="Arial" font-size="12">8.5</text>
+<line x1="55" y1="60" x2="60" y2="60" stroke="black" />
+<text x="50" y="64" text-anchor="end" font-family="Arial" font-size="12">10.8</text>
+<path d="M60 287.197 L 88.3333 327.297 L 116.667 276.151 L 145 350.32 L 173.333 318.11 L 201.667 342.083 L 230 303.199 L 258.333 278.259 L 286.667 314.255 L 315 303.404 L 343.333 306.466 L 371.667 349.774 L 400 334.905 L 428.333 341.999 L 456.667 309.016 L 485 302.777 L 513.333 318.825 L 541.667 327.93 L 570 305.557 L 598.333 322.227 L 626.667 353.634 L 655 356.269 L 683.333 319.824 L 711.667 327.172 L 740 319.626" fill="none" stroke="red" stroke-width="2" />
+<path d="M60 90.145 L 88.3333 85.1515 L 116.667 84.4556 L 145 60 L 173.333 67.7015 L 201.667 86.1237 L 230 108.803 L 258.333 74.1122 L 286.667 87.4131 L 315 83.6286 L 343.333 93.22 L 371.667 116.829 L 400 80.9228 L 428.333 95.1034 L 456.667 112.584 L 485 97.917 L 513.333 114.88 L 541.667 105.603 L 570 112.1 L 598.333 107.533 L 626.667 94.5134 L 655 102.488 L 683.333 83.5552 L 711.667 111.156 L 740 104.429" fill="none" stroke="black" stroke-width="2" />
+<path d="M60 499.154 L 88.3333 500.428 L 116.667 494.826 L 145 507.65 L 173.333 518.508 L 201.667 497.392 L 230 502.628 L 258.333 504.296 L 286.667 502.57 L 315 497.63 L 343.333 504.018 L 371.667 499.016 L 400 509.246 L 428.333 512.578 L 456.667 521.599 L 485 514.229 L 513.333 540 L 541.667 515.063 L 570 503.341 L 598.333 504.132 L 626.667 507.452 L 655 525.744 L 683.333 515.055 L 711.667 518.144 L 740 519.707" fill="none" stroke="green" stroke-width="2" />
+<path d="M60 369.6 L 88.3333 373.285 L 116.667 409.421 L 145 418.76 L 173.333 395.186 L 201.667 384.71 L 230 382.965 L 258.333 377.736 L 286.667 376.64 L 315 375.473 L 343.333 381.635 L 371.667 376.741 L 400 386.84 L 428.333 419.827 L 456.667 388.899 L 485 411.885 L 513.333 378.314 L 541.667 450.656 L 570 414.938 L 598.333 416.803 L 626.667 441.698 L 655 355.515 L 683.333 394.729 L 711.667 390.529 L 740 392.736" fill="none" stroke="blue" stroke-width="2" />
 <rect x="590" y="40" width="180" height="100" fill="white" stroke="black" opacity="0.8" />
 <line x1="600" y1="50" x2="630" y2="50" stroke="red" stroke-width="2" />
 <text x="640" y="55">he</text>

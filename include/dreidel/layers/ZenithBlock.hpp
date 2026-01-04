@@ -49,8 +49,9 @@ public:
             throw std::invalid_argument("ZenithBlock in_channels must be a power of 2 for Spectral Mixing.");
         }
 
+        // Scaled He Initialization (0.1 factor) for stability in Spectral Networks
         T stddev = std::sqrt(static_cast<T>(2.0) / (kernel_size * kernel_size));
-        packed_weights_.random(0, stddev);
+        packed_weights_.random(0, stddev * 0.1);
         spectral_scales_.fill(1.0);
 
         // Initialize Mixing Weights: Center=1, Neighbors=0 (Identity Mixing)

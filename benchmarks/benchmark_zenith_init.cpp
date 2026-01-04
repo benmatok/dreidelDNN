@@ -76,8 +76,8 @@ void generate_convergence_svg(const std::map<std::string, std::vector<float>>& r
     svg << "<line x1=\"" << padding << "\" y1=\"" << height - padding << "\" x2=\"" << padding << "\" y2=\"" << padding << "\" stroke=\"black\" />\n"; // Y axis
 
     // Labels
-    svg << "<text x=\"" << width/2 << "\" y=\"" << height - 10 << "\" text-anchor=\"middle\">Steps</text>\n";
-    svg << "<text x=\"20\" y=\"" << height/2 << "\" text-anchor=\"middle\" transform=\"rotate(-90 20 " << height/2 << ")\">Log10 Loss</text>\n";
+    svg << "<text x=\"" << width/2 << "\" y=\"" << height - 10 << "\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"14\">Steps</text>\n";
+    svg << "<text x=\"20\" y=\"" << height/2 << "\" text-anchor=\"middle\" transform=\"rotate(-90 20 " << height/2 << ")\" font-family=\"Arial\" font-size=\"14\">Log10 Loss</text>\n";
 
     auto map_x = [&](size_t step) {
         return padding + (double)step / (total_steps - 1) * (width - 2*padding);
@@ -88,6 +88,26 @@ void generate_convergence_svg(const std::map<std::string, std::vector<float>>& r
         double norm = (log_l - log_min) / log_range;
         return height - padding - (norm * (height - 2*padding));
     };
+
+    // X-Axis Ticks (5 ticks)
+    for (int i = 0; i <= 5; ++i) {
+        size_t step = (total_steps - 1) * i / 5;
+        double x = map_x(step);
+        svg << "<line x1=\"" << x << "\" y1=\"" << height - padding << "\" x2=\"" << x << "\" y2=\"" << height - padding + 5 << "\" stroke=\"black\" />\n";
+        svg << "<text x=\"" << x << "\" y=\"" << height - padding + 20 << "\" text-anchor=\"middle\" font-family=\"Arial\" font-size=\"12\">" << step << "</text>\n";
+    }
+
+    // Y-Axis Ticks (5 ticks)
+    for (int i = 0; i <= 5; ++i) {
+        double val = log_min + (log_range * i / 5.0);
+        double y = height - padding - ((val - log_min) / log_range * (height - 2*padding));
+        svg << "<line x1=\"" << padding - 5 << "\" y1=\"" << y << "\" x2=\"" << padding << "\" y2=\"" << y << "\" stroke=\"black\" />\n";
+
+        // Format float
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(1) << val;
+        svg << "<text x=\"" << padding - 10 << "\" y=\"" << y + 4 << "\" text-anchor=\"end\" font-family=\"Arial\" font-size=\"12\">" << ss.str() << "</text>\n";
+    }
 
     // Colors
     std::map<std::string, std::string> colors;
