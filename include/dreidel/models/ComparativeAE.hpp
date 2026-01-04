@@ -183,6 +183,18 @@ public:
 
     std::string name() const override { return "ZenithHierarchicalAE"; }
 
+    void reinit(const std::string& scheme) {
+        // Reinit Zenith Blocks
+        stage1_block_->reinit(scheme);
+        stage2_block1_->reinit(scheme);
+        stage2_block2_->reinit(scheme);
+        decoder_stage1_->reinit(scheme);
+        decoder_stage2_->reinit(scheme);
+        // Stem and others are standard Conv2D, keep default initialization for now?
+        // Or reinit them if supported? Conv2D doesn't have reinit yet.
+        // Assuming stem is fine as He.
+    }
+
 private:
     std::unique_ptr<Conv2D<T>> stem_;
     std::unique_ptr<PixelUnshuffle<T>> stage1_unshuffle_;
