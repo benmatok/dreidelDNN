@@ -16,15 +16,6 @@ namespace models {
 
 using namespace layers;
 
-struct ZenithConfig {
-    bool use_identity_init = true;
-    bool use_spectral_dropout = false;
-    bool use_coordconv = false;
-    bool use_groupnorm = false;
-    bool use_checkpointing = false;
-    float dropout_rate = 0.1f;
-};
-
 // Helper: Residual Block
 template <typename T>
 class ResidualBlock : public Layer<T> {
@@ -95,14 +86,10 @@ private:
 template <typename T>
 class ZenithHierarchicalAE : public Layer<T> {
 public:
-    ZenithHierarchicalAE(size_t base_filters = 16, ZenithConfig config = ZenithConfig())
-        : config_(config) {
-
-        // 3. Positional Encoding Injection
-        size_t stem_in_ch = config_.use_coordconv ? 5 : 3;
+    ZenithHierarchicalAE(size_t base_filters = 16) {
 
         // 1. Stem: Conv2d -> H/2, W/2
-        stem_ = std::make_unique<Conv2D<T>>(stem_in_ch, base_filters, 2, 2, 0);
+        stem_ = std::make_unique<Conv2D<T>>(3, base_filters, 2, 2, 0);
 
         // 2. Stage 1: PixelUnshuffle(4) -> C*16, H/8
         // Input C, H/2. Output C*16, H/8.
@@ -111,14 +98,10 @@ public:
         // Body: 1x ZenithBlock(C*16)
         size_t s1_ch = base_filters * 16;
         stage1_block_ = std::make_unique<ZenithBlock<T>>(s1_ch, 3, s1_ch);
-
-        // Apply Configs
-        std::string init_scheme = config_.use_identity_init ? "identity" : "he";
-        stage1_block_->reinit(init_scheme);
-        stage1_block_->set_group_norm(config_.use_groupnorm, 32);
-        if (config_.use_spectral_dropout) stage1_block_->set_spectral_dropout(config_.dropout_rate);
+        // Default Dropout 0.1
 
         // 3. Stage 2: PixelUnshuffle(4) -> C*256, H/32
+        // Input C*16, H/8. Output (C*16)*16 = C*256, H/32.
         stage2_unshuffle_ = std::make_unique<PixelUnshuffle<T>>(4);
         size_t s2_ch = base_filters * 256;
 
@@ -126,73 +109,33 @@ public:
         stage2_block1_ = std::make_unique<ZenithBlock<T>>(s2_ch, 3, s2_ch);
         stage2_block2_ = std::make_unique<ZenithBlock<T>>(s2_ch, 3, s2_ch);
 
-        stage2_block1_->reinit(init_scheme);
-        stage2_block1_->set_group_norm(config_.use_groupnorm, 32);
-        if (config_.use_spectral_dropout) stage2_block1_->set_spectral_dropout(config_.dropout_rate * 2); // Higher dropout for deep?
-        if (config_.use_checkpointing) stage2_block1_->set_gradient_checkpointing(true);
-
-        stage2_block2_->reinit(init_scheme);
-        stage2_block2_->set_group_norm(config_.use_groupnorm, 32);
-        if (config_.use_spectral_dropout) stage2_block2_->set_spectral_dropout(config_.dropout_rate * 2);
-        if (config_.use_checkpointing) stage2_block2_->set_gradient_checkpointing(true);
+        // Apply deeper dropout
+        stage2_block1_->set_spectral_dropout(0.2f);
+        stage2_block2_->set_spectral_dropout(0.2f);
 
         // 4. Head: Fused Zenith Autoencoder (Decoder Part)
+        // Note: ZenithBlock supports upscale=1, 2, 4, 8.
         size_t dec1_ch = base_filters * 16;
         decoder_stage1_ = std::make_unique<ZenithBlock<T>>(s2_ch, dec1_ch, 3, s2_ch, true, false, false, 1, 8); // Upscale 8x
-        decoder_stage1_->reinit(init_scheme);
-        decoder_stage1_->set_group_norm(config_.use_groupnorm, 32);
 
         // Final Projection to 3 channels.
         decoder_stage2_ = std::make_unique<ZenithBlock<T>>(dec1_ch, 3, 3, dec1_ch, true, false, false, 1, 4); // Upscale 4x
-        decoder_stage2_->reinit(init_scheme);
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
-        if (config_.use_coordconv) {
-            auto shape = input.shape();
-            size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3]; // C=3
+        Tensor<T> x = stem_->forward(input);
 
-            Tensor<T> input_aug({N, H, W, 5});
-            T* aug_ptr = input_aug.data();
-            const T* in_ptr = input.data();
+        x = stage1_unshuffle_->forward(x);
+        x = stage1_block_->forward(x);
 
-            #pragma omp parallel for collapse(3)
-            for(size_t n=0; n<N; ++n) {
-                for(size_t h=0; h<H; ++h) {
-                    for(size_t w=0; w<W; ++w) {
-                        size_t idx_src = ((n*H + h)*W + w)*3;
-                        size_t idx_dst = ((n*H + h)*W + w)*5;
+        x = stage2_unshuffle_->forward(x);
+        x = stage2_block1_->forward(x);
+        x = stage2_block2_->forward(x);
 
-                        aug_ptr[idx_dst + 0] = in_ptr[idx_src + 0];
-                        aug_ptr[idx_dst + 1] = in_ptr[idx_src + 1];
-                        aug_ptr[idx_dst + 2] = in_ptr[idx_src + 2];
-
-                        // Normalized Coords [-1, 1]
-                        aug_ptr[idx_dst + 3] = 2.0f * (static_cast<float>(w) / (W - 1)) - 1.0f; // X
-                        aug_ptr[idx_dst + 4] = 2.0f * (static_cast<float>(h) / (H - 1)) - 1.0f; // Y
-                    }
-                }
-            }
-            Tensor<T> x = stem_->forward(input_aug);
-            x = stage1_unshuffle_->forward(x);
-            x = stage1_block_->forward(x);
-            x = stage2_unshuffle_->forward(x);
-            x = stage2_block1_->forward(x);
-            x = stage2_block2_->forward(x);
-            x = decoder_stage1_->forward(x);
-            x = decoder_stage2_->forward(x);
-            return x;
-        } else {
-             Tensor<T> x = stem_->forward(input);
-             x = stage1_unshuffle_->forward(x);
-             x = stage1_block_->forward(x);
-             x = stage2_unshuffle_->forward(x);
-             x = stage2_block1_->forward(x);
-             x = stage2_block2_->forward(x);
-             x = decoder_stage1_->forward(x);
-             x = decoder_stage2_->forward(x);
-             return x;
-        }
+        // Fused Decoder
+        x = decoder_stage1_->forward(x);
+        x = decoder_stage2_->forward(x);
+        return x;
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
@@ -243,7 +186,6 @@ public:
     std::string name() const override { return "ZenithHierarchicalAE"; }
 
 private:
-    ZenithConfig config_;
     std::unique_ptr<Conv2D<T>> stem_;
     std::unique_ptr<PixelUnshuffle<T>> stage1_unshuffle_;
     std::unique_ptr<ZenithBlock<T>> stage1_block_;

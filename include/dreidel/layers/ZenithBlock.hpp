@@ -31,82 +31,58 @@ public:
           packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           spectral_scales_({1, in_channels}),
           mixing_weights_({3, in_channels}),
-          bias_({1, out_channels}),
           oracle_projection_({1, in_channels}),
 
           grad_packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           grad_spectral_scales_({1, in_channels}),
           grad_mixing_weights_({3, in_channels}),
-          grad_bias_({1, out_channels}),
           grad_oracle_projection_({1, in_channels}),
           rng_(std::random_device{}())
     {
         if ((in_channels_ & (in_channels_ - 1)) != 0) {
             throw std::invalid_argument("ZenithBlock in_channels must be a power of 2 for Spectral Mixing.");
         }
-        reinit("identity"); // Default to Identity
+
+        // 1. Delta-Orthogonal Initialization (Identity)
+        packed_weights_.fill(0);
+        T* w_ptr = packed_weights_.data();
+        size_t k_center = kernel_size_ / 2;
+        size_t spatial_size = kernel_size_ * kernel_size_;
+        for (size_t c = 0; c < in_channels_; ++c) {
+            w_ptr[c * spatial_size + k_center * kernel_size_ + k_center] = 1.0f;
+        }
+
+        // Spectral Identity
+        spectral_scales_.fill(1.0);
+        mixing_weights_.fill(0);
+        T* mw = mixing_weights_.data();
+        std::fill(mw + in_channels_, mw + 2 * in_channels_, 1.0f);
+
+        // Gating
+        oracle_projection_.random(-1.0, 1.0);
+
+        // Zero Grads
+        grad_packed_weights_.fill(0);
+        grad_spectral_scales_.fill(0);
+        grad_mixing_weights_.fill(0);
+        grad_oracle_projection_.fill(0);
+
+        // 2. GroupNorm (Hardcoded Standard)
+        size_t groups = 32;
+        if (out_channels_ % groups != 0) groups = 1;
+        group_norm_ = std::make_unique<GroupNorm<T>>(groups, out_channels_);
     }
 
     ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim,
                 bool use_ifwht = true, bool use_dilated = false, bool use_gating = false)
         : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1) {}
 
-    // Allow re-initialization for benchmarking
-    void reinit(const std::string& scheme) {
-        if (scheme == "identity") {
-            // Delta-Orthogonal (Identity)
-            packed_weights_.fill(0);
-            T* w_ptr = packed_weights_.data();
-            size_t k_center = kernel_size_ / 2;
-            size_t spatial_size = kernel_size_ * kernel_size_;
-            for (size_t c = 0; c < in_channels_; ++c) {
-                w_ptr[c * spatial_size + k_center * kernel_size_ + k_center] = 1.0f;
-            }
-            spectral_scales_.fill(1.0);
-            mixing_weights_.fill(0);
-            T* mw = mixing_weights_.data();
-            std::fill(mw + in_channels_, mw + 2 * in_channels_, 1.0f);
-            bias_.fill(0.01);
-        } else if (scheme == "he") {
-            // Standard He Normal
-            T stddev = std::sqrt(static_cast<T>(2.0) / (kernel_size_ * kernel_size_ * in_channels_));
-            // Note: Depthwise usually divides by K*K only (fan_in per channel is K*K).
-            T stddev_dw = std::sqrt(static_cast<T>(2.0) / (kernel_size_ * kernel_size_));
-            packed_weights_.random(0, stddev_dw);
-
-            // Random scales/mixing
-            spectral_scales_.random(0.9, 1.1); // Perturbed Identity
-            mixing_weights_.random(-0.1, 0.1);
-            bias_.fill(0);
-        }
-
-        // Zero Grads
-        grad_packed_weights_.fill(0);
-        grad_spectral_scales_.fill(0);
-        grad_mixing_weights_.fill(0);
-        grad_bias_.fill(0);
-        grad_oracle_projection_.fill(0);
-    }
-
-    void set_group_norm(bool enable, size_t groups = 32) {
-        use_group_norm_ = enable;
-        if (enable) {
-            group_norm_ = std::make_unique<GroupNorm<T>>(groups, out_channels_);
-        } else {
-            group_norm_.reset();
-        }
-    }
-
     void set_spectral_dropout(float rate) {
         spectral_dropout_rate_ = rate;
     }
 
-    void set_gradient_checkpointing(bool enable) {
-        gradient_checkpointing_ = enable;
-    }
-
-    void set_bias_init(T val) {
-        bias_.fill(val);
+    void set_training(bool training) {
+        training_ = training;
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
@@ -132,7 +108,8 @@ public:
         T* out_ptr = output.data();
         const T* in_ptr = input.data();
 
-        bool apply_dropout = (spectral_dropout_rate_ > 0.0f);
+        // 3. Spectral Dropout (Only in Training)
+        bool apply_dropout = training_ && (spectral_dropout_rate_ > 0.0f);
         if (apply_dropout) {
             dropout_mask_.resize(in_channels_);
             std::bernoulli_distribution d(1.0f - spectral_dropout_rate_);
@@ -141,25 +118,17 @@ public:
             }
         }
 
-        Tensor<T>* eyes_out_ptr = nullptr;
-        Tensor<T> eyes_temp;
-        if (gradient_checkpointing_) {
-            eyes_temp = Tensor<T>({N, H_out, W_out, in_channels_});
-            eyes_out_ptr = &eyes_temp;
-        } else {
-             if (eyes_out_cached_.shape().size() != 4 || eyes_out_cached_.shape()[0] != N) {
-                 eyes_out_cached_ = Tensor<T>({N, H_out, W_out, in_channels_});
-            }
-            eyes_out_ptr = &eyes_out_cached_;
+        if (eyes_out_cached_.shape().size() != 4 || eyes_out_cached_.shape()[0] != N) {
+             eyes_out_cached_ = Tensor<T>({N, H_out, W_out, in_channels_});
         }
-        T* eyes_ptr = eyes_out_ptr->data();
+        T* eyes_ptr = eyes_out_cached_.data();
 
         int k_rad = kernel_size_ / 2;
         const T* w_ptr = packed_weights_.data();
         const T* scale_ptr = spectral_scales_.data();
-        const T* bias_ptr = bias_.data();
         const T* mix_w = mixing_weights_.data();
 
+        // Step 1: Eyes (Depthwise)
         #pragma omp parallel for collapse(3)
         for(size_t n=0; n<N; ++n) {
             for(size_t h_out=0; h_out<H_out; ++h_out) {
@@ -205,9 +174,10 @@ public:
             }
         }
 
-        // Inverted Dropout Scale Factor
+        // Inverted Dropout Scale
         T dropout_scale = (apply_dropout) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
 
+        // Step 2: Mixer (Spectral)
         #pragma omp parallel
         {
             std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
@@ -255,10 +225,6 @@ public:
                             for(size_t c=0; c<out_channels_; ++c) buf_out[c] *= norm;
                         }
 
-                        if (!use_group_norm_) {
-                             for(size_t c=0; c<out_channels_; ++c) buf_out[c] += bias_ptr[c];
-                        }
-
                         size_t out_idx = ((n*H_out + h)*W_out + w)*out_channels_;
                         for(size_t c=0; c<out_channels_; ++c) {
                             out_ptr[out_idx + c] = buf_out[c];
@@ -268,10 +234,10 @@ public:
             }
         }
 
-        if (use_group_norm_) {
-            output = group_norm_->forward(output);
-        }
+        // Step 3: GroupNorm & Activation
+        output = group_norm_->forward(output);
 
+        // ReLU
         #pragma omp parallel for
         for (size_t i = 0; i < output.size(); ++i) {
              if (output.data()[i] < 0) output.data()[i] = 0;
@@ -298,7 +264,6 @@ public:
         grad_packed_weights_.fill(0);
         grad_spectral_scales_.fill(0);
         grad_mixing_weights_.fill(0);
-        grad_bias_.fill(0);
         grad_oracle_projection_.fill(0);
 
         Tensor<T> grad_input(shape);
@@ -307,16 +272,13 @@ public:
         const T* go_ptr = grad_output.data();
         T* gi_ptr = grad_input.data();
 
-        const T* eyes_ptr = (gradient_checkpointing_) ? nullptr : eyes_out_cached_.data();
-
-        Tensor<T> grad_pre_act = grad_output; // Copy
+        const T* eyes_ptr = eyes_out_cached_.data();
 
         const T* scale_ptr = spectral_scales_.data();
-        const T* mix_w = mixing_weights_.data(); // 3 rows: L, C, R
+        const T* mix_w = mixing_weights_.data();
         const T* w_L = mix_w;
         const T* w_C = mix_w + in_channels_;
         const T* w_R = mix_w + 2 * in_channels_;
-        const T* bias_ptr = bias_.data();
         const T* input_ptr = input_cached_.data();
 
         T* g_scale = grad_spectral_scales_.data();
@@ -324,14 +286,14 @@ public:
         T* gw_L = g_mix;
         T* gw_C = g_mix + in_channels_;
         T* gw_R = g_mix + 2 * in_channels_;
-        T* g_bias = grad_bias_.data();
 
         T norm = (use_ifwht_) ? (1.0f / static_cast<T>(out_channels_)) : 1.0f;
-        T dropout_scale = (spectral_dropout_rate_ > 0.0f) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
+        T dropout_scale = (training_ && spectral_dropout_rate_ > 0.0f) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
 
         Tensor<T> d_mixer_out({N, H_out, W_out, out_channels_});
-        if (use_group_norm_) {
-             Tensor<T> temp_gn_out({N, H_out, W_out, out_channels_});
+
+        {
+             Tensor<T> gn_in({N, H_out, W_out, out_channels_});
 
              #pragma omp parallel
              {
@@ -340,30 +302,11 @@ public:
                 for(size_t n=0; n<N; ++n) {
                     for(size_t h=0; h<H_out; ++h) {
                         for(size_t w=0; w<W_out; ++w) {
-                             if (eyes_ptr) {
-                                  size_t idx = ((n*H_out + h)*W_out + w)*in_channels_;
-                                  for(size_t c=0; c<in_channels_; ++c) buf_in[c] = eyes_ptr[idx+c];
-                             } else {
-                                  int k_rad = kernel_size_ / 2;
-                                  const T* w_base = packed_weights_.data();
-                                  std::fill(buf_in.begin(), buf_in.end(), 0);
-                                  for(int ky=-k_rad; ky<=k_rad; ++ky) {
-                                      int ih = (up_shift > 0) ? (((int)h + ky) >> up_shift) : (((int)h + ky) / (int)upscale_);
-                                      if(ih < 0 || ih >= (int)H) continue;
-                                      for(int kx=-k_rad; kx<=k_rad; ++kx) {
-                                          int iw = (up_shift > 0) ? (((int)w + kx) >> up_shift) : (((int)w + kx) / (int)upscale_);
-                                          if(iw < 0 || iw >= (int)W) continue;
-                                          size_t in_idx = ((n*H + ih)*W + iw)*in_channels_;
-                                          for(size_t c=0; c<in_channels_; ++c) {
-                                              T w_val = w_base[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
-                                              buf_in[c] += input_ptr[in_idx + c] * w_val;
-                                          }
-                                      }
-                                  }
-                             }
+                             size_t idx = ((n*H_out + h)*W_out + w)*in_channels_;
+                             for(size_t c=0; c<in_channels_; ++c) buf_in[c] = eyes_ptr[idx+c];
 
                              algo::WHT::fwht_1d(buf_in.data(), in_channels_);
-                             if (spectral_dropout_rate_ > 0.0f) {
+                             if (training_ && spectral_dropout_rate_ > 0.0f) {
                                  for(size_t c=0; c<in_channels_; ++c) buf_in[c] *= (dropout_mask_[c] * dropout_scale);
                              }
                              for(size_t c=0; c<in_channels_; ++c) buf_in[c] *= scale_ptr[c];
@@ -383,27 +326,27 @@ public:
                                 for(size_t c=0; c<out_channels_; ++c) buf_out[c] *= norm;
                              }
 
-                             size_t idx = ((n*H_out + h)*W_out + w)*out_channels_;
-                             for(size_t c=0; c<out_channels_; ++c) temp_gn_out.data()[idx+c] = buf_out[c];
+                             size_t out_idx = ((n*H_out + h)*W_out + w)*out_channels_;
+                             for(size_t c=0; c<out_channels_; ++c) gn_in.data()[out_idx+c] = buf_out[c];
                         }
                     }
                 }
              }
 
-             Tensor<T> gn_out = group_norm_->forward(temp_gn_out);
+             // 2. Forward GN
+             Tensor<T> gn_out = group_norm_->forward(gn_in);
 
-             Tensor<T> d_gn_out = grad_output;
+             // 3. Backward ReLU
+             Tensor<T> d_gn_out = grad_output; // Copy
              T* d_gn_ptr = d_gn_out.data();
              const T* gn_out_ptr = gn_out.data();
 
              for(size_t i=0; i<d_gn_out.size(); ++i) {
-                 if (gn_out_ptr[i] <= 0) d_gn_ptr[i] = 0;
+                 if (gn_out_ptr[i] <= 0) d_gn_ptr[i] = 0; // ReLU
              }
 
+             // 4. Backward GN
              d_mixer_out = group_norm_->backward(d_gn_out);
-
-        } else {
-             d_mixer_out = grad_output;
         }
 
         const T* d_mix_ptr = d_mixer_out.data();
@@ -414,7 +357,6 @@ public:
             std::vector<T> local_gw_L(in_channels_, 0);
             std::vector<T> local_gw_C(in_channels_, 0);
             std::vector<T> local_gw_R(in_channels_, 0);
-            std::vector<T> local_g_bias(out_channels_, 0);
 
             std::vector<T, core::AlignedAllocator<T>> buf_grad(std::max(in_channels_, out_channels_));
             std::vector<T, core::AlignedAllocator<T>> buf_eyes(in_channels_);
@@ -428,39 +370,16 @@ public:
 
                         for(size_t c=0; c<out_channels_; ++c) buf_grad[c] = d_mix_ptr[out_idx + c];
 
-                        if (!use_group_norm_) {
-                             for(size_t c=0; c<out_channels_; ++c) local_g_bias[c] += buf_grad[c];
-                        }
-
                         if(use_ifwht_) {
                              for(size_t c=0; c<out_channels_; ++c) buf_grad[c] *= norm;
                              algo::WHT::fwht_1d(buf_grad.data(), out_channels_);
                         }
 
-                        if (eyes_ptr) {
-                            size_t idx = ((n*H_out + h)*W_out + w)*in_channels_;
-                            for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] = eyes_ptr[idx+c];
-                        } else {
-                            int k_rad = kernel_size_ / 2;
-                            const T* w_base = packed_weights_.data();
-                            std::fill(buf_eyes.begin(), buf_eyes.end(), 0);
-                            for(int ky=-k_rad; ky<=k_rad; ++ky) {
-                                int ih = (up_shift > 0) ? (((int)h + ky) >> up_shift) : (((int)h + ky) / (int)upscale_);
-                                if(ih < 0 || ih >= (int)H) continue;
-                                for(int kx=-k_rad; kx<=k_rad; ++kx) {
-                                    int iw = (up_shift > 0) ? (((int)w + kx) >> up_shift) : (((int)w + kx) / (int)upscale_);
-                                    if(iw < 0 || iw >= (int)W) continue;
-                                    size_t in_idx = ((n*H + ih)*W + iw)*in_channels_;
-                                    for(size_t c=0; c<in_channels_; ++c) {
-                                        T w_val = w_base[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
-                                        buf_eyes[c] += input_ptr[in_idx + c] * w_val;
-                                    }
-                                }
-                            }
-                        }
+                        size_t idx = ((n*H_out + h)*W_out + w)*in_channels_;
+                        for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] = eyes_ptr[idx+c];
 
                         algo::WHT::fwht_1d(buf_eyes.data(), in_channels_);
-                        if (spectral_dropout_rate_ > 0.0f) {
+                        if (training_ && spectral_dropout_rate_ > 0.0f) {
                             for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] *= (dropout_mask_[c] * dropout_scale);
                         }
                         for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] *= scale_ptr[c];
@@ -481,8 +400,6 @@ public:
                                 if (c > 0) d_eyes[c-1] += dy * w_L[c];
                                 if (c < in_channels_-1) d_eyes[c+1] += dy * w_R[c];
                             }
-                        } else {
-                             // Fallback
                         }
 
                         for(size_t c=0; c<in_channels_; ++c) {
@@ -491,7 +408,7 @@ public:
                             d_eyes[c] *= scale_ptr[c];
                         }
 
-                        if (spectral_dropout_rate_ > 0.0f) {
+                        if (training_ && spectral_dropout_rate_ > 0.0f) {
                             for(size_t c=0; c<in_channels_; ++c) d_eyes[c] *= (dropout_mask_[c] * dropout_scale);
                         }
 
@@ -533,9 +450,6 @@ public:
 
             #pragma omp critical
             {
-                if(!use_group_norm_) {
-                     for(size_t i=0; i<local_g_bias.size(); ++i) g_bias[i] += local_g_bias[i];
-                }
                 for(size_t i=0; i<local_g_scale.size(); ++i) g_scale[i] += local_g_scale[i];
                 for(size_t i=0; i<local_gw_L.size(); ++i) gw_L[i] += local_gw_L[i];
                 for(size_t i=0; i<local_gw_C.size(); ++i) gw_C[i] += local_gw_C[i];
@@ -548,23 +462,17 @@ public:
 
     std::vector<Tensor<T>*> parameters() override {
         std::vector<Tensor<T>*> params = {&packed_weights_, &spectral_scales_, &mixing_weights_};
-        if (!use_group_norm_) params.push_back(&bias_);
         if (use_gating_) params.push_back(&oracle_projection_);
-        if (use_group_norm_) {
-            auto p = group_norm_->parameters();
-            params.insert(params.end(), p.begin(), p.end());
-        }
+        auto p = group_norm_->parameters();
+        params.insert(params.end(), p.begin(), p.end());
         return params;
     }
 
     std::vector<Tensor<T>*> gradients() override {
         std::vector<Tensor<T>*> grads = {&grad_packed_weights_, &grad_spectral_scales_, &grad_mixing_weights_};
-        if (!use_group_norm_) grads.push_back(&grad_bias_);
         if (use_gating_) grads.push_back(&grad_oracle_projection_);
-        if (use_group_norm_) {
-            auto g = group_norm_->gradients();
-            grads.insert(grads.end(), g.begin(), g.end());
-        }
+        auto g = group_norm_->gradients();
+        grads.insert(grads.end(), g.begin(), g.end());
         return grads;
     }
 
@@ -579,20 +487,17 @@ private:
     bool use_gating_;
     size_t stride_;
     size_t upscale_;
-    bool use_group_norm_ = false;
-    float spectral_dropout_rate_ = 0.0f;
-    bool gradient_checkpointing_ = false;
+    float spectral_dropout_rate_ = 0.1f;
+    bool training_ = true;
 
     Tensor<T> packed_weights_;
     Tensor<T> spectral_scales_;
     Tensor<T> mixing_weights_;
-    Tensor<T> bias_;
     Tensor<T> oracle_projection_;
 
     Tensor<T> grad_packed_weights_;
     Tensor<T> grad_spectral_scales_;
     Tensor<T> grad_mixing_weights_;
-    Tensor<T> grad_bias_;
     Tensor<T> grad_oracle_projection_;
 
     Tensor<T> input_cached_;
