@@ -27,7 +27,7 @@ public:
 
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim,
                 bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1,
-                const std::string& init_scheme = "identity")
+                const std::string& init_scheme = "he")
         : in_channels_(in_channels), out_channels_(out_channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
           use_ifwht_(use_ifwht), use_gating_(use_gating), stride_(stride), upscale_(upscale),
           packed_weights_({in_channels, 1, kernel_size, kernel_size}),
