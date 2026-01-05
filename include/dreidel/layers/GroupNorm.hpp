@@ -5,6 +5,8 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include "../hal/ops.hpp"
+#include "../hal/x86.hpp"
 
 namespace dreidel {
 namespace layers {
@@ -81,17 +83,46 @@ public:
                     }
                 }
                 T var = sum_sq / (spatial_size * C_per_G);
+
+                // Using standard sqrt as approximate rsqrt showed no consistent gain and potential regression
                 T inv_std = 1.0f / std::sqrt(var + eps_);
                 inv_std_ptr[n * num_groups_ + g] = inv_std;
 
                 // Normalize and Apply Affine
+                // Vectorization here is beneficial if C_per_G is large, but loop is over HW.
+                // Inner loop is C. If C_per_G is e.g. 64/32=2, it's tiny.
+                // If C=512, G=32, C_per_G=16. Vectorizable.
                 for (size_t hw = 0; hw < spatial_size; ++hw) {
                     const T* pixel_in = in_ptr + ((n * spatial_size) + hw) * C;
                     T* pixel_out = out_ptr + ((n * spatial_size) + hw) * C;
+
+#ifdef DREIDEL_ARCH_AVX2
+                    // Only apply AVX2 if chunk is large enough to matter
+                    size_t c = start_c;
+                    if (C_per_G >= 8) {
+                        __m256 v_mean = _mm256_set1_ps(mean);
+                        __m256 v_inv_std = _mm256_set1_ps(inv_std);
+                        for (; c + 7 < end_c; c += 8) {
+                             __m256 x = _mm256_loadu_ps(pixel_in + c);
+                             __m256 gamma = _mm256_loadu_ps(g_ptr + c);
+                             __m256 beta = _mm256_loadu_ps(b_ptr + c);
+
+                             __m256 norm = _mm256_mul_ps(_mm256_sub_ps(x, v_mean), v_inv_std);
+                             __m256 res = _mm256_add_ps(_mm256_mul_ps(norm, gamma), beta);
+
+                             _mm256_storeu_ps(pixel_out + c, res);
+                        }
+                    }
+                    for (; c < end_c; ++c) {
+                        T norm = (pixel_in[c] - mean) * inv_std;
+                        pixel_out[c] = norm * g_ptr[c] + b_ptr[c];
+                    }
+#else
                     for (size_t c = start_c; c < end_c; ++c) {
                         T norm = (pixel_in[c] - mean) * inv_std;
                         pixel_out[c] = norm * g_ptr[c] + b_ptr[c];
                     }
+#endif
                 }
             }
         }
@@ -122,7 +153,6 @@ public:
 
         #pragma omp parallel
         {
-            // Thread-local accumulation buffers to avoid atomic contention in inner loop
             std::vector<T> local_grad_gamma(C, 0.0);
             std::vector<T> local_grad_beta(C, 0.0);
 
@@ -135,11 +165,9 @@ public:
                     T inv_std = inv_std_ptr[n * num_groups_ + g];
                     T M = static_cast<T>(spatial_size * C_per_G);
 
-                    // Local sums for group statistics gradients
                     T sum_dy_gamma = 0;
                     T sum_dy_gamma_xhat = 0;
 
-                    // First pass: Accumulate gradients and compute sums
                     for (size_t hw = 0; hw < spatial_size; ++hw) {
                         size_t offset = ((n * spatial_size) + hw) * C;
                         const T* pi = in_ptr + offset;
@@ -149,7 +177,6 @@ public:
                             T dy = pgo[c];
                             T x_hat = (pi[c] - mean) * inv_std;
 
-                            // Accumulate to thread-local buffer
                             local_grad_gamma[c] += dy * x_hat;
                             local_grad_beta[c] += dy;
 
@@ -162,7 +189,6 @@ public:
                     T mean_dy_gamma = sum_dy_gamma / M;
                     T mean_dy_gamma_xhat = sum_dy_gamma_xhat / M;
 
-                    // Second pass: Compute input gradients
                     for (size_t hw = 0; hw < spatial_size; ++hw) {
                         size_t offset = ((n * spatial_size) + hw) * C;
                         const T* pi = in_ptr + offset;
@@ -177,7 +203,6 @@ public:
                 }
             }
 
-            // Reduction of thread-local gradients
             #pragma omp critical
             {
                 for (size_t c = 0; c < C; ++c) {
@@ -209,7 +234,6 @@ private:
     Tensor<T> grad_gamma_;
     Tensor<T> grad_beta_;
 
-    // Cache
     Tensor<T> input_cached_;
     Tensor<T> mean_cached_;
     Tensor<T> inv_std_cached_;
