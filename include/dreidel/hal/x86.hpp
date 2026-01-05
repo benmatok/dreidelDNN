@@ -23,6 +23,11 @@ struct Ops {
         _mm512_store_ps(dst, val);
     }
 
+    // Streaming Store (Non-Temporal)
+    static inline void stream_store(float* dst, __m512 val) {
+        _mm512_stream_ps(dst, val);
+    }
+
     static inline __m512 add(__m512 a, __m512 b) {
         return _mm512_add_ps(a, b);
     }
@@ -48,6 +53,16 @@ struct Ops {
         // scale=4 because floats are 4 bytes
         return _mm512_i32gather_ps(vindex, (void*)base_addr, 4);
     }
+
+    // Approximate Reciprocal
+    static inline __m512 rcp_approx(__m512 a) {
+        return _mm512_rcp14_ps(a);
+    }
+
+    // Approximate Reciprocal Sqrt
+    static inline __m512 rsqrt_approx(__m512 a) {
+        return _mm512_rsqrt14_ps(a);
+    }
 };
 
 #elif defined(DREIDEL_ARCH_AVX2)
@@ -61,6 +76,11 @@ struct Ops {
 
     static inline void store(float* dst, __m256 val) {
         _mm256_store_ps(dst, val);
+    }
+
+    // Streaming Store (Non-Temporal)
+    static inline void stream_store(float* dst, __m256 val) {
+        _mm256_stream_ps(dst, val);
     }
 
     static inline __m256 add(__m256 a, __m256 b) {
@@ -86,6 +106,16 @@ struct Ops {
     static inline __m256 gather(const float* base_addr, __m256i vindex) {
         return _mm256_i32gather_ps(base_addr, vindex, 4);
     }
+
+    // Approximate Reciprocal (Error ~0.00036)
+    static inline __m256 rcp_approx(__m256 a) {
+        return _mm256_rcp_ps(a);
+    }
+
+    // Approximate Reciprocal Sqrt
+    static inline __m256 rsqrt_approx(__m256 a) {
+        return _mm256_rsqrt_ps(a);
+    }
 };
 
 #else
@@ -94,9 +124,8 @@ using Ops = dreidel::hal::generic::Ops;
 #endif
 
 // --- Register-Resident FWHT Helpers (AVX2 Optimized) ---
-// Defined outside Ops to be generally available in namespace x86
 
-// Perform FWHT on 8 elements within a YMM register
+// Perform FWHT on 8 elements within a YMM register (Float)
 inline void fwht8_avx2(__m256& r) {
 #ifdef DREIDEL_ARCH_AVX2
     // Stage 1 (Stride 1): Pairs (0,1), (2,3)...
