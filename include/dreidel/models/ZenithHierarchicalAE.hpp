@@ -24,7 +24,7 @@ public:
     // Stage 2: PixelUnshuffle (factor=4), Fixed 2D Sinusoidal Embeddings, 2x ZenithBlock
     // Head: Mirrors encoder
 
-    ZenithHierarchicalAE(size_t input_channels = 3, size_t base_channels = 32, bool use_pe = true, const std::string& init_scheme = "identity")
+    ZenithHierarchicalAE(size_t input_channels = 3, size_t base_channels = 32, bool use_pe = true, const std::string& init_scheme = "he")
         : use_pe_(use_pe)
     {
         // Stem
