@@ -11,6 +11,7 @@
 #include <memory>
 #include <cmath>
 #include <iostream>
+#include <mutex>
 
 namespace dreidel {
 namespace models {
@@ -23,7 +24,9 @@ public:
     // Stage 2: PixelUnshuffle (factor=4), Fixed 2D Sinusoidal Embeddings, 2x ZenithBlock
     // Head: Mirrors encoder
 
-    ZenithHierarchicalAE(size_t input_channels = 3, size_t base_channels = 32) {
+    ZenithHierarchicalAE(size_t input_channels = 3, size_t base_channels = 32, bool use_pe = true, const std::string& init_scheme = "identity")
+        : use_pe_(use_pe)
+    {
         // Stem
         stem_ = std::make_unique<layers::Conv2D<T>>(input_channels, base_channels, 2, 2); // k=2, s=2
 
@@ -35,7 +38,7 @@ public:
 
         // 1x ZenithBlock
         stage1_block_ = std::make_unique<layers::ZenithBlock<T>>(
-            stage1_channels_, stage1_channels_, 3, stage1_channels_, true, false, false, 1, 1
+            stage1_channels_, stage1_channels_, 3, stage1_channels_, true, false, false, 1, 1, init_scheme
         );
 
         // Stage 2 (Bottleneck)
@@ -46,10 +49,10 @@ public:
 
         // 2x ZenithBlock
         stage2_block1_ = std::make_unique<layers::ZenithBlock<T>>(
-            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1
+            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1, init_scheme
         );
         stage2_block2_ = std::make_unique<layers::ZenithBlock<T>>(
-            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1
+            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1, init_scheme
         );
 
         // Positional Embedding Params (Fixed)
@@ -134,7 +137,9 @@ public:
         x = stage2_unshuffle_->forward(x); // H/32, W/32, C=8192
 
         // Injection: Fixed 2D Sinusoidal Positional Embeddings
-        add_positional_embeddings(x);
+        if (use_pe_) {
+            add_positional_embeddings(x);
+        }
 
         x = stage2_block1_->forward(x);
         x = stage2_block2_->forward(x);
@@ -231,53 +236,49 @@ private:
         size_t W = shape[2];
         size_t C = shape[3]; // Should be 8192
 
+        // Thread-safe lazy initialization
         if (pe_cache_.shape().empty() || pe_cache_.shape()[1] != H || pe_cache_.shape()[2] != W || pe_cache_.shape()[3] != C) {
-            // Recompute cache if dimensions change
-            pe_cache_ = Tensor<T>({1, H, W, C});
-            T* p = pe_cache_.data();
+            std::lock_guard<std::mutex> lock(pe_mutex_);
+            // Double-check locking pattern
+            if (pe_cache_.shape().empty() || pe_cache_.shape()[1] != H || pe_cache_.shape()[2] != W || pe_cache_.shape()[3] != C) {
+                // Recompute cache if dimensions change
+                pe_cache_ = Tensor<T>({1, H, W, C});
+                T* p = pe_cache_.data();
 
-            size_t C_half = C / 2;
+                size_t C_half = C / 2;
 
-            for(size_t h=0; h<H; ++h) {
-                for(size_t w=0; w<W; ++w) {
-                    T* pixel = p + (h*W + w)*C;
+                for(size_t h=0; h<H; ++h) {
+                    for(size_t w=0; w<W; ++w) {
+                        T* pixel = p + (h*W + w)*C;
 
-                    // Y embedding (Channels 0 to C_half - 1)
-                    // High frequencies at high indices.
-                    // Split into even/odd for Sin/Cos pairs.
-                    for(size_t c=0; c<C_half; ++c) {
-                        // Effective channel index k for frequency calculation
-                        // We have C_half channels. If we pair them (2k, 2k+1), we have C_half/2 frequencies.
-                        size_t k = c / 2;
-                        size_t max_k = C_half / 2;
+                        // Y embedding (Channels 0 to C_half - 1)
+                        for(size_t c=0; c<C_half; ++c) {
+                            size_t k = c / 2;
+                            size_t max_k = C_half / 2;
 
-                        double normalized_idx = (double)k / (double)max_k;
-                        // High freq at high index: omega grows with k.
-                        // Standard: omega = 1 / 10000^(2k/d). Decreases.
-                        // We want: omega = 1 / 10000^( (max_k - 1 - k) / max_k )?
-                        // Or simply reverse:
+                            double normalized_idx = (double)k / (double)max_k;
+                            double omega = 1.0 / std::pow(10000.0, 1.0 - normalized_idx);
 
-                        double omega = 1.0 / std::pow(10000.0, 1.0 - normalized_idx);
-
-                        if (c % 2 == 0) {
-                            pixel[c] = std::sin(h * omega);
-                        } else {
-                            pixel[c] = std::cos(h * omega);
+                            if (c % 2 == 0) {
+                                pixel[c] = std::sin(h * omega);
+                            } else {
+                                pixel[c] = std::cos(h * omega);
+                            }
                         }
-                    }
 
-                    // X embedding (Channels C_half to C - 1)
-                    for(size_t c=0; c<C_half; ++c) {
-                        size_t k = c / 2;
-                        size_t max_k = C_half / 2;
+                        // X embedding (Channels C_half to C - 1)
+                        for(size_t c=0; c<C_half; ++c) {
+                            size_t k = c / 2;
+                            size_t max_k = C_half / 2;
 
-                        double normalized_idx = (double)k / (double)max_k;
-                        double omega = 1.0 / std::pow(10000.0, 1.0 - normalized_idx);
+                            double normalized_idx = (double)k / (double)max_k;
+                            double omega = 1.0 / std::pow(10000.0, 1.0 - normalized_idx);
 
-                        if (c % 2 == 0) {
-                            pixel[C_half + c] = std::sin(w * omega);
-                        } else {
-                            pixel[C_half + c] = std::cos(w * omega);
+                            if (c % 2 == 0) {
+                                pixel[C_half + c] = std::sin(w * omega);
+                            } else {
+                                pixel[C_half + c] = std::cos(w * omega);
+                            }
                         }
                     }
                 }
@@ -303,6 +304,8 @@ private:
     }
 
     Tensor<T> pe_cache_;
+    bool use_pe_;
+    std::mutex pe_mutex_;
 };
 
 } // namespace models

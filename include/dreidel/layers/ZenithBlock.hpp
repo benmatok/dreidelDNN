@@ -26,7 +26,8 @@ public:
     static inline bool use_fused_kernels = true;
 
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim,
-                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1)
+                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1,
+                const std::string& init_scheme = "identity")
         : in_channels_(in_channels), out_channels_(out_channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
           use_ifwht_(use_ifwht), use_gating_(use_gating), stride_(stride), upscale_(upscale),
           packed_weights_({in_channels, 1, kernel_size, kernel_size}),
@@ -44,25 +45,7 @@ public:
             throw std::invalid_argument("ZenithBlock in_channels must be a power of 2 for Spectral Mixing.");
         }
 
-        // 1. Delta-Orthogonal Initialization (Identity)
-        packed_weights_.fill(0);
-        T* w_ptr = packed_weights_.data();
-        size_t k_center = kernel_size_ / 2;
-        size_t spatial_size = kernel_size_ * kernel_size_;
-        for (size_t c = 0; c < in_channels_; ++c) {
-            w_ptr[c * spatial_size + k_center * kernel_size_ + k_center] = 1.0f;
-        }
-
-        // Spectral Identity
-        // Lazy Normalization: Fuse 1/N scaling into the spectral weights.
-        // This was confirmed to give ~10-15% speedup in benchmarks.
-        T norm_factor = (use_ifwht) ? (1.0f / static_cast<T>(out_channels_)) : 1.0f;
-
-        spectral_scales_.fill(1.0f * norm_factor);
-
-        mixing_weights_.fill(0);
-        T* mw = mixing_weights_.data();
-        std::fill(mw + in_channels_, mw + 2 * in_channels_, 1.0f);
+        initialize(init_scheme);
 
         // Gating
         oracle_projection_.random(-1.0, 1.0);
@@ -82,6 +65,45 @@ public:
     ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim,
                 bool use_ifwht = true, bool use_dilated = false, bool use_gating = false)
         : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1) {}
+
+    void initialize(const std::string& scheme) {
+        // 1. Packed Weights (Eyes)
+        packed_weights_.fill(0);
+        if (scheme == "identity") {
+            // Delta-Orthogonal
+            T* w_ptr = packed_weights_.data();
+            size_t k_center = kernel_size_ / 2;
+            size_t spatial_size = kernel_size_ * kernel_size_;
+            for (size_t c = 0; c < in_channels_; ++c) {
+                w_ptr[c * spatial_size + k_center * kernel_size_ + k_center] = 1.0f;
+            }
+        } else if (scheme == "he") {
+            // Kaiming / He
+            T stddev = std::sqrt(2.0f / (in_channels_ * kernel_size_ * kernel_size_));
+            packed_weights_.random(0, stddev);
+        } else {
+            // Random small
+            packed_weights_.random(-0.01, 0.01);
+        }
+
+        // 2. Spectral Scales & Mixer
+        // For Identity, we use spectral identity (scale=1, mix=1)
+        // For He, we still want spectral path to be open, but maybe we add noise?
+        // Standard Zenith implementation uses Identity for the mixing path initially to pass gradients.
+
+        T norm_factor = (use_ifwht_) ? (1.0f / static_cast<T>(out_channels_)) : 1.0f;
+        spectral_scales_.fill(1.0f * norm_factor);
+
+        mixing_weights_.fill(0);
+        T* mw = mixing_weights_.data();
+        // Center band = 1.0 (Identity mixing)
+        std::fill(mw + in_channels_, mw + 2 * in_channels_, 1.0f);
+
+        if (scheme == "he" || scheme == "random") {
+             // Maybe add noise to mixing weights if requested, but "Identity Mix" is structural.
+             // We keep Mixer as Identity for stability, only vary Eyes initialization.
+        }
+    }
 
     void set_spectral_dropout(float rate) {
         spectral_dropout_rate_ = rate;
