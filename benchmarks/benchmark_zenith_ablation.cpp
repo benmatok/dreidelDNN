@@ -28,18 +28,23 @@ T compute_mse(const Tensor<T>& a, const Tensor<T>& b) {
 }
 
 template <typename T>
-void train_model(layers::Layer<T>* model, utils::WaveletGenerator2D<T>& gen, const std::string& name,
-                 int steps, size_t batch_size, size_t H, size_t W, size_t C, std::vector<double>& loss_history) {
+void train_model(layers::Layer<T>* model, const std::vector<Tensor<T>>& dataset, const std::string& name,
+                 int steps, size_t batch_size, std::vector<double>& loss_history, bool use_clipping = false) {
 
     std::cout << "Training " << name << "..." << std::endl;
 
     optim::SimpleAdam<T> optimizer(0.0005);
+    if (use_clipping) {
+        optimizer.set_coordinate_wise_clipping(true, 1.0);
+    }
     optimizer.add_parameters(model->parameters(), model->gradients());
 
-    Tensor<T> input({batch_size, H, W, C});
+    size_t dataset_size = dataset.size();
 
     for(int step=0; step<steps; ++step) {
-        gen.generate_batch(input, batch_size);
+        // Sample random image from dataset (Simple cycling for benchmark)
+        const Tensor<T>& input = dataset[step % dataset_size];
+
         optimizer.zero_grad();
         Tensor<T> output = model->forward(input);
 
@@ -68,35 +73,42 @@ void train_model(layers::Layer<T>* model, utils::WaveletGenerator2D<T>& gen, con
 }
 
 int main() {
-    size_t H = 64; // Smaller for speed to allow more steps
+    size_t H = 64;
     size_t W = 64;
     size_t C = 3;
     size_t batch_size = 4;
 
-    // "500 epochs" requested.
-    // Reduced for sandbox limits.
+    // Reduced to 1500 to fit sandbox limits
+    int steps = 1500;
+    int dataset_size = 200; // 200 distinct batches
 
-    int steps = 2000;
-
+    std::cout << "Pre-generating dataset (" << dataset_size << " batches)..." << std::endl;
     utils::WaveletGenerator2D<float> gen(H, W);
+    std::vector<Tensor<float>> dataset;
+    dataset.reserve(dataset_size);
+    for(int i=0; i<dataset_size; ++i) {
+        Tensor<float> t({batch_size, H, W, C});
+        gen.generate_batch(t, batch_size);
+        dataset.push_back(std::move(t));
+    }
 
     // 1. Baseline: He Init, No PE
     std::cout << "=== Experiment 1: Baseline (He Init, No PE) ===" << std::endl;
     models::ZenithHierarchicalAE<float> model_he_nope(C, 32, false, "he");
     std::vector<double> loss_he_nope;
-    train_model(&model_he_nope, gen, "Baseline", steps, batch_size, H, W, C, loss_he_nope);
+    train_model(&model_he_nope, dataset, "Baseline", steps, batch_size, loss_he_nope, false);
 
     // 2. Improvement A: Identity Init, No PE
     std::cout << "\n=== Experiment 2: Improvement A (Identity Init, No PE) ===" << std::endl;
     models::ZenithHierarchicalAE<float> model_id_nope(C, 32, false, "identity");
     std::vector<double> loss_id_nope;
-    train_model(&model_id_nope, gen, "Identity Init", steps, batch_size, H, W, C, loss_id_nope);
+    train_model(&model_id_nope, dataset, "Identity Init", steps, batch_size, loss_id_nope, true);
 
     // 3. Improvement B: Identity Init + PE
     std::cout << "\n=== Experiment 3: Improvement B (Identity Init + PE) ===" << std::endl;
     models::ZenithHierarchicalAE<float> model_id_pe(C, 32, true, "identity");
     std::vector<double> loss_id_pe;
-    train_model(&model_id_pe, gen, "Identity + PE", steps, batch_size, H, W, C, loss_id_pe);
+    train_model(&model_id_pe, dataset, "Identity + PE", steps, batch_size, loss_id_pe, true);
 
     // Save Results
     std::ofstream csv("benchmark_results_ablation.csv");
