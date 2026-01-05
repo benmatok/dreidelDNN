@@ -134,66 +134,67 @@ public:
         const T* scale_ptr = spectral_scales_.data();
         const T* mix_w = mixing_weights_.data();
 
-        // Step 1: Eyes (Depthwise)
-        #pragma omp parallel for collapse(3)
-        for(size_t n=0; n<N; ++n) {
-            for(size_t h_out=0; h_out<H_out; ++h_out) {
-                for(size_t w_out=0; w_out<W_out; ++w_out) {
-                    if (upscale_ > 1) {
-                         for(size_t c=0; c<C; ++c) {
-                            T val = 0;
-                            for(int ky=-k_rad; ky<=k_rad; ++ky) {
-                                int v_h = (int)h_out + ky;
-                                if (v_h < 0 || v_h >= (int)H_out) continue;
-                                int ih = (up_shift > 0) ? (v_h >> up_shift) : (v_h / (int)upscale_);
-                                for(int kx=-k_rad; kx<=k_rad; ++kx) {
-                                    int v_w = (int)w_out + kx;
-                                    if (v_w < 0 || v_w >= (int)W_out) continue;
-                                    int iw = (up_shift > 0) ? (v_w >> up_shift) : (v_w / (int)upscale_);
-                                    T pixel = in_ptr[((n*H + ih)*W + iw)*C + c];
-                                    T weight = w_ptr[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
-                                    val += pixel * weight;
-                                }
-                            }
-                            eyes_ptr[((n*H_out + h_out)*W_out + w_out)*C + c] = val;
-                        }
-                    } else {
-                        int h_in_center = h_out * stride_;
-                        int w_in_center = w_out * stride_;
-                        for(size_t c=0; c<C; ++c) {
-                            T val = 0;
-                            for(int ky=-k_rad; ky<=k_rad; ++ky) {
-                                int ih = h_in_center + ky;
-                                if(ih < 0 || ih >= (int)H) continue;
-                                for(int kx=-k_rad; kx<=k_rad; ++kx) {
-                                    int iw = w_in_center + kx;
-                                    if(iw < 0 || iw >= (int)W) continue;
-                                    T pixel = in_ptr[((n*H + ih)*W + iw)*C + c];
-                                    T weight = w_ptr[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
-                                    val += pixel * weight;
-                                }
-                            }
-                            eyes_ptr[((n*H_out + h_out)*W_out + w_out)*C + c] = val;
-                        }
-                    }
-                }
-            }
-        }
-
         // Inverted Dropout Scale
         T dropout_scale = (apply_dropout) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
 
-        // Step 2: Mixer (Spectral)
+        // Fused Step 1 (Eyes/Depthwise) & Step 2 (Mixer) & ReLU
         #pragma omp parallel
         {
             std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
+
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
-                for(size_t h=0; h<H_out; ++h) {
-                    for(size_t w=0; w<W_out; ++w) {
-                        size_t eyes_idx = ((n*H_out + h)*W_out + w)*in_channels_;
-                        T* pixel = eyes_ptr + eyes_idx;
-                        for(size_t c=0; c<in_channels_; ++c) buf_in[c] = pixel[c];
+                for(size_t h_out=0; h_out<H_out; ++h_out) {
+                    for(size_t w_out=0; w_out<W_out; ++w_out) {
+                        // --- Part 1: Eyes (Depthwise) ---
+                        // Compute and write to eyes_out_cached_ (needed for backward)
+                        // Also keep in buf_in for immediate mixing (L1 cache locality)
+
+                        size_t eyes_idx = ((n*H_out + h_out)*W_out + w_out)*in_channels_;
+                        T* eyes_store_ptr = eyes_ptr + eyes_idx;
+
+                        if (upscale_ > 1) {
+                             for(size_t c=0; c<C; ++c) {
+                                T val = 0;
+                                for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                                    int v_h = (int)h_out + ky;
+                                    if (v_h < 0 || v_h >= (int)H_out) continue;
+                                    int ih = (up_shift > 0) ? (v_h >> up_shift) : (v_h / (int)upscale_);
+                                    for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                                        int v_w = (int)w_out + kx;
+                                        if (v_w < 0 || v_w >= (int)W_out) continue;
+                                        int iw = (up_shift > 0) ? (v_w >> up_shift) : (v_w / (int)upscale_);
+                                        T pixel = in_ptr[((n*H + ih)*W + iw)*C + c];
+                                        T weight = w_ptr[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
+                                        val += pixel * weight;
+                                    }
+                                }
+                                eyes_store_ptr[c] = val;
+                                buf_in[c] = val;
+                            }
+                        } else {
+                            int h_in_center = h_out * stride_;
+                            int w_in_center = w_out * stride_;
+                            for(size_t c=0; c<C; ++c) {
+                                T val = 0;
+                                for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                                    int ih = h_in_center + ky;
+                                    if(ih < 0 || ih >= (int)H) continue;
+                                    for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                                        int iw = w_in_center + kx;
+                                        if(iw < 0 || iw >= (int)W) continue;
+                                        T pixel = in_ptr[((n*H + ih)*W + iw)*C + c];
+                                        T weight = w_ptr[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
+                                        val += pixel * weight;
+                                    }
+                                }
+                                eyes_store_ptr[c] = val;
+                                buf_in[c] = val;
+                            }
+                        }
+
+                        // --- Part 2: Mixer (Spectral) ---
+                        // buf_in already has the data.
 
                         algo::WHT::fwht_1d(buf_in.data(), in_channels_);
 
@@ -227,31 +228,23 @@ public:
 
                         if (use_ifwht_) {
                             algo::WHT::fwht_1d(buf_out.data(), out_channels_);
-                            // Lazy Norm Optimization:
-                            // The 1/N scale was already applied in the spectral domain via `spectral_scales_`.
-                            // So we skip the explicit normalization loop here.
                         }
 
-                        size_t out_idx = ((n*H_out + h)*W_out + w)*out_channels_;
+                        size_t out_idx = ((n*H_out + h_out)*W_out + w_out)*out_channels_;
 
-                        // Streaming Store was benchmarked and found to regress in this configuration.
-                        // Standard store is used.
+                        // --- Part 3: ReLU ---
                         for(size_t c=0; c<out_channels_; ++c) {
-                            out_ptr[out_idx + c] = buf_out[c];
+                            T v = buf_out[c];
+                            if (v < 0) v = 0;
+                            out_ptr[out_idx + c] = v;
                         }
                     }
                 }
             }
         }
 
-        // Step 3: GroupNorm & Activation
+        // Step 3: GroupNorm
         output = group_norm_->forward(output);
-
-        // ReLU
-        #pragma omp parallel for
-        for (size_t i = 0; i < output.size(); ++i) {
-             if (output.data()[i] < 0) output.data()[i] = 0;
-        }
 
         return output;
     }
