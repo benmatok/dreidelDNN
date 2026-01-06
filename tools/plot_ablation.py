@@ -7,18 +7,16 @@ def create_svg_line_chart(output_file):
     padding = 60
 
     steps = []
-    loss_he = []
-    loss_id = []
-    loss_pe = []
+    loss_std = []
+    loss_slm = []
 
     try:
-        with open('benchmark_results_ablation.csv', 'r') as f:
+        with open('benchmark_results_slm.csv', 'r') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 steps.append(int(row['Step']))
-                loss_he.append(float(row['Baseline']))
-                loss_id.append(float(row['IdentityInit']))
-                loss_pe.append(float(row['IdentityPE']))
+                loss_std.append(float(row['Standard']))
+                loss_slm.append(float(row['SLM']))
     except FileNotFoundError:
         print("CSV not found")
         return
@@ -26,7 +24,7 @@ def create_svg_line_chart(output_file):
     if not steps:
         return
 
-    max_loss = max(max(loss_he), max(loss_id), max(loss_pe))
+    max_loss = max(max(loss_std), max(loss_slm))
     if max_loss == 0: max_loss = 1
 
     max_step = max(steps)
@@ -61,24 +59,22 @@ def create_svg_line_chart(output_file):
             points.append(f"{x},{y}")
         return f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2" />\n'
 
-    svg += plot_line(loss_he, "#e74c3c")   # Red
-    svg += plot_line(loss_id, "#f1c40f")   # Yellow
-    svg += plot_line(loss_pe, "#3498db")   # Blue
+    svg += plot_line(loss_std, "#e74c3c")   # Red (Standard)
+    svg += plot_line(loss_slm, "#3498db")   # Blue (SLM)
 
     # Legend
-    legend_x = width - 200
+    legend_x = width - 250
     legend_y = 50
 
     def add_legend_item(y, color, text):
         return f'<rect x="{legend_x}" y="{y}" width="15" height="15" fill="{color}" />\n' \
                f'<text x="{legend_x + 20}" y="{y+12}" font-family="Arial" font-size="12">{text}</text>\n'
 
-    svg += add_legend_item(legend_y, "#e74c3c", "Baseline (He Init, No PE)")
-    svg += add_legend_item(legend_y + 20, "#f1c40f", "Identity Init, No PE")
-    svg += add_legend_item(legend_y + 40, "#3498db", "Identity Init + Pos Emb")
+    svg += add_legend_item(legend_y, "#e74c3c", "Standard Zenith (He+PE)")
+    svg += add_legend_item(legend_y + 20, "#3498db", "Zenith-SLM (He+PE+SLM)")
 
     # Title
-    svg += f'<text x="{width/2}" y="30" font-family="Arial" font-size="16" text-anchor="middle" font-weight="bold">Zenith Ablation Study (2000 Steps)</text>\n'
+    svg += f'<text x="{width/2}" y="30" font-family="Arial" font-size="16" text-anchor="middle" font-weight="bold">Zenith-SLM Comparison</text>\n'
 
     svg += '</svg>'
 
@@ -87,4 +83,4 @@ def create_svg_line_chart(output_file):
     print(f"Graph saved to {output_file}")
 
 if __name__ == "__main__":
-    create_svg_line_chart('docs/ablation_benchmark.svg')
+    create_svg_line_chart('docs/slm_benchmark.svg')

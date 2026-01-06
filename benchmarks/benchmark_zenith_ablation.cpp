@@ -92,31 +92,24 @@ int main() {
         dataset.push_back(std::move(t));
     }
 
-    // 1. Baseline: He Init, No PE
-    std::cout << "=== Experiment 1: Baseline (He Init, No PE) ===" << std::endl;
-    models::ZenithHierarchicalAE<float> model_he_nope(C, 32, false, "he");
-    std::vector<double> loss_he_nope;
-    train_model(&model_he_nope, dataset, "Baseline", steps, batch_size, loss_he_nope, false);
+    // 1. Standard Zenith (He, PE=True, SLM=False)
+    std::cout << "=== Experiment 1: Standard Zenith (He, PE) ===" << std::endl;
+    models::ZenithHierarchicalAE<float> model_std(C, 32, true, "he", false);
+    std::vector<double> loss_std;
+    train_model(&model_std, dataset, "Standard Zenith", steps, batch_size, loss_std, false);
 
-    // 2. Improvement A: Identity Init, No PE
-    std::cout << "\n=== Experiment 2: Improvement A (Identity Init, No PE) ===" << std::endl;
-    models::ZenithHierarchicalAE<float> model_id_nope(C, 32, false, "identity");
-    std::vector<double> loss_id_nope;
-    train_model(&model_id_nope, dataset, "Identity Init", steps, batch_size, loss_id_nope, true);
-
-    // 3. Improvement B: Identity Init + PE
-    std::cout << "\n=== Experiment 3: Improvement B (Identity Init + PE) ===" << std::endl;
-    models::ZenithHierarchicalAE<float> model_id_pe(C, 32, true, "identity");
-    std::vector<double> loss_id_pe;
-    train_model(&model_id_pe, dataset, "Identity + PE", steps, batch_size, loss_id_pe, true);
+    // 2. Zenith-SLM (He, PE=True, SLM=True)
+    std::cout << "\n=== Experiment 2: Zenith-SLM (He, PE, SLM) ===" << std::endl;
+    models::ZenithHierarchicalAE<float> model_slm(C, 32, true, "he", true);
+    std::vector<double> loss_slm;
+    train_model(&model_slm, dataset, "Zenith-SLM", steps, batch_size, loss_slm, false);
 
     // Save Results
-    std::ofstream csv("benchmark_results_ablation.csv");
-    csv << "Step,Baseline,IdentityInit,IdentityPE\n";
-    for(size_t i=0; i<loss_he_nope.size(); ++i) {
-        // Logging every step creates huge CSV. Maybe subsample?
+    std::ofstream csv("benchmark_results_slm.csv");
+    csv << "Step,Standard,SLM\n";
+    for(size_t i=0; i<loss_std.size(); ++i) {
         if (i % 10 == 0) {
-             csv << i << "," << loss_he_nope[i] << "," << loss_id_nope[i] << "," << loss_id_pe[i] << "\n";
+             csv << i << "," << loss_std[i] << "," << loss_slm[i] << "\n";
         }
     }
     csv.close();
