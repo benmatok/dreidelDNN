@@ -71,6 +71,9 @@ int main() {
     models::ZenithHierarchicalAE<float> zenith_ae;
     auto res_zenith = run_benchmark(&zenith_ae, input, "ZenithHierarchicalAE", iterations);
 
+    models::ZenithHierarchicalAE<float> zenith_slm_ae(3, 32, true, "he", true);
+    auto res_zenith_slm = run_benchmark(&zenith_slm_ae, input, "Zenith-SLM", iterations);
+
     models::ConvBaselineAE<float> conv_ae;
     auto res_conv = run_benchmark(&conv_ae, input, "ConvBaselineAE", iterations);
 
@@ -79,21 +82,21 @@ int main() {
     std::cout << "Model | Forward (s) | Backward (s) | Total (s)" << std::endl;
     std::cout << "--- | --- | --- | ---" << std::endl;
     std::cout << res_zenith.name << " | " << res_zenith.forward_time_avg << " | " << res_zenith.backward_time_avg << " | " << res_zenith.total_time_avg << std::endl;
+    std::cout << res_zenith_slm.name << " | " << res_zenith_slm.forward_time_avg << " | " << res_zenith_slm.backward_time_avg << " | " << res_zenith_slm.total_time_avg << std::endl;
     std::cout << res_conv.name << " | " << res_conv.forward_time_avg << " | " << res_conv.backward_time_avg << " | " << res_conv.total_time_avg << std::endl;
 
-    double fwd_speedup = res_conv.forward_time_avg / res_zenith.forward_time_avg;
-    double bwd_speedup = res_conv.backward_time_avg / res_zenith.backward_time_avg;
-    double total_speedup = res_conv.total_time_avg / res_zenith.total_time_avg;
+    double fwd_speedup = res_conv.forward_time_avg / res_zenith_slm.forward_time_avg;
+    double total_speedup = res_conv.total_time_avg / res_zenith_slm.total_time_avg;
 
     std::cout << std::endl;
-    std::cout << "Speedup (Zenith vs Baseline):" << std::endl;
+    std::cout << "Speedup (Zenith-SLM vs Baseline):" << std::endl;
     std::cout << "Forward: " << fwd_speedup << "x" << std::endl;
-    std::cout << "Backward: " << bwd_speedup << "x" << std::endl;
     std::cout << "Total: " << total_speedup << "x" << std::endl;
 
     std::ofstream csv("benchmark_results_wavelet.csv");
     csv << "Model,Forward,Backward,Total\n";
     csv << res_zenith.name << "," << res_zenith.forward_time_avg << "," << res_zenith.backward_time_avg << "," << res_zenith.total_time_avg << "\n";
+    csv << res_zenith_slm.name << "," << res_zenith_slm.forward_time_avg << "," << res_zenith_slm.backward_time_avg << "," << res_zenith_slm.total_time_avg << "\n";
     csv << res_conv.name << "," << res_conv.forward_time_avg << "," << res_conv.backward_time_avg << "," << res_conv.total_time_avg << "\n";
     csv.close();
 
