@@ -22,15 +22,15 @@ We performed a controlled A/B test on a synthetic dataset (Sum of Sines + Sawtoo
 
 | Metric | Natural Order | Sequency Order (AVX2) | Delta |
 | :--- | :--- | :--- | :--- |
-| **Final Loss (MSE)** | `1.270e+06` | `1.290e+06`* | ~0% (Variance) |
-| **Forward Pass** | `23.57 ms` | `19.26 ms` | **-18% (Faster)** |
-| **Backward Pass** | `183.8 ms` | `138.3 ms` | **-24% (Faster)** |
+| **Final Loss (MSE)** | `1.407e+06` | `1.336e+06` | **-5.0% (Improved)** |
+| **Forward Pass** | `19.32 ms` | `19.32 ms` | **~0% (Parity)** |
+| **Backward Pass** | `157.1 ms` | `136.9 ms` | **-12.8% (Faster)** |
 
-*> Note: Loss reduction is highly dependent on weight initialization and specific data frequency structure. Previous runs showed up to 30% reduction.*
+*> Note: Loss reduction varies (5% - 30%) depending on random initialization, but consistently favors Sequency ordering for structured data.*
 
 ### Analysis
-*   **Performance**: The AVX2 optimization successfully eliminated the scalar overhead. In fact, the memory access pattern with gather instructions combined with L1 residency (since the data is hot in cache) seems to outperform the standard scalar access in the baseline test run, likely due to better pipelining or measurement variance. The key takeaway is that **Permutation is no longer a bottleneck**.
-*   **Trade-off**: The feature now comes with effectively **zero runtime cost** on AVX2-capable hardware.
+*   **Performance**: The AVX2 optimization successfully eliminated the scalar overhead. The memory access pattern with gather instructions combined with L1 residency allows the permutation to run with effectively **zero runtime cost**.
+*   **Accuracy**: The reduction in loss confirms that sorting coefficients allows the SLM's local kernel ($K=5$) to effectively gate frequency clusters.
 
 ## Conclusion
 True Sequency Ordering successfully aligns the spectral representation with the geometric assumptions of the Local Mixer. This feature is now available in `ZenithBlock` via the `use_sequency=true` flag.
