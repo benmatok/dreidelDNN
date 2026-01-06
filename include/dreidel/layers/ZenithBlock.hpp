@@ -25,6 +25,7 @@ template <typename T>
 class ZenithBlock : public Layer<T> {
 public:
     static inline bool use_fused_kernels = true;
+    static constexpr size_t rig_iterations_ = 3;
 
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim,
                 bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1,
@@ -221,6 +222,20 @@ public:
             if (use_slm_ || use_sequency_) buf_mag.resize(in_channels_);
             if (use_slm_) buf_hidden.resize(in_channels_);
 
+            // Buffers for RIG
+            std::vector<T, core::AlignedAllocator<T>> buf_est;
+            std::vector<T, core::AlignedAllocator<T>> buf_gate;
+
+            if (use_slm_) {
+                buf_est.resize((rig_iterations_ + 1) * in_channels_);
+                buf_hidden.resize(rig_iterations_ * in_channels_);
+                buf_gate.resize(rig_iterations_ * in_channels_);
+            }
+
+            // Scratch for permutation
+            std::vector<T, core::AlignedAllocator<T>> buf_temp;
+            if (use_sequency_) buf_temp.resize(in_channels_);
+
             const int32_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
             const int32_t* nat_map_ptr = use_sequency_ ? natural_map_.data() : nullptr;
 
@@ -282,80 +297,80 @@ public:
 
                         // Permute Natural -> Sequency
                         if (use_sequency_) {
-                            // buf_in is Natural.
-                            // We want buf_in to be Sequency.
-                            // buf_seq[k] = buf_nat[map[k]]
-                            // Use buf_mag as temp
-        if constexpr (std::is_same_v<T, float>) {
-            #ifdef DREIDEL_ARCH_AVX2
-                permute_avx2(buf_mag.data(), buf_in.data(), seq_map_ptr, in_channels_);
-            #else
-                for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = buf_in[seq_map_ptr[k]];
-            #endif
-        } else {
-            for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = buf_in[seq_map_ptr[k]];
+                            if constexpr (std::is_same_v<T, float>) {
+                                #ifdef DREIDEL_ARCH_AVX2
+                                    permute_avx2(buf_temp.data(), buf_in.data(), seq_map_ptr, in_channels_);
+                                #else
+                                    for(size_t k=0; k<in_channels_; ++k) buf_temp[k] = buf_in[seq_map_ptr[k]];
+                                #endif
+                            } else {
+                                for(size_t k=0; k<in_channels_; ++k) buf_temp[k] = buf_in[seq_map_ptr[k]];
                             }
-                            // Copy back
-                            std::memcpy(buf_in.data(), buf_mag.data(), in_channels_ * sizeof(T));
+                            std::memcpy(buf_in.data(), buf_temp.data(), in_channels_ * sizeof(T));
                         }
 
-                        // SLM Gating (Zenith-DSG)
+                        // Zenith-RIG (Recurrent Iterative Gating)
                         if (use_slm_) {
-                            // 1. Compute Mag
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                buf_mag[c] = std::abs(buf_in[c]);
+                            // 1. Initialize Est[0] = |Input|
+                            T* est_0 = buf_est.data();
+                            for(size_t c=0; c<in_channels_; ++c) est_0[c] = std::abs(buf_in[c]);
+
+                            // 2. Unrolled Loop
+                            for(size_t k=0; k<rig_iterations_; ++k) {
+                                const T* curr_est = buf_est.data() + k * in_channels_;
+                                T* next_est = buf_est.data() + (k+1) * in_channels_;
+                                T* curr_hidden = buf_hidden.data() + k * in_channels_;
+                                T* curr_gate = buf_gate.data() + k * in_channels_;
+
+                                // Layer 1: Conv(Est[k]) -> Hidden
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    T val = slm_b1_ptr[c];
+                                    const T* w = slm_w1_ptr + c * 5;
+                                    if (c >= 2) val += w[0] * curr_est[c-2];
+                                    if (c >= 1) val += w[1] * curr_est[c-1];
+                                    val += w[2] * curr_est[c];
+                                    if (c + 1 < in_channels_) val += w[3] * curr_est[c+1];
+                                    if (c + 2 < in_channels_) val += w[4] * curr_est[c+2];
+                                    curr_hidden[c] = (val > 0) ? val : 0; // ReLU
+                                }
+
+                                // Layer 2: Conv(Hidden) -> Gate
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    T val = slm_b2_ptr[c];
+                                    const T* w = slm_w2_ptr + c * 5;
+                                    if (c >= 2) val += w[0] * curr_hidden[c-2];
+                                    if (c >= 1) val += w[1] * curr_hidden[c-1];
+                                    val += w[2] * curr_hidden[c];
+                                    if (c + 1 < in_channels_) val += w[3] * curr_hidden[c+1];
+                                    if (c + 2 < in_channels_) val += w[4] * curr_hidden[c+2];
+                                    curr_gate[c] = 1.0f / (1.0f + std::exp(-val)); // Sigmoid
+                                }
+
+                                // Update State: Est[k+1] = Est[0] * Gate[k] (Refinement)
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    next_est[c] = est_0[c] * curr_gate[c];
+                                }
                             }
 
-                            // 2. Layer 1: Energy Integration (Conv1D + Bias1 + ReLU)
+                            // 3. Apply Final Gate to Complex Input
+                            const T* final_gate = buf_gate.data() + (rig_iterations_ - 1) * in_channels_;
                             for(size_t c=0; c<in_channels_; ++c) {
-                                T val = slm_b1_ptr[c];
-                                const T* w = slm_w1_ptr + c * 5;
-
-                                if (c >= 2) val += w[0] * buf_mag[c-2];
-                                if (c >= 1) val += w[1] * buf_mag[c-1];
-                                val += w[2] * buf_mag[c];
-                                if (c + 1 < in_channels_) val += w[3] * buf_mag[c+1];
-                                if (c + 2 < in_channels_) val += w[4] * buf_mag[c+2];
-
-                                // ReLU
-                                buf_hidden[c] = (val > 0) ? val : 0;
-                            }
-
-                            // 3. Layer 2: Gate Smoothing (Conv1D + Bias2 + Sigmoid) & Apply
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                T val = slm_b2_ptr[c];
-                                const T* w = slm_w2_ptr + c * 5;
-
-                                if (c >= 2) val += w[0] * buf_hidden[c-2];
-                                if (c >= 1) val += w[1] * buf_hidden[c-1];
-                                val += w[2] * buf_hidden[c];
-                                if (c + 1 < in_channels_) val += w[3] * buf_hidden[c+1];
-                                if (c + 2 < in_channels_) val += w[4] * buf_hidden[c+2];
-
-                                // Sigmoid
-                                T gate = 1.0f / (1.0f + std::exp(-val));
-
-                                // 4. Apply Gate
-                                buf_in[c] *= gate;
+                                buf_in[c] *= final_gate[c];
                             }
                         }
 
                         // Permute Sequency -> Natural
                         if (use_sequency_) {
-                            // buf_in is Sequency (modified by SLM)
-                            // We want buf_in to be Natural.
-                            // buf_nat[i] = buf_seq[nat_map[i]]
-                            // Use buf_mag as temp
-        if constexpr (std::is_same_v<T, float>) {
-            #ifdef DREIDEL_ARCH_AVX2
-                permute_avx2(buf_mag.data(), buf_in.data(), nat_map_ptr, in_channels_);
-            #else
-                for(size_t i=0; i<in_channels_; ++i) buf_mag[i] = buf_in[nat_map_ptr[i]];
-            #endif
-        } else {
-            for(size_t i=0; i<in_channels_; ++i) buf_mag[i] = buf_in[nat_map_ptr[i]];
+                            if constexpr (std::is_same_v<T, float>) {
+                                #ifdef DREIDEL_ARCH_AVX2
+                                    permute_avx2(buf_temp.data(), buf_in.data(), nat_map_ptr, in_channels_);
+                                #else
+                                    for(size_t i=0; i<in_channels_; ++i) buf_temp[i] = buf_in[nat_map_ptr[i]];
+                                #endif
+                            } else {
+                                for(size_t i=0; i<in_channels_; ++i) buf_temp[i] = buf_in[nat_map_ptr[i]];
                             }
-                            std::memcpy(buf_in.data(), buf_mag.data(), in_channels_ * sizeof(T));
+                            std::memcpy(buf_in.data(), buf_temp.data(), in_channels_ * sizeof(T));
                         }
 
                         if (apply_dropout) {
@@ -460,29 +475,6 @@ public:
         const T* slm_w2_ptr = use_slm_ ? slm_weights2_.data() : nullptr;
         const T* slm_b2_ptr = use_slm_ ? slm_bias2_.data() : nullptr;
 
-        // Lazy Norm: Norm is fused, so factor here is 1.0 (or we need to account for it if backward needs unscaling?
-        // Backward of y = IFWHT(x) * (1/N) is x_grad = FWHT(y_grad) * (1/N).
-        // Since we fused 1/N into weights, the forward was y = IFWHT(x * (1/N)).
-        // Gradient of y w.r.t x is IFWHT(1/N).
-        // So backward prop is correct as is, provided `spectral_scales_` contains the 1/N.
-        // Wait, backward uses `scale_ptr`. If `scale_ptr` is `1/N`, then `buf_eyes` in backward
-        // will be scaled by `1/N` again.
-        // Forward: x -> WHT -> *S -> IFWHT -> y.
-        // Backward: dy -> FWHT -> *S -> IFWHT -> dx.
-        // If S has 1/N, then backward applies 1/N too.
-        // Standard WHT/IFWHT are symmetric (up to N).
-        // The previous code applied 1/N explicitly at end of forward.
-        // And 1/N explicitly at start of backward (before FWHT on grads).
-        // Let's check previous backward:
-        // `for(size_t c=0; c<out_channels_; ++c) buf_grad[c] *= norm;`
-        // `algo::WHT::fwht_1d(buf_grad.data(), out_channels_);`
-        // So yes, backward also needs scaling.
-        // By fusing into `spectral_scales_`, we use `scale_ptr` in the middle.
-        // Forward: x -> WHT -> *S(1/N) -> IFWHT.
-        // Backward: dy -> FWHT -> *S(1/N) -> IFWHT.
-        // This is mathematically consistent! The 1/N is applied via S in both passes.
-        // So removing explicit norm in backward is also correct.
-
         T dropout_scale = (training_ && spectral_dropout_rate_ > 0.0f) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
 
         Tensor<T> d_mixer_out({N, H_out, W_out, out_channels_});
@@ -567,25 +559,32 @@ public:
             std::vector<T, core::AlignedAllocator<T>> buf_eyes(in_channels_);
             std::vector<T, core::AlignedAllocator<T>> d_eyes(in_channels_);
 
-            // SLM temp buffers
-            std::vector<T, core::AlignedAllocator<T>> buf_mag;
-            std::vector<T, core::AlignedAllocator<T>> buf_hidden; // Hidden layer activations
-            std::vector<T, core::AlignedAllocator<T>> buf_gate;   // Sigmoid output
-            std::vector<T, core::AlignedAllocator<T>> d_gate;     // Gradient w.r.t Gate
-            std::vector<T, core::AlignedAllocator<T>> d_hidden;   // Gradient w.r.t Hidden
+            // SLM temp buffers (RIG sized)
+            std::vector<T, core::AlignedAllocator<T>> buf_est;
+            std::vector<T, core::AlignedAllocator<T>> buf_hidden;
+            std::vector<T, core::AlignedAllocator<T>> buf_gate;
 
-            if (use_slm_ || use_sequency_) {
-                buf_mag.resize(in_channels_);
-            }
+            // Gradients buffers
+            std::vector<T, core::AlignedAllocator<T>> d_est;
+            std::vector<T, core::AlignedAllocator<T>> d_hidden;
+            std::vector<T, core::AlignedAllocator<T>> d_gate;
+
+            std::vector<T, core::AlignedAllocator<T>> buf_temp; // Scratch for permute
+
+            if (use_slm_ || use_sequency_) buf_temp.resize(in_channels_);
+
             if (use_slm_) {
-                buf_hidden.resize(in_channels_);
-                buf_gate.resize(in_channels_);
+                buf_est.resize((rig_iterations_ + 1) * in_channels_);
+                buf_hidden.resize(rig_iterations_ * in_channels_);
+                buf_gate.resize(rig_iterations_ * in_channels_);
+
+                d_est.resize((rig_iterations_ + 1) * in_channels_);
+                d_hidden.resize(in_channels_); // Can reuse layer-wise
                 d_gate.resize(in_channels_);
-                d_hidden.resize(in_channels_);
             }
 
-    const int32_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
-    const int32_t* nat_map_ptr = use_sequency_ ? natural_map_.data() : nullptr;
+            const int32_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
+            const int32_t* nat_map_ptr = use_sequency_ ? natural_map_.data() : nullptr;
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
@@ -607,222 +606,216 @@ public:
 
                         // Permute Natural -> Sequency (Forward Logic)
                         if (use_sequency_) {
-        if constexpr (std::is_same_v<T, float>) {
-            #ifdef DREIDEL_ARCH_AVX2
-                permute_avx2(buf_mag.data(), buf_eyes.data(), seq_map_ptr, in_channels_);
-            #else
-                for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = buf_eyes[seq_map_ptr[k]];
-            #endif
-        } else {
-            for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = buf_eyes[seq_map_ptr[k]];
-        }
-                            std::memcpy(buf_eyes.data(), buf_mag.data(), in_channels_ * sizeof(T));
+                            if constexpr (std::is_same_v<T, float>) {
+                                #ifdef DREIDEL_ARCH_AVX2
+                                    permute_avx2(buf_temp.data(), buf_eyes.data(), seq_map_ptr, in_channels_);
+                                #else
+                                    for(size_t k=0; k<in_channels_; ++k) buf_temp[k] = buf_eyes[seq_map_ptr[k]];
+                                #endif
+                            } else {
+                                for(size_t k=0; k<in_channels_; ++k) buf_temp[k] = buf_eyes[seq_map_ptr[k]];
+                            }
+                            std::memcpy(buf_eyes.data(), buf_temp.data(), in_channels_ * sizeof(T));
                         }
 
-                        // SLM Forward Recompute (DSG)
+                        // Zenith-RIG Forward Recompute (for Backward)
                         if (use_slm_) {
-                            // 1. Mag
-                            for(size_t c=0; c<in_channels_; ++c) buf_mag[c] = std::abs(buf_eyes[c]);
+                            // 1. Initialize Est[0]
+                            T* est_0 = buf_est.data();
+                            for(size_t c=0; c<in_channels_; ++c) est_0[c] = std::abs(buf_eyes[c]);
 
-                            // 2. Layer 1 (Hidden)
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                T val = slm_b1_ptr[c];
-                                const T* w = slm_w1_ptr + c * 5;
-                                if (c >= 2) val += w[0] * buf_mag[c-2];
-                                if (c >= 1) val += w[1] * buf_mag[c-1];
-                                val += w[2] * buf_mag[c];
-                                if (c + 1 < in_channels_) val += w[3] * buf_mag[c+1];
-                                if (c + 2 < in_channels_) val += w[4] * buf_mag[c+2];
-                                buf_hidden[c] = (val > 0) ? val : 0;
+                            // 2. Unrolled Loop (Replay)
+                            for(size_t k=0; k<rig_iterations_; ++k) {
+                                const T* curr_est = buf_est.data() + k * in_channels_;
+                                T* next_est = buf_est.data() + (k+1) * in_channels_;
+                                T* curr_hidden = buf_hidden.data() + k * in_channels_;
+                                T* curr_gate = buf_gate.data() + k * in_channels_;
+
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    T val = slm_b1_ptr[c];
+                                    const T* w = slm_w1_ptr + c * 5;
+                                    if (c >= 2) val += w[0] * curr_est[c-2];
+                                    if (c >= 1) val += w[1] * curr_est[c-1];
+                                    val += w[2] * curr_est[c];
+                                    if (c + 1 < in_channels_) val += w[3] * curr_est[c+1];
+                                    if (c + 2 < in_channels_) val += w[4] * curr_est[c+2];
+                                    curr_hidden[c] = (val > 0) ? val : 0;
+                                }
+
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    T val = slm_b2_ptr[c];
+                                    const T* w = slm_w2_ptr + c * 5;
+                                    if (c >= 2) val += w[0] * curr_hidden[c-2];
+                                    if (c >= 1) val += w[1] * curr_hidden[c-1];
+                                    val += w[2] * curr_hidden[c];
+                                    if (c + 1 < in_channels_) val += w[3] * curr_hidden[c+1];
+                                    if (c + 2 < in_channels_) val += w[4] * curr_hidden[c+2];
+                                    curr_gate[c] = 1.0f / (1.0f + std::exp(-val));
+                                }
+
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    next_est[c] = est_0[c] * curr_gate[c];
+                                }
                             }
 
-                            // 3. Layer 2 (Gate)
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                T val = slm_b2_ptr[c];
-                                const T* w = slm_w2_ptr + c * 5;
-                                if (c >= 2) val += w[0] * buf_hidden[c-2];
-                                if (c >= 1) val += w[1] * buf_hidden[c-1];
-                                val += w[2] * buf_hidden[c];
-                                if (c + 1 < in_channels_) val += w[3] * buf_hidden[c+1];
-                                if (c + 2 < in_channels_) val += w[4] * buf_hidden[c+2];
-                                buf_gate[c] = 1.0f / (1.0f + std::exp(-val));
-
-                                // Apply
-                                buf_eyes[c] *= buf_gate[c];
-                            }
+                            // buf_eyes holds u_seq (pre-gated). We DO NOT apply final gate here.
+                            // We need u_seq for gradient calculation (dL/dGate = dL/dY * u_seq).
                         }
 
-                        // Note: buf_eyes is now in Sequency order if use_sequency_ is true
-                        // But wait! In forward pass we permuted back to Natural before IFWHT/Scale?
-                        // Forward: FWHT -> P -> SLM -> P_inv -> Scale -> Mix -> IFWHT.
-                        // Wait, my Forward code was:
-                        // FWHT -> P -> SLM -> P_inv -> Scale -> Mix -> IFWHT.
-                        // Here (backward loop) we are recomputing forward path to get `buf_eyes` (aka `u`) for derivative.
-                        // We did: FWHT -> P -> SLM.
-                        // `buf_eyes` now holds `u_seq * gate`.
-                        // But we need to match what's coming from `d_eyes` (backprop).
-                        // Let's trace `d_eyes` flow backwards.
+                        // NOTE: buf_eyes is now in Sequency order (if use_sequency).
 
-                        // Incoming `d_eyes` is `dL/dy`. y = Output of IFWHT?
-                        // No.
-                        // In backward loop before this block:
-                        // d_eyes[c] was populated from `d_mixer` using `w_C`, `w_L` etc.
-                        // These `w` operate on `buf_in` from forward.
-                        // `buf_in` in forward was `FWHT(x) -> P -> SLM -> P_inv -> Scale`.
-                        // So `buf_in` (at mixing point) is Natural order.
-                        // So `d_eyes` (at start of backprop loop) is Natural order.
-
-                        // Then we do:
-                        // d_eyes[c] *= scale_ptr[c] (Propagate through scale)
-                        // Then `d_eyes` is dL/d(P_inv(SLM_out)).
-                        // We need to propagate through P_inv.
-                        // P_inv: Seq -> Nat.
-                        // y = P_inv(x). x = P(y).
-                        // dL/dx = P_inv^T * dL/dy?
-                        // P_inv corresponds to "Gather from Nat Map".
-                        // buf_nat[i] = buf_seq[nat_map[i]].
-                        // Gradient: dL/dbuf_seq[k] += dL/dbuf_nat[i] where nat_map[i] == k.
-                        // Or simply: dL/d_seq = P * dL/d_nat. (Since P_inv is permutation, transpose is inverse = P).
-                        // So we need to apply P to d_eyes.
-
-                        // Permute d_eyes Natural -> Sequency
-                        if (use_sequency_) {
-        if constexpr (std::is_same_v<T, float>) {
-            #ifdef DREIDEL_ARCH_AVX2
-                permute_avx2(buf_mag.data(), d_eyes.data(), seq_map_ptr, in_channels_);
-            #else
-                for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = d_eyes[seq_map_ptr[k]];
-            #endif
-        } else {
-            for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = d_eyes[seq_map_ptr[k]];
-        }
-                            std::memcpy(d_eyes.data(), buf_mag.data(), in_channels_ * sizeof(T));
-                        }
-
-                        // Now `d_eyes` is in Sequency order.
-                        // `buf_eyes` (recomputed) is also in Sequency order (since we did FWHT -> P -> SLM).
-
-                        if (training_ && spectral_dropout_rate_ > 0.0f) {
-                            for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] *= (dropout_mask_[c] * dropout_scale);
-                        }
-                        for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] *= scale_ptr[c];
-
-                        std::fill(d_eyes.begin(), d_eyes.end(), 0);
-                        if (in_channels_ == out_channels_) {
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                T dy = buf_grad[c];
-
-                                // dL/dW mixing
-                                T prev = (c==0)?0:buf_eyes[c-1];
-                                T curr = buf_eyes[c];
-                                T next = (c==in_channels_-1)?0:buf_eyes[c+1];
-
-                                local_gw_L[c] += dy * prev;
-                                local_gw_C[c] += dy * curr;
-                                local_gw_R[c] += dy * next;
-
-                                // dL/dInput (propagate back)
-                                d_eyes[c] += dy * w_C[c];
-                                if (c > 0) d_eyes[c-1] += dy * w_L[c];
-                                if (c < in_channels_-1) d_eyes[c+1] += dy * w_R[c];
-                            }
-                        }
+                        // dL/dScale & Backprop through Scale & Dropout
+                        // buf_eyes holds `u`. buf_gate holds `Gate`.
+                        const T* final_gate = buf_gate.data() + (rig_iterations_ - 1) * in_channels_;
 
                         for(size_t c=0; c<in_channels_; ++c) {
-                            // dL/dScale
-                            // buf_eyes currently holds: (WHT(eyes) * SLM_Gate * Dropout) * Scale
-                            // d_eyes is gradient w.r.t. `buf_eyes`
+                            T u = buf_eyes[c]; // u_seq
+                            T g = final_gate[c];
+                            T val = u * g; // u * Gate
 
-                            // We need unscaled value: buf_eyes / scale
-                            T unscaled = (std::abs(scale_ptr[c]) > 1e-9) ? buf_eyes[c] / scale_ptr[c] : 0;
-                            local_g_scale[c] += d_eyes[c] * unscaled;
+                            if (training_ && spectral_dropout_rate_ > 0.0f) {
+                                val *= (dropout_mask_[c] * dropout_scale);
+                            }
 
-                            // Propagate back through Scale
+                            // dL/dScale = dL/dY * val
+                            local_g_scale[c] += d_eyes[c] * val;
+
+                            // dL/dVal = dL/dY * Scale
                             d_eyes[c] *= scale_ptr[c];
-                        }
 
-                        if (training_ && spectral_dropout_rate_ > 0.0f) {
-                            for(size_t c=0; c<in_channels_; ++c) d_eyes[c] *= (dropout_mask_[c] * dropout_scale);
-                        }
-
-                        // SLM Backward (DSG)
-                        if (use_slm_) {
-                            // d_eyes is dL/d(u_seq * gate).
-                            // buf_eyes is u_seq * gate.
-
-                            std::fill(d_hidden.begin(), d_hidden.end(), 0);
-                            std::fill(d_gate.begin(), d_gate.end(), 0); // Reuse d_gate for dMag
-
-                            // 1. Backprop Gate & Layer 2
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                T g = buf_gate[c];
-                                T u = (g > 1e-9) ? buf_eyes[c] / g : 0;
-
-                                // dL/dGate = dL/dY * u
-                                T d_g = d_eyes[c] * u;
-
-                                // dSigmoid: g * (1-g)
-                                T d_z2 = d_g * g * (1.0f - g);
-
-                                local_g_slm_b2[c] += d_z2;
-
-                                // Backprop L2 to Weights & Hidden
-                                T* w_g = local_g_slm_w2.data() + c * 5;
-                                const T* w_fwd = slm_w2_ptr + c * 5;
-
-                                if (c >= 2) { w_g[0] += d_z2 * buf_hidden[c-2]; d_hidden[c-2] += d_z2 * w_fwd[0]; }
-                                if (c >= 1) { w_g[1] += d_z2 * buf_hidden[c-1]; d_hidden[c-1] += d_z2 * w_fwd[1]; }
-                                w_g[2] += d_z2 * buf_hidden[c]; d_hidden[c] += d_z2 * w_fwd[2];
-                                if (c + 1 < in_channels_) { w_g[3] += d_z2 * buf_hidden[c+1]; d_hidden[c+1] += d_z2 * w_fwd[3]; }
-                                if (c + 2 < in_channels_) { w_g[4] += d_z2 * buf_hidden[c+2]; d_hidden[c+2] += d_z2 * w_fwd[4]; }
-                            }
-
-                            // 2. Backprop Hidden (ReLU) & Layer 1
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                T d_h = d_hidden[c];
-                                // ReLU derivative: 1 if hidden > 0, else 0
-                                if (buf_hidden[c] <= 0) d_h = 0;
-
-                                T d_z1 = d_h;
-                                local_g_slm_b1[c] += d_z1;
-
-                                T* w_g = local_g_slm_w1.data() + c * 5;
-                                const T* w_fwd = slm_w1_ptr + c * 5;
-
-                                if (c >= 2) { w_g[0] += d_z1 * buf_mag[c-2]; d_gate[c-2] += d_z1 * w_fwd[0]; }
-                                if (c >= 1) { w_g[1] += d_z1 * buf_mag[c-1]; d_gate[c-1] += d_z1 * w_fwd[1]; }
-                                w_g[2] += d_z1 * buf_mag[c]; d_gate[c] += d_z1 * w_fwd[2];
-                                if (c + 1 < in_channels_) { w_g[3] += d_z1 * buf_mag[c+1]; d_gate[c+1] += d_z1 * w_fwd[3]; }
-                                if (c + 2 < in_channels_) { w_g[4] += d_z1 * buf_mag[c+2]; d_gate[c+2] += d_z1 * w_fwd[4]; }
-                            }
-
-                            // 3. Backprop Mag -> u
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                T g = buf_gate[c];
-                                T u = (g > 1e-9) ? buf_eyes[c] / g : 0;
-                                T sgn = (u > 0) ? 1.0f : ((u < 0) ? -1.0f : 0.0f);
-
-                                // dL/dMag (in d_gate) * sgn(u)
-                                T d_u_branch2 = d_gate[c] * sgn;
-
-                                // Combine with Branch 1 (dL/dY * g)
-                                d_eyes[c] = d_eyes[c] * g + d_u_branch2;
+                            // Backprop Dropout
+                            if (training_ && spectral_dropout_rate_ > 0.0f) {
+                                d_eyes[c] *= (dropout_mask_[c] * dropout_scale);
                             }
                         }
 
-                        // Permute Sequency -> Natural (Backprop through P)
-                        // dL/d_nat = P_inv * dL/d_seq
+                        // Permute d_eyes Natural -> Sequency (Before SLM Backward)
+                        // Input d_eyes is dL/d(Natural). We need dL/d(Sequency) for SLM.
                         if (use_sequency_) {
-        if constexpr (std::is_same_v<T, float>) {
-            #ifdef DREIDEL_ARCH_AVX2
-                permute_avx2(buf_mag.data(), d_eyes.data(), nat_map_ptr, in_channels_);
-            #else
-                for(size_t i=0; i<in_channels_; ++i) buf_mag[i] = d_eyes[nat_map_ptr[i]];
-            #endif
-        } else {
-            for(size_t i=0; i<in_channels_; ++i) buf_mag[i] = d_eyes[nat_map_ptr[i]];
-        }
-                            std::memcpy(d_eyes.data(), buf_mag.data(), in_channels_ * sizeof(T));
+                            if constexpr (std::is_same_v<T, float>) {
+                                #ifdef DREIDEL_ARCH_AVX2
+                                    permute_avx2(buf_temp.data(), d_eyes.data(), seq_map_ptr, in_channels_);
+                                #else
+                                    for(size_t k=0; k<in_channels_; ++k) buf_temp[k] = d_eyes[seq_map_ptr[k]];
+                                #endif
+                            } else {
+                                for(size_t k=0; k<in_channels_; ++k) buf_temp[k] = d_eyes[seq_map_ptr[k]];
+                            }
+                            std::memcpy(d_eyes.data(), buf_temp.data(), in_channels_ * sizeof(T));
+                        }
+
+                        // Zenith-RIG Backward
+                        if (use_slm_) {
+                            // d_eyes is dL/d(u * Gate).
+                            // buf_eyes is `u`.
+                            // final_gate is `Gate`.
+
+                            // Initialize d_est buffer to 0
+                            std::fill(d_est.begin(), d_est.end(), 0.0f);
+
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T g = final_gate[c];
+                                T u = buf_eyes[c];
+
+                                // 1. Gradient to Final Gate
+                                // dL/dGate = dL/d(u*g) * u
+                                d_gate[c] = d_eyes[c] * u;
+
+                                // 2. Update d_eyes to hold dL/du partial (dL/d(u*g) * g)
+                                d_eyes[c] = d_eyes[c] * g;
+                            }
+
+                            // BPTT Loop (k = iterations-1 down to 0)
+                            for(int k = (int)rig_iterations_ - 1; k >= 0; --k) {
+                                const T* curr_gate = buf_gate.data() + k * in_channels_;
+                                const T* curr_hidden = buf_hidden.data() + k * in_channels_;
+                                const T* curr_est = buf_est.data() + k * in_channels_;
+                                const T* est_0 = buf_est.data(); // Always Input Mag
+
+                                // dL/dGate[k] is in d_gate.
+                                // Note: For k < last, d_gate comes from next_est.
+                                // Est[k+1] = Est[0] * Gate[k].
+                                // dL/dGate[k] += dL/dEst[k+1] * Est[0].
+                                if (k < (int)rig_iterations_ - 1) {
+                                    T* d_next_est = d_est.data() + (k+1) * in_channels_;
+                                    for(size_t c=0; c<in_channels_; ++c) {
+                                        d_gate[c] += d_next_est[c] * est_0[c];
+                                    }
+                                }
+
+                                // Backprop Gate -> Logits -> Layer 2 -> Hidden
+                                std::fill(d_hidden.begin(), d_hidden.end(), 0.0f);
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    T g = curr_gate[c];
+                                    T d_g = d_gate[c];
+                                    T d_z2 = d_g * g * (1.0f - g); // Sigmoid deriv
+
+                                    local_g_slm_b2[c] += d_z2;
+
+                                    T* w_g = local_g_slm_w2.data() + c * 5;
+                                    const T* w_fwd = slm_w2_ptr + c * 5;
+
+                                    if (c >= 2) { w_g[0] += d_z2 * curr_hidden[c-2]; d_hidden[c-2] += d_z2 * w_fwd[0]; }
+                                    if (c >= 1) { w_g[1] += d_z2 * curr_hidden[c-1]; d_hidden[c-1] += d_z2 * w_fwd[1]; }
+                                    w_g[2] += d_z2 * curr_hidden[c]; d_hidden[c] += d_z2 * w_fwd[2];
+                                    if (c + 1 < in_channels_) { w_g[3] += d_z2 * curr_hidden[c+1]; d_hidden[c+1] += d_z2 * w_fwd[3]; }
+                                    if (c + 2 < in_channels_) { w_g[4] += d_z2 * curr_hidden[c+2]; d_hidden[c+2] += d_z2 * w_fwd[4]; }
+                                }
+
+                                // Backprop Hidden -> Layer 1 -> Input(Est[k])
+                                T* d_curr_est = d_est.data() + k * in_channels_;
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    T d_h = d_hidden[c];
+                                    if (curr_hidden[c] <= 0) d_h = 0; // ReLU
+
+                                    local_g_slm_b1[c] += d_h;
+
+                                    T* w_g = local_g_slm_w1.data() + c * 5;
+                                    const T* w_fwd = slm_w1_ptr + c * 5;
+
+                                    if (c >= 2) { w_g[0] += d_h * curr_est[c-2]; d_curr_est[c-2] += d_h * w_fwd[0]; }
+                                    if (c >= 1) { w_g[1] += d_h * curr_est[c-1]; d_curr_est[c-1] += d_h * w_fwd[1]; }
+                                    w_g[2] += d_h * curr_est[c]; d_curr_est[c] += d_h * w_fwd[2];
+                                    if (c + 1 < in_channels_) { w_g[3] += d_h * curr_est[c+1]; d_curr_est[c+1] += d_h * w_fwd[3]; }
+                                    if (c + 2 < in_channels_) { w_g[4] += d_h * curr_est[c+2]; d_curr_est[c+2] += d_h * w_fwd[4]; }
+                                }
+
+                                // Reset d_gate for next iteration
+                                std::fill(d_gate.begin(), d_gate.end(), 0.0f);
+                            }
+
+                            // Propagate dL/dEst[k] to dL/dEst[0] (Input Mag)
+                            T* d_est_0 = d_est.data();
+                            for(size_t k=0; k<rig_iterations_; ++k) {
+                                const T* gate_k = buf_gate.data() + k * in_channels_;
+                                const T* d_est_k_plus_1 = d_est.data() + (k+1) * in_channels_;
+
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    d_est_0[c] += d_est_k_plus_1[c] * gate_k[c];
+                                }
+                            }
+
+                            // Finally: d_eyes += dL/dMag * sgn(u)
+                            // dL/dMag is in d_est[0].
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T u = buf_eyes[c];
+                                T sgn = (u > 0) ? 1.0f : ((u < 0) ? -1.0f : 0.0f);
+                                d_eyes[c] += d_est_0[c] * sgn;
+                            }
+                        }
+
+                        // Permute d_eyes Sequency -> Natural (for IFWHT)
+                        if (use_sequency_) {
+                            if constexpr (std::is_same_v<T, float>) {
+                                #ifdef DREIDEL_ARCH_AVX2
+                                    permute_avx2(buf_temp.data(), d_eyes.data(), nat_map_ptr, in_channels_);
+                                #else
+                                    for(size_t i=0; i<in_channels_; ++i) buf_temp[i] = d_eyes[nat_map_ptr[i]];
+                                #endif
+                            } else {
+                                for(size_t i=0; i<in_channels_; ++i) buf_temp[i] = d_eyes[nat_map_ptr[i]];
+                            }
+                            std::memcpy(d_eyes.data(), buf_temp.data(), in_channels_ * sizeof(T));
                         }
 
                         algo::WHT::fwht_1d(d_eyes.data(), in_channels_);
