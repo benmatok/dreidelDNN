@@ -42,7 +42,7 @@ BenchmarkResult run_benchmark(size_t C, bool use_sequency) {
     size_t N = 4;
     size_t H = 64;
     size_t W = 64;
-    size_t steps = 50; // Short training loop
+    size_t steps = 200; // Longer training loop for RIG convergence
 
     // Create Layer
     // ZenithBlock(in, out, k, spec, ifwht, dilated, gating, stride, upscale, init, slm, sequency)
