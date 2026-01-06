@@ -7,6 +7,7 @@
 #include "../hal/ops.hpp"
 #include "../hal/x86.hpp"
 #include "../algo/WHT.hpp"
+#include "../algo/Sequency.hpp"
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -27,9 +28,9 @@ public:
 
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim,
                 bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1,
-                const std::string& init_scheme = "he", bool use_slm = false)
+                const std::string& init_scheme = "he", bool use_slm = false, bool use_sequency = false)
         : in_channels_(in_channels), out_channels_(out_channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
-          use_ifwht_(use_ifwht), use_gating_(use_gating), stride_(stride), upscale_(upscale), use_slm_(use_slm),
+          use_ifwht_(use_ifwht), use_gating_(use_gating), stride_(stride), upscale_(upscale), use_slm_(use_slm), use_sequency_(use_sequency),
           packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           spectral_scales_({1, in_channels}),
           mixing_weights_({3, in_channels}),
@@ -72,11 +73,28 @@ public:
         size_t groups = 32;
         if (out_channels_ % groups != 0) groups = 1;
         group_norm_ = std::make_unique<GroupNorm<T>>(groups, out_channels_);
+
+        // Sequency Map
+        if (use_sequency_) {
+            sequency_map_ = algo::Sequency::compute_to_natural_map(in_channels_);
+            // Inverse map: To get back to Natural from Sequency
+            // sequency_map_[k] gives Natural index for k-th Sequency.
+            // So if we have Seq buffer Y, and want Natural X:
+            // X[sequency_map_[k]] = Y[k].
+            // Or if we want to copy: X[i] = Y[inv_map[i]].
+            // Since we permute in place using temp buffer:
+            // Seq -> Nat:
+            // Temp[map[k]] = Buf[k] (Scatter)
+            // Or: Temp[i] = Buf[inv_map[i]] (Gather)
+            // It's cleaner to have inv_map.
+            // natural_map_[i] = Sequency Index of i-th Natural.
+            natural_map_ = algo::Sequency::compute_to_sequency_map(in_channels_);
+        }
     }
 
     ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim,
-                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, bool use_slm = false)
-        : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1, "he", use_slm) {}
+                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, bool use_slm = false, bool use_sequency = false)
+        : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1, "he", use_slm, use_sequency) {}
 
     void initialize(const std::string& scheme) {
         // 1. Packed Weights (Eyes)
@@ -123,6 +141,14 @@ public:
 
     void set_training(bool training) {
         training_ = training;
+    }
+
+    void set_sequency_ordering(bool use) {
+        use_sequency_ = use;
+        if (use_sequency_ && sequency_map_.empty()) {
+            sequency_map_ = algo::Sequency::compute_to_natural_map(in_channels_);
+            natural_map_ = algo::Sequency::compute_to_sequency_map(in_channels_);
+        }
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
@@ -179,7 +205,10 @@ public:
         {
             std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
             std::vector<T, core::AlignedAllocator<T>> buf_mag; // Alloc only if needed
-            if (use_slm_) buf_mag.resize(in_channels_);
+            if (use_slm_ || use_sequency_) buf_mag.resize(in_channels_);
+
+            const uint16_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
+            const uint16_t* nat_map_ptr = use_sequency_ ? natural_map_.data() : nullptr;
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
@@ -237,6 +266,19 @@ public:
 
                         algo::WHT::fwht_1d(buf_in.data(), in_channels_);
 
+                        // Permute Natural -> Sequency
+                        if (use_sequency_) {
+                            // buf_in is Natural.
+                            // We want buf_in to be Sequency.
+                            // buf_seq[k] = buf_nat[map[k]]
+                            // Use buf_mag as temp
+                            for(size_t k=0; k<in_channels_; ++k) {
+                                buf_mag[k] = buf_in[seq_map_ptr[k]];
+                            }
+                            // Copy back
+                            std::memcpy(buf_in.data(), buf_mag.data(), in_channels_ * sizeof(T));
+                        }
+
                         // SLM Gating
                         if (use_slm_) {
                             // 1. Compute Mag
@@ -265,6 +307,18 @@ public:
                                 // 3. Multiply
                                 buf_in[c] *= gate;
                             }
+                        }
+
+                        // Permute Sequency -> Natural
+                        if (use_sequency_) {
+                            // buf_in is Sequency (modified by SLM)
+                            // We want buf_in to be Natural.
+                            // buf_nat[i] = buf_seq[nat_map[i]]
+                            // Use buf_mag as temp
+                            for(size_t i=0; i<in_channels_; ++i) {
+                                buf_mag[i] = buf_in[nat_map_ptr[i]];
+                            }
+                            std::memcpy(buf_in.data(), buf_mag.data(), in_channels_ * sizeof(T));
                         }
 
                         if (apply_dropout) {
@@ -475,11 +529,16 @@ public:
             std::vector<T, core::AlignedAllocator<T>> buf_mag;
             std::vector<T, core::AlignedAllocator<T>> buf_gate;
             std::vector<T, core::AlignedAllocator<T>> d_gate;
-            if (use_slm_) {
+            if (use_slm_ || use_sequency_) {
                 buf_mag.resize(in_channels_);
+            }
+            if (use_slm_) {
                 buf_gate.resize(in_channels_);
                 d_gate.resize(in_channels_);
             }
+
+            const uint16_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
+            const uint16_t* nat_map_ptr = use_sequency_ ? natural_map_.data() : nullptr;
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
@@ -499,6 +558,12 @@ public:
 
                         algo::WHT::fwht_1d(buf_eyes.data(), in_channels_);
 
+                        // Permute Natural -> Sequency (Forward Logic)
+                        if (use_sequency_) {
+                            for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = buf_eyes[seq_map_ptr[k]];
+                            std::memcpy(buf_eyes.data(), buf_mag.data(), in_channels_ * sizeof(T));
+                        }
+
                         // SLM Forward Recompute
                         if (use_slm_) {
                             for(size_t c=0; c<in_channels_; ++c) buf_mag[c] = std::abs(buf_eyes[c]);
@@ -516,6 +581,48 @@ public:
                                 buf_eyes[c] *= buf_gate[c];
                             }
                         }
+
+                        // Note: buf_eyes is now in Sequency order if use_sequency_ is true
+                        // But wait! In forward pass we permuted back to Natural before IFWHT/Scale?
+                        // Forward: FWHT -> P -> SLM -> P_inv -> Scale -> Mix -> IFWHT.
+                        // Wait, my Forward code was:
+                        // FWHT -> P -> SLM -> P_inv -> Scale -> Mix -> IFWHT.
+                        // Here (backward loop) we are recomputing forward path to get `buf_eyes` (aka `u`) for derivative.
+                        // We did: FWHT -> P -> SLM.
+                        // `buf_eyes` now holds `u_seq * gate`.
+                        // But we need to match what's coming from `d_eyes` (backprop).
+                        // Let's trace `d_eyes` flow backwards.
+
+                        // Incoming `d_eyes` is `dL/dy`. y = Output of IFWHT?
+                        // No.
+                        // In backward loop before this block:
+                        // d_eyes[c] was populated from `d_mixer` using `w_C`, `w_L` etc.
+                        // These `w` operate on `buf_in` from forward.
+                        // `buf_in` in forward was `FWHT(x) -> P -> SLM -> P_inv -> Scale`.
+                        // So `buf_in` (at mixing point) is Natural order.
+                        // So `d_eyes` (at start of backprop loop) is Natural order.
+
+                        // Then we do:
+                        // d_eyes[c] *= scale_ptr[c] (Propagate through scale)
+                        // Then `d_eyes` is dL/d(P_inv(SLM_out)).
+                        // We need to propagate through P_inv.
+                        // P_inv: Seq -> Nat.
+                        // y = P_inv(x). x = P(y).
+                        // dL/dx = P_inv^T * dL/dy?
+                        // P_inv corresponds to "Gather from Nat Map".
+                        // buf_nat[i] = buf_seq[nat_map[i]].
+                        // Gradient: dL/dbuf_seq[k] += dL/dbuf_nat[i] where nat_map[i] == k.
+                        // Or simply: dL/d_seq = P * dL/d_nat. (Since P_inv is permutation, transpose is inverse = P).
+                        // So we need to apply P to d_eyes.
+
+                        // Permute d_eyes Natural -> Sequency
+                        if (use_sequency_) {
+                            for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = d_eyes[seq_map_ptr[k]];
+                            std::memcpy(d_eyes.data(), buf_mag.data(), in_channels_ * sizeof(T));
+                        }
+
+                        // Now `d_eyes` is in Sequency order.
+                        // `buf_eyes` (recomputed) is also in Sequency order (since we did FWHT -> P -> SLM).
 
                         if (training_ && spectral_dropout_rate_ > 0.0f) {
                             for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] *= (dropout_mask_[c] * dropout_scale);
@@ -562,15 +669,8 @@ public:
 
                         // SLM Backward
                         if (use_slm_) {
-                            // d_eyes is now dL/d(WHT(x) * Gate)
-                            // Let u = WHT(x) (Recomputed earlier into buf_mag? No, buf_mag is abs(u))
-                            // We need u.
-                            // buf_eyes was modified in forward recompute.
-                            // We need to recover `u`.
-                            // `buf_eyes` currently holds `u * gate * dropout * scale` (at start of this block it held `u * gate`)
-                            // Wait, logic above modified `buf_eyes` in-place.
-                            // It's `u * gate`.
-                            // So `u = buf_eyes / gate`.
+                            // d_eyes is dL/d(u_seq * gate).
+                            // buf_eyes is u_seq * gate.
 
                             for(size_t c=0; c<in_channels_; ++c) {
                                 // dL/dGate = dL/d(u*g) * u
@@ -638,6 +738,13 @@ public:
                                 // d_eyes[c] = d_out * g + d_u_branch2
                                 d_eyes[c] = d_eyes[c] * g + d_u_branch2;
                             }
+                        }
+
+                        // Permute Sequency -> Natural (Backprop through P)
+                        // dL/d_nat = P_inv * dL/d_seq
+                        if (use_sequency_) {
+                            for(size_t i=0; i<in_channels_; ++i) buf_mag[i] = d_eyes[nat_map_ptr[i]];
+                            std::memcpy(d_eyes.data(), buf_mag.data(), in_channels_ * sizeof(T));
                         }
 
                         algo::WHT::fwht_1d(d_eyes.data(), in_channels_);
@@ -728,8 +835,12 @@ private:
     size_t stride_;
     size_t upscale_;
     bool use_slm_;
+    bool use_sequency_ = false;
     float spectral_dropout_rate_ = 0.1f;
     bool training_ = true;
+
+    std::vector<uint16_t> sequency_map_;
+    std::vector<uint16_t> natural_map_;
 
     Tensor<T> packed_weights_;
     Tensor<T> spectral_scales_;
