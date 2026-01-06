@@ -35,15 +35,19 @@ public:
           spectral_scales_({1, in_channels}),
           mixing_weights_({3, in_channels}),
           oracle_projection_({1, in_channels}),
-          slm_weights_({5, in_channels}),
-          slm_bias_({1, in_channels}),
+          slm_weights1_({5, in_channels}),
+          slm_bias1_({1, in_channels}),
+          slm_weights2_({5, in_channels}),
+          slm_bias2_({1, in_channels}),
 
           grad_packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           grad_spectral_scales_({1, in_channels}),
           grad_mixing_weights_({3, in_channels}),
           grad_oracle_projection_({1, in_channels}),
-          grad_slm_weights_({5, in_channels}),
-          grad_slm_bias_({1, in_channels}),
+          grad_slm_weights1_({5, in_channels}),
+          grad_slm_bias1_({1, in_channels}),
+          grad_slm_weights2_({5, in_channels}),
+          grad_slm_bias2_({1, in_channels}),
           rng_(std::random_device{}())
     {
         if ((in_channels_ & (in_channels_ - 1)) != 0) {
@@ -55,10 +59,18 @@ public:
         // Gating
         oracle_projection_.random(-1.0, 1.0);
 
-        // SLM Init
+        // SLM Init (DSG: Denoising Signal Gate)
         if (use_slm_) {
-            slm_weights_.random(-0.01, 0.01);
-            slm_bias_.fill(0.0); // Bias slightly positive? Prompt: "zero (or slightly positive)". 0.0 is sigmoid(0)=0.5.
+            // Layer 1: Energy Integration & Thresholding
+            // Kaiming Normal for ReLU
+            T stddev = std::sqrt(2.0f / (5.0f)); // Fan-in is 5 (kernel size) * 1 (depthwise)
+            slm_weights1_.random(0, stddev);
+            slm_bias1_.fill(-1.0f); // Learnable Noise Floor (-sigma)
+
+            // Layer 2: Gate Smoothing
+            // Xavier for Sigmoid (or Kaiming if we consider it linear until sigmoid)
+            slm_weights2_.random(0, stddev);
+            slm_bias2_.fill(0.0f);
         }
 
         // Zero Grads
@@ -66,8 +78,10 @@ public:
         grad_spectral_scales_.fill(0);
         grad_mixing_weights_.fill(0);
         grad_oracle_projection_.fill(0);
-        grad_slm_weights_.fill(0);
-        grad_slm_bias_.fill(0);
+        grad_slm_weights1_.fill(0);
+        grad_slm_bias1_.fill(0);
+        grad_slm_weights2_.fill(0);
+        grad_slm_bias2_.fill(0);
 
         // 2. GroupNorm (Hardcoded Standard)
         size_t groups = 32;
@@ -189,8 +203,10 @@ public:
         const T* scale_ptr = spectral_scales_.data();
         const T* mix_w = mixing_weights_.data();
 
-        const T* slm_w_ptr = use_slm_ ? slm_weights_.data() : nullptr;
-        const T* slm_b_ptr = use_slm_ ? slm_bias_.data() : nullptr;
+        const T* slm_w1_ptr = use_slm_ ? slm_weights1_.data() : nullptr;
+        const T* slm_b1_ptr = use_slm_ ? slm_bias1_.data() : nullptr;
+        const T* slm_w2_ptr = use_slm_ ? slm_weights2_.data() : nullptr;
+        const T* slm_b2_ptr = use_slm_ ? slm_bias2_.data() : nullptr;
 
         // Inverted Dropout Scale
         T dropout_scale = (apply_dropout) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
@@ -200,7 +216,10 @@ public:
         {
             std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
             std::vector<T, core::AlignedAllocator<T>> buf_mag; // Alloc only if needed
+            std::vector<T, core::AlignedAllocator<T>> buf_hidden; // For DSG
+
             if (use_slm_ || use_sequency_) buf_mag.resize(in_channels_);
+            if (use_slm_) buf_hidden.resize(in_channels_);
 
             const int32_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
             const int32_t* nat_map_ptr = use_sequency_ ? natural_map_.data() : nullptr;
@@ -280,32 +299,43 @@ public:
                             std::memcpy(buf_in.data(), buf_mag.data(), in_channels_ * sizeof(T));
                         }
 
-                        // SLM Gating
+                        // SLM Gating (Zenith-DSG)
                         if (use_slm_) {
                             // 1. Compute Mag
                             for(size_t c=0; c<in_channels_; ++c) {
                                 buf_mag[c] = std::abs(buf_in[c]);
                             }
 
-                            // 2. Conv1D K=5 & Sigmoid & Apply
-                            // Padding: Zero padding
+                            // 2. Layer 1: Energy Integration (Conv1D + Bias1 + ReLU)
                             for(size_t c=0; c<in_channels_; ++c) {
-                                T gate_val = slm_b_ptr[c];
+                                T val = slm_b1_ptr[c];
+                                const T* w = slm_w1_ptr + c * 5;
 
-                                // Unrolled K=5 loop: -2, -1, 0, 1, 2
-                                // w index: c*5 + k_offset
-                                const T* w_c = slm_w_ptr + c * 5;
+                                if (c >= 2) val += w[0] * buf_mag[c-2];
+                                if (c >= 1) val += w[1] * buf_mag[c-1];
+                                val += w[2] * buf_mag[c];
+                                if (c + 1 < in_channels_) val += w[3] * buf_mag[c+1];
+                                if (c + 2 < in_channels_) val += w[4] * buf_mag[c+2];
 
-                                if (c >= 2) gate_val += w_c[0] * buf_mag[c-2];
-                                if (c >= 1) gate_val += w_c[1] * buf_mag[c-1];
-                                gate_val += w_c[2] * buf_mag[c];
-                                if (c + 1 < in_channels_) gate_val += w_c[3] * buf_mag[c+1];
-                                if (c + 2 < in_channels_) gate_val += w_c[4] * buf_mag[c+2];
+                                // ReLU
+                                buf_hidden[c] = (val > 0) ? val : 0;
+                            }
 
-                                // Sigmoid: 1 / (1 + exp(-x))
-                                T gate = 1.0f / (1.0f + std::exp(-gate_val));
+                            // 3. Layer 2: Gate Smoothing (Conv1D + Bias2 + Sigmoid) & Apply
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T val = slm_b2_ptr[c];
+                                const T* w = slm_w2_ptr + c * 5;
 
-                                // 3. Multiply
+                                if (c >= 2) val += w[0] * buf_hidden[c-2];
+                                if (c >= 1) val += w[1] * buf_hidden[c-1];
+                                val += w[2] * buf_hidden[c];
+                                if (c + 1 < in_channels_) val += w[3] * buf_hidden[c+1];
+                                if (c + 2 < in_channels_) val += w[4] * buf_hidden[c+2];
+
+                                // Sigmoid
+                                T gate = 1.0f / (1.0f + std::exp(-val));
+
+                                // 4. Apply Gate
                                 buf_in[c] *= gate;
                             }
                         }
@@ -420,11 +450,15 @@ public:
         T* gw_C = g_mix + in_channels_;
         T* gw_R = g_mix + 2 * in_channels_;
 
-        T* g_slm_w = use_slm_ ? grad_slm_weights_.data() : nullptr;
-        T* g_slm_b = use_slm_ ? grad_slm_bias_.data() : nullptr;
+        T* g_slm_w1 = use_slm_ ? grad_slm_weights1_.data() : nullptr;
+        T* g_slm_b1 = use_slm_ ? grad_slm_bias1_.data() : nullptr;
+        T* g_slm_w2 = use_slm_ ? grad_slm_weights2_.data() : nullptr;
+        T* g_slm_b2 = use_slm_ ? grad_slm_bias2_.data() : nullptr;
 
-        const T* slm_w_ptr = use_slm_ ? slm_weights_.data() : nullptr;
-        const T* slm_b_ptr = use_slm_ ? slm_bias_.data() : nullptr;
+        const T* slm_w1_ptr = use_slm_ ? slm_weights1_.data() : nullptr;
+        const T* slm_b1_ptr = use_slm_ ? slm_bias1_.data() : nullptr;
+        const T* slm_w2_ptr = use_slm_ ? slm_weights2_.data() : nullptr;
+        const T* slm_b2_ptr = use_slm_ ? slm_bias2_.data() : nullptr;
 
         // Lazy Norm: Norm is fused, so factor here is 1.0 (or we need to account for it if backward needs unscaling?
         // Backward of y = IFWHT(x) * (1/N) is x_grad = FWHT(y_grad) * (1/N).
@@ -520,12 +554,13 @@ public:
             std::vector<T> local_gw_R(in_channels_, 0);
 
             // SLM Local Grads
-            // weights: 5 * in_channels. bias: in_channels.
-            std::vector<T> local_g_slm_w;
-            std::vector<T> local_g_slm_b;
+            std::vector<T> local_g_slm_w1, local_g_slm_b1;
+            std::vector<T> local_g_slm_w2, local_g_slm_b2;
             if (use_slm_) {
-                local_g_slm_w.resize(in_channels_ * 5, 0.0);
-                local_g_slm_b.resize(in_channels_, 0.0);
+                local_g_slm_w1.resize(in_channels_ * 5, 0.0);
+                local_g_slm_b1.resize(in_channels_, 0.0);
+                local_g_slm_w2.resize(in_channels_ * 5, 0.0);
+                local_g_slm_b2.resize(in_channels_, 0.0);
             }
 
             std::vector<T, core::AlignedAllocator<T>> buf_grad(std::max(in_channels_, out_channels_));
@@ -534,14 +569,19 @@ public:
 
             // SLM temp buffers
             std::vector<T, core::AlignedAllocator<T>> buf_mag;
-            std::vector<T, core::AlignedAllocator<T>> buf_gate;
-            std::vector<T, core::AlignedAllocator<T>> d_gate;
+            std::vector<T, core::AlignedAllocator<T>> buf_hidden; // Hidden layer activations
+            std::vector<T, core::AlignedAllocator<T>> buf_gate;   // Sigmoid output
+            std::vector<T, core::AlignedAllocator<T>> d_gate;     // Gradient w.r.t Gate
+            std::vector<T, core::AlignedAllocator<T>> d_hidden;   // Gradient w.r.t Hidden
+
             if (use_slm_ || use_sequency_) {
                 buf_mag.resize(in_channels_);
             }
             if (use_slm_) {
+                buf_hidden.resize(in_channels_);
                 buf_gate.resize(in_channels_);
                 d_gate.resize(in_channels_);
+                d_hidden.resize(in_channels_);
             }
 
     const int32_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
@@ -579,20 +619,35 @@ public:
                             std::memcpy(buf_eyes.data(), buf_mag.data(), in_channels_ * sizeof(T));
                         }
 
-                        // SLM Forward Recompute
+                        // SLM Forward Recompute (DSG)
                         if (use_slm_) {
+                            // 1. Mag
                             for(size_t c=0; c<in_channels_; ++c) buf_mag[c] = std::abs(buf_eyes[c]);
+
+                            // 2. Layer 1 (Hidden)
                             for(size_t c=0; c<in_channels_; ++c) {
-                                T val = slm_b_ptr[c];
-                                const T* w_c = slm_w_ptr + c * 5;
-                                if (c >= 2) val += w_c[0] * buf_mag[c-2];
-                                if (c >= 1) val += w_c[1] * buf_mag[c-1];
-                                val += w_c[2] * buf_mag[c];
-                                if (c + 1 < in_channels_) val += w_c[3] * buf_mag[c+1];
-                                if (c + 2 < in_channels_) val += w_c[4] * buf_mag[c+2];
+                                T val = slm_b1_ptr[c];
+                                const T* w = slm_w1_ptr + c * 5;
+                                if (c >= 2) val += w[0] * buf_mag[c-2];
+                                if (c >= 1) val += w[1] * buf_mag[c-1];
+                                val += w[2] * buf_mag[c];
+                                if (c + 1 < in_channels_) val += w[3] * buf_mag[c+1];
+                                if (c + 2 < in_channels_) val += w[4] * buf_mag[c+2];
+                                buf_hidden[c] = (val > 0) ? val : 0;
+                            }
+
+                            // 3. Layer 2 (Gate)
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T val = slm_b2_ptr[c];
+                                const T* w = slm_w2_ptr + c * 5;
+                                if (c >= 2) val += w[0] * buf_hidden[c-2];
+                                if (c >= 1) val += w[1] * buf_hidden[c-1];
+                                val += w[2] * buf_hidden[c];
+                                if (c + 1 < in_channels_) val += w[3] * buf_hidden[c+1];
+                                if (c + 2 < in_channels_) val += w[4] * buf_hidden[c+2];
                                 buf_gate[c] = 1.0f / (1.0f + std::exp(-val));
 
-                                // Apply Gate
+                                // Apply
                                 buf_eyes[c] *= buf_gate[c];
                             }
                         }
@@ -690,75 +745,67 @@ public:
                             for(size_t c=0; c<in_channels_; ++c) d_eyes[c] *= (dropout_mask_[c] * dropout_scale);
                         }
 
-                        // SLM Backward
+                        // SLM Backward (DSG)
                         if (use_slm_) {
                             // d_eyes is dL/d(u_seq * gate).
                             // buf_eyes is u_seq * gate.
 
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                // dL/dGate = dL/d(u*g) * u
-                                // dL/du_branch1 = dL/d(u*g) * g
+                            std::fill(d_hidden.begin(), d_hidden.end(), 0);
+                            std::fill(d_gate.begin(), d_gate.end(), 0); // Reuse d_gate for dMag
 
-                                T g = buf_gate[c];
-                                T u = (g > 1e-9) ? buf_eyes[c] / g : 0; // Recover u
-
-                                T d_out = d_eyes[c];
-
-                                // Branch 1: Through multiplication
-                                T d_u = d_out * g;
-
-                                // Branch 2: Through Gate
-                                // dGate = d_out * u
-                                T d_g = d_out * u;
-
-                                // Sigmoid derivative: g * (1-g)
-                                T d_z = d_g * g * (1.0f - g);
-
-                                // Backprop Conv1D
-                                // z[c] = bias[c] + sum(w[k,c] * mag[c+k-2])
-                                // dL/dBias[c] += d_z
-                                // dL/dW[k,c] += d_z * mag[c+k-2]
-                                // dL/dMag[n] += d_z * w[k,c] (where n = c+k-2)
-
-                                local_g_slm_b[c] += d_z;
-
-                                // We need to accumulate dL/dMag. Use d_gate buffer for dMag.
-                                // Initialize d_gate to 0 outside loop? Yes.
-                            }
-
-                            std::fill(d_gate.begin(), d_gate.end(), 0);
-
-                            // Conv Backward (Weights & Input)
+                            // 1. Backprop Gate & Layer 2
                             for(size_t c=0; c<in_channels_; ++c) {
                                 T g = buf_gate[c];
                                 T u = (g > 1e-9) ? buf_eyes[c] / g : 0;
+
+                                // dL/dGate = dL/dY * u
                                 T d_g = d_eyes[c] * u;
-                                T d_z = d_g * g * (1.0f - g);
 
-                                T* w_c = local_g_slm_w.data() + c * 5;
-                                const T* w_fwd = slm_w_ptr + c * 5;
+                                // dSigmoid: g * (1-g)
+                                T d_z2 = d_g * g * (1.0f - g);
 
-                                if (c >= 2) { w_c[0] += d_z * buf_mag[c-2]; d_gate[c-2] += d_z * w_fwd[0]; }
-                                if (c >= 1) { w_c[1] += d_z * buf_mag[c-1]; d_gate[c-1] += d_z * w_fwd[1]; }
-                                w_c[2] += d_z * buf_mag[c]; d_gate[c] += d_z * w_fwd[2];
-                                if (c + 1 < in_channels_) { w_c[3] += d_z * buf_mag[c+1]; d_gate[c+1] += d_z * w_fwd[3]; }
-                                if (c + 2 < in_channels_) { w_c[4] += d_z * buf_mag[c+2]; d_gate[c+2] += d_z * w_fwd[4]; }
+                                local_g_slm_b2[c] += d_z2;
+
+                                // Backprop L2 to Weights & Hidden
+                                T* w_g = local_g_slm_w2.data() + c * 5;
+                                const T* w_fwd = slm_w2_ptr + c * 5;
+
+                                if (c >= 2) { w_g[0] += d_z2 * buf_hidden[c-2]; d_hidden[c-2] += d_z2 * w_fwd[0]; }
+                                if (c >= 1) { w_g[1] += d_z2 * buf_hidden[c-1]; d_hidden[c-1] += d_z2 * w_fwd[1]; }
+                                w_g[2] += d_z2 * buf_hidden[c]; d_hidden[c] += d_z2 * w_fwd[2];
+                                if (c + 1 < in_channels_) { w_g[3] += d_z2 * buf_hidden[c+1]; d_hidden[c+1] += d_z2 * w_fwd[3]; }
+                                if (c + 2 < in_channels_) { w_g[4] += d_z2 * buf_hidden[c+2]; d_hidden[c+2] += d_z2 * w_fwd[4]; }
                             }
 
-                            // Backprop Mag -> u
-                            // Mag = |u|
-                            // dMag/du = sgn(u)
-                            // dL/du += dL/dMag * sgn(u)
+                            // 2. Backprop Hidden (ReLU) & Layer 1
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T d_h = d_hidden[c];
+                                // ReLU derivative: 1 if hidden > 0, else 0
+                                if (buf_hidden[c] <= 0) d_h = 0;
+
+                                T d_z1 = d_h;
+                                local_g_slm_b1[c] += d_z1;
+
+                                T* w_g = local_g_slm_w1.data() + c * 5;
+                                const T* w_fwd = slm_w1_ptr + c * 5;
+
+                                if (c >= 2) { w_g[0] += d_z1 * buf_mag[c-2]; d_gate[c-2] += d_z1 * w_fwd[0]; }
+                                if (c >= 1) { w_g[1] += d_z1 * buf_mag[c-1]; d_gate[c-1] += d_z1 * w_fwd[1]; }
+                                w_g[2] += d_z1 * buf_mag[c]; d_gate[c] += d_z1 * w_fwd[2];
+                                if (c + 1 < in_channels_) { w_g[3] += d_z1 * buf_mag[c+1]; d_gate[c+1] += d_z1 * w_fwd[3]; }
+                                if (c + 2 < in_channels_) { w_g[4] += d_z1 * buf_mag[c+2]; d_gate[c+2] += d_z1 * w_fwd[4]; }
+                            }
+
+                            // 3. Backprop Mag -> u
                             for(size_t c=0; c<in_channels_; ++c) {
                                 T g = buf_gate[c];
                                 T u = (g > 1e-9) ? buf_eyes[c] / g : 0;
                                 T sgn = (u > 0) ? 1.0f : ((u < 0) ? -1.0f : 0.0f);
 
+                                // dL/dMag (in d_gate) * sgn(u)
                                 T d_u_branch2 = d_gate[c] * sgn;
 
-                                // Combine with Branch 1
-                                // d_eyes was dL/dy. Now it becomes dL/du.
-                                // d_eyes[c] = d_out * g + d_u_branch2
+                                // Combine with Branch 1 (dL/dY * g)
                                 d_eyes[c] = d_eyes[c] * g + d_u_branch2;
                             }
                         }
@@ -821,8 +868,10 @@ public:
                 for(size_t i=0; i<local_gw_C.size(); ++i) gw_C[i] += local_gw_C[i];
                 for(size_t i=0; i<local_gw_R.size(); ++i) gw_R[i] += local_gw_R[i];
                 if (use_slm_) {
-                    for(size_t i=0; i<local_g_slm_w.size(); ++i) g_slm_w[i] += local_g_slm_w[i];
-                    for(size_t i=0; i<local_g_slm_b.size(); ++i) g_slm_b[i] += local_g_slm_b[i];
+                    for(size_t i=0; i<local_g_slm_w1.size(); ++i) g_slm_w1[i] += local_g_slm_w1[i];
+                    for(size_t i=0; i<local_g_slm_b1.size(); ++i) g_slm_b1[i] += local_g_slm_b1[i];
+                    for(size_t i=0; i<local_g_slm_w2.size(); ++i) g_slm_w2[i] += local_g_slm_w2[i];
+                    for(size_t i=0; i<local_g_slm_b2.size(); ++i) g_slm_b2[i] += local_g_slm_b2[i];
                 }
             }
         }
@@ -834,8 +883,10 @@ public:
         std::vector<Tensor<T>*> params = {&packed_weights_, &spectral_scales_, &mixing_weights_};
         if (use_gating_) params.push_back(&oracle_projection_);
         if (use_slm_) {
-            params.push_back(&slm_weights_);
-            params.push_back(&slm_bias_);
+            params.push_back(&slm_weights1_);
+            params.push_back(&slm_bias1_);
+            params.push_back(&slm_weights2_);
+            params.push_back(&slm_bias2_);
         }
         auto p = group_norm_->parameters();
         params.insert(params.end(), p.begin(), p.end());
@@ -846,8 +897,10 @@ public:
         std::vector<Tensor<T>*> grads = {&grad_packed_weights_, &grad_spectral_scales_, &grad_mixing_weights_};
         if (use_gating_) grads.push_back(&grad_oracle_projection_);
         if (use_slm_) {
-            grads.push_back(&grad_slm_weights_);
-            grads.push_back(&grad_slm_bias_);
+            grads.push_back(&grad_slm_weights1_);
+            grads.push_back(&grad_slm_bias1_);
+            grads.push_back(&grad_slm_weights2_);
+            grads.push_back(&grad_slm_bias2_);
         }
         auto g = group_norm_->gradients();
         grads.insert(grads.end(), g.begin(), g.end());
@@ -911,15 +964,19 @@ private:
     Tensor<T> spectral_scales_;
     Tensor<T> mixing_weights_;
     Tensor<T> oracle_projection_;
-    Tensor<T> slm_weights_;
-    Tensor<T> slm_bias_;
+    Tensor<T> slm_weights1_;
+    Tensor<T> slm_bias1_;
+    Tensor<T> slm_weights2_;
+    Tensor<T> slm_bias2_;
 
     Tensor<T> grad_packed_weights_;
     Tensor<T> grad_spectral_scales_;
     Tensor<T> grad_mixing_weights_;
     Tensor<T> grad_oracle_projection_;
-    Tensor<T> grad_slm_weights_;
-    Tensor<T> grad_slm_bias_;
+    Tensor<T> grad_slm_weights1_;
+    Tensor<T> grad_slm_bias1_;
+    Tensor<T> grad_slm_weights2_;
+    Tensor<T> grad_slm_bias2_;
 
     Tensor<T> input_cached_;
     Tensor<T> eyes_out_cached_;
