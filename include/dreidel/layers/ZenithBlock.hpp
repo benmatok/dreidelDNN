@@ -966,25 +966,31 @@ private:
     static inline void permute_avx2(float* out, const float* in, const int32_t* indices, size_t N) {
         #ifdef DREIDEL_ARCH_AVX2
         size_t i = 0;
+        // Unroll by 4 (8 floats * 4 = 32 floats per loop)
         for (; i + 32 <= N; i += 32) {
+             // Gather 4 blocks of 8
              __m256i idx0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i));
              __m256i idx1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i + 8));
              __m256i idx2 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i + 16));
              __m256i idx3 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i + 24));
+
              __m256 r0 = _mm256_i32gather_ps(in, idx0, 4);
              __m256 r1 = _mm256_i32gather_ps(in, idx1, 4);
              __m256 r2 = _mm256_i32gather_ps(in, idx2, 4);
              __m256 r3 = _mm256_i32gather_ps(in, idx3, 4);
+
              _mm256_store_ps(out + i, r0);
              _mm256_store_ps(out + i + 8, r1);
              _mm256_store_ps(out + i + 16, r2);
              _mm256_store_ps(out + i + 24, r3);
         }
+        // Fallback for remaining (still AVX for multiples of 8)
         for (; i + 8 <= N; i += 8) {
             __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i));
             __m256 r = _mm256_i32gather_ps(in, idx, 4);
             _mm256_store_ps(out + i, r);
         }
+        // Scalar tail (likely N is power of 2 so 0, but good to have)
         for (; i < N; ++i) {
             out[i] = in[indices[i]];
         }
