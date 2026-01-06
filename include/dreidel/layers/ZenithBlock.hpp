@@ -76,19 +76,11 @@ public:
 
         // Sequency Map
         if (use_sequency_) {
-            sequency_map_ = algo::Sequency::compute_to_natural_map(in_channels_);
-            // Inverse map: To get back to Natural from Sequency
-            // sequency_map_[k] gives Natural index for k-th Sequency.
-            // So if we have Seq buffer Y, and want Natural X:
-            // X[sequency_map_[k]] = Y[k].
-            // Or if we want to copy: X[i] = Y[inv_map[i]].
-            // Since we permute in place using temp buffer:
-            // Seq -> Nat:
-            // Temp[map[k]] = Buf[k] (Scatter)
-            // Or: Temp[i] = Buf[inv_map[i]] (Gather)
-            // It's cleaner to have inv_map.
-            // natural_map_[i] = Sequency Index of i-th Natural.
-            natural_map_ = algo::Sequency::compute_to_sequency_map(in_channels_);
+            auto s_map = algo::Sequency::compute_to_natural_map(in_channels_);
+            sequency_map_.assign(s_map.begin(), s_map.end());
+
+            auto n_map = algo::Sequency::compute_to_sequency_map(in_channels_);
+            natural_map_.assign(n_map.begin(), n_map.end());
         }
     }
 
@@ -146,8 +138,11 @@ public:
     void set_sequency_ordering(bool use) {
         use_sequency_ = use;
         if (use_sequency_ && sequency_map_.empty()) {
-            sequency_map_ = algo::Sequency::compute_to_natural_map(in_channels_);
-            natural_map_ = algo::Sequency::compute_to_sequency_map(in_channels_);
+            auto s_map = algo::Sequency::compute_to_natural_map(in_channels_);
+            sequency_map_.assign(s_map.begin(), s_map.end());
+
+            auto n_map = algo::Sequency::compute_to_sequency_map(in_channels_);
+            natural_map_.assign(n_map.begin(), n_map.end());
         }
     }
 
@@ -207,8 +202,8 @@ public:
             std::vector<T, core::AlignedAllocator<T>> buf_mag; // Alloc only if needed
             if (use_slm_ || use_sequency_) buf_mag.resize(in_channels_);
 
-            const uint16_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
-            const uint16_t* nat_map_ptr = use_sequency_ ? natural_map_.data() : nullptr;
+            const int32_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
+            const int32_t* nat_map_ptr = use_sequency_ ? natural_map_.data() : nullptr;
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
@@ -272,8 +267,14 @@ public:
                             // We want buf_in to be Sequency.
                             // buf_seq[k] = buf_nat[map[k]]
                             // Use buf_mag as temp
-                            for(size_t k=0; k<in_channels_; ++k) {
-                                buf_mag[k] = buf_in[seq_map_ptr[k]];
+        if constexpr (std::is_same_v<T, float>) {
+            #ifdef DREIDEL_ARCH_AVX2
+                permute_avx2(buf_mag.data(), buf_in.data(), seq_map_ptr, in_channels_);
+            #else
+                for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = buf_in[seq_map_ptr[k]];
+            #endif
+        } else {
+            for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = buf_in[seq_map_ptr[k]];
                             }
                             // Copy back
                             std::memcpy(buf_in.data(), buf_mag.data(), in_channels_ * sizeof(T));
@@ -315,8 +316,14 @@ public:
                             // We want buf_in to be Natural.
                             // buf_nat[i] = buf_seq[nat_map[i]]
                             // Use buf_mag as temp
-                            for(size_t i=0; i<in_channels_; ++i) {
-                                buf_mag[i] = buf_in[nat_map_ptr[i]];
+        if constexpr (std::is_same_v<T, float>) {
+            #ifdef DREIDEL_ARCH_AVX2
+                permute_avx2(buf_mag.data(), buf_in.data(), nat_map_ptr, in_channels_);
+            #else
+                for(size_t i=0; i<in_channels_; ++i) buf_mag[i] = buf_in[nat_map_ptr[i]];
+            #endif
+        } else {
+            for(size_t i=0; i<in_channels_; ++i) buf_mag[i] = buf_in[nat_map_ptr[i]];
                             }
                             std::memcpy(buf_in.data(), buf_mag.data(), in_channels_ * sizeof(T));
                         }
@@ -537,8 +544,8 @@ public:
                 d_gate.resize(in_channels_);
             }
 
-            const uint16_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
-            const uint16_t* nat_map_ptr = use_sequency_ ? natural_map_.data() : nullptr;
+    const int32_t* seq_map_ptr = use_sequency_ ? sequency_map_.data() : nullptr;
+    const int32_t* nat_map_ptr = use_sequency_ ? natural_map_.data() : nullptr;
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
@@ -560,7 +567,15 @@ public:
 
                         // Permute Natural -> Sequency (Forward Logic)
                         if (use_sequency_) {
-                            for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = buf_eyes[seq_map_ptr[k]];
+        if constexpr (std::is_same_v<T, float>) {
+            #ifdef DREIDEL_ARCH_AVX2
+                permute_avx2(buf_mag.data(), buf_eyes.data(), seq_map_ptr, in_channels_);
+            #else
+                for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = buf_eyes[seq_map_ptr[k]];
+            #endif
+        } else {
+            for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = buf_eyes[seq_map_ptr[k]];
+        }
                             std::memcpy(buf_eyes.data(), buf_mag.data(), in_channels_ * sizeof(T));
                         }
 
@@ -617,7 +632,15 @@ public:
 
                         // Permute d_eyes Natural -> Sequency
                         if (use_sequency_) {
-                            for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = d_eyes[seq_map_ptr[k]];
+        if constexpr (std::is_same_v<T, float>) {
+            #ifdef DREIDEL_ARCH_AVX2
+                permute_avx2(buf_mag.data(), d_eyes.data(), seq_map_ptr, in_channels_);
+            #else
+                for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = d_eyes[seq_map_ptr[k]];
+            #endif
+        } else {
+            for(size_t k=0; k<in_channels_; ++k) buf_mag[k] = d_eyes[seq_map_ptr[k]];
+        }
                             std::memcpy(d_eyes.data(), buf_mag.data(), in_channels_ * sizeof(T));
                         }
 
@@ -743,7 +766,15 @@ public:
                         // Permute Sequency -> Natural (Backprop through P)
                         // dL/d_nat = P_inv * dL/d_seq
                         if (use_sequency_) {
-                            for(size_t i=0; i<in_channels_; ++i) buf_mag[i] = d_eyes[nat_map_ptr[i]];
+        if constexpr (std::is_same_v<T, float>) {
+            #ifdef DREIDEL_ARCH_AVX2
+                permute_avx2(buf_mag.data(), d_eyes.data(), nat_map_ptr, in_channels_);
+            #else
+                for(size_t i=0; i<in_channels_; ++i) buf_mag[i] = d_eyes[nat_map_ptr[i]];
+            #endif
+        } else {
+            for(size_t i=0; i<in_channels_; ++i) buf_mag[i] = d_eyes[nat_map_ptr[i]];
+        }
                             std::memcpy(d_eyes.data(), buf_mag.data(), in_channels_ * sizeof(T));
                         }
 
@@ -839,10 +870,44 @@ private:
     float spectral_dropout_rate_ = 0.1f;
     bool training_ = true;
 
-    std::vector<uint16_t> sequency_map_;
-    std::vector<uint16_t> natural_map_;
+    std::vector<int32_t, core::AlignedAllocator<int32_t>> sequency_map_;
+    std::vector<int32_t, core::AlignedAllocator<int32_t>> natural_map_;
 
     Tensor<T> packed_weights_;
+
+    static inline void permute_avx2(float* out, const float* in, const int32_t* indices, size_t N) {
+        #ifdef DREIDEL_ARCH_AVX2
+        size_t i = 0;
+        // Unroll by 4 (8 floats * 4 = 32 floats per loop)
+        for (; i + 32 <= N; i += 32) {
+             // Gather 4 blocks of 8
+             __m256i idx0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i));
+             __m256i idx1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i + 8));
+             __m256i idx2 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i + 16));
+             __m256i idx3 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i + 24));
+
+             __m256 r0 = _mm256_i32gather_ps(in, idx0, 4);
+             __m256 r1 = _mm256_i32gather_ps(in, idx1, 4);
+             __m256 r2 = _mm256_i32gather_ps(in, idx2, 4);
+             __m256 r3 = _mm256_i32gather_ps(in, idx3, 4);
+
+             _mm256_store_ps(out + i, r0);
+             _mm256_store_ps(out + i + 8, r1);
+             _mm256_store_ps(out + i + 16, r2);
+             _mm256_store_ps(out + i + 24, r3);
+        }
+        // Fallback for remaining (still AVX for multiples of 8)
+        for (; i + 8 <= N; i += 8) {
+            __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i));
+            __m256 r = _mm256_i32gather_ps(in, idx, 4);
+            _mm256_store_ps(out + i, r);
+        }
+        // Scalar tail (likely N is power of 2 so 0, but good to have)
+        for (; i < N; ++i) {
+            out[i] = in[indices[i]];
+        }
+        #endif
+    }
     Tensor<T> spectral_scales_;
     Tensor<T> mixing_weights_;
     Tensor<T> oracle_projection_;
