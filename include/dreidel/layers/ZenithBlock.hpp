@@ -27,18 +27,22 @@ public:
 
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim,
                 bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1,
-                const std::string& init_scheme = "he")
+                const std::string& init_scheme = "he", bool use_slm = false)
         : in_channels_(in_channels), out_channels_(out_channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
-          use_ifwht_(use_ifwht), use_gating_(use_gating), stride_(stride), upscale_(upscale),
+          use_ifwht_(use_ifwht), use_gating_(use_gating), stride_(stride), upscale_(upscale), use_slm_(use_slm),
           packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           spectral_scales_({1, in_channels}),
           mixing_weights_({3, in_channels}),
           oracle_projection_({1, in_channels}),
+          slm_weights_({5, in_channels}),
+          slm_bias_({1, in_channels}),
 
           grad_packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           grad_spectral_scales_({1, in_channels}),
           grad_mixing_weights_({3, in_channels}),
           grad_oracle_projection_({1, in_channels}),
+          grad_slm_weights_({5, in_channels}),
+          grad_slm_bias_({1, in_channels}),
           rng_(std::random_device{}())
     {
         if ((in_channels_ & (in_channels_ - 1)) != 0) {
@@ -50,11 +54,19 @@ public:
         // Gating
         oracle_projection_.random(-1.0, 1.0);
 
+        // SLM Init
+        if (use_slm_) {
+            slm_weights_.random(-0.01, 0.01);
+            slm_bias_.fill(0.0); // Bias slightly positive? Prompt: "zero (or slightly positive)". 0.0 is sigmoid(0)=0.5.
+        }
+
         // Zero Grads
         grad_packed_weights_.fill(0);
         grad_spectral_scales_.fill(0);
         grad_mixing_weights_.fill(0);
         grad_oracle_projection_.fill(0);
+        grad_slm_weights_.fill(0);
+        grad_slm_bias_.fill(0);
 
         // 2. GroupNorm (Hardcoded Standard)
         size_t groups = 32;
@@ -63,8 +75,8 @@ public:
     }
 
     ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim,
-                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false)
-        : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1) {}
+                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, bool use_slm = false)
+        : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1, "he", use_slm) {}
 
     void initialize(const std::string& scheme) {
         // 1. Packed Weights (Eyes)
@@ -156,6 +168,9 @@ public:
         const T* scale_ptr = spectral_scales_.data();
         const T* mix_w = mixing_weights_.data();
 
+        const T* slm_w_ptr = use_slm_ ? slm_weights_.data() : nullptr;
+        const T* slm_b_ptr = use_slm_ ? slm_bias_.data() : nullptr;
+
         // Inverted Dropout Scale
         T dropout_scale = (apply_dropout) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
 
@@ -163,6 +178,8 @@ public:
         #pragma omp parallel
         {
             std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
+            std::vector<T, core::AlignedAllocator<T>> buf_mag; // Alloc only if needed
+            if (use_slm_) buf_mag.resize(in_channels_);
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
@@ -219,6 +236,36 @@ public:
                         // buf_in already has the data.
 
                         algo::WHT::fwht_1d(buf_in.data(), in_channels_);
+
+                        // SLM Gating
+                        if (use_slm_) {
+                            // 1. Compute Mag
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                buf_mag[c] = std::abs(buf_in[c]);
+                            }
+
+                            // 2. Conv1D K=5 & Sigmoid & Apply
+                            // Padding: Zero padding
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T gate_val = slm_b_ptr[c];
+
+                                // Unrolled K=5 loop: -2, -1, 0, 1, 2
+                                // w index: c*5 + k_offset
+                                const T* w_c = slm_w_ptr + c * 5;
+
+                                if (c >= 2) gate_val += w_c[0] * buf_mag[c-2];
+                                if (c >= 1) gate_val += w_c[1] * buf_mag[c-1];
+                                gate_val += w_c[2] * buf_mag[c];
+                                if (c + 1 < in_channels_) gate_val += w_c[3] * buf_mag[c+1];
+                                if (c + 2 < in_channels_) gate_val += w_c[4] * buf_mag[c+2];
+
+                                // Sigmoid: 1 / (1 + exp(-x))
+                                T gate = 1.0f / (1.0f + std::exp(-gate_val));
+
+                                // 3. Multiply
+                                buf_in[c] *= gate;
+                            }
+                        }
 
                         if (apply_dropout) {
                             for(size_t c=0; c<in_channels_; ++c) buf_in[c] *= (dropout_mask_[c] * dropout_scale);
@@ -311,6 +358,12 @@ public:
         T* gw_L = g_mix;
         T* gw_C = g_mix + in_channels_;
         T* gw_R = g_mix + 2 * in_channels_;
+
+        T* g_slm_w = use_slm_ ? grad_slm_weights_.data() : nullptr;
+        T* g_slm_b = use_slm_ ? grad_slm_bias_.data() : nullptr;
+
+        const T* slm_w_ptr = use_slm_ ? slm_weights_.data() : nullptr;
+        const T* slm_b_ptr = use_slm_ ? slm_bias_.data() : nullptr;
 
         // Lazy Norm: Norm is fused, so factor here is 1.0 (or we need to account for it if backward needs unscaling?
         // Backward of y = IFWHT(x) * (1/N) is x_grad = FWHT(y_grad) * (1/N).
@@ -405,9 +458,28 @@ public:
             std::vector<T> local_gw_C(in_channels_, 0);
             std::vector<T> local_gw_R(in_channels_, 0);
 
+            // SLM Local Grads
+            // weights: 5 * in_channels. bias: in_channels.
+            std::vector<T> local_g_slm_w;
+            std::vector<T> local_g_slm_b;
+            if (use_slm_) {
+                local_g_slm_w.resize(in_channels_ * 5, 0.0);
+                local_g_slm_b.resize(in_channels_, 0.0);
+            }
+
             std::vector<T, core::AlignedAllocator<T>> buf_grad(std::max(in_channels_, out_channels_));
             std::vector<T, core::AlignedAllocator<T>> buf_eyes(in_channels_);
             std::vector<T, core::AlignedAllocator<T>> d_eyes(in_channels_);
+
+            // SLM temp buffers
+            std::vector<T, core::AlignedAllocator<T>> buf_mag;
+            std::vector<T, core::AlignedAllocator<T>> buf_gate;
+            std::vector<T, core::AlignedAllocator<T>> d_gate;
+            if (use_slm_) {
+                buf_mag.resize(in_channels_);
+                buf_gate.resize(in_channels_);
+                d_gate.resize(in_channels_);
+            }
 
             #pragma omp for collapse(3)
             for(size_t n=0; n<N; ++n) {
@@ -426,6 +498,25 @@ public:
                         for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] = eyes_ptr[idx+c];
 
                         algo::WHT::fwht_1d(buf_eyes.data(), in_channels_);
+
+                        // SLM Forward Recompute
+                        if (use_slm_) {
+                            for(size_t c=0; c<in_channels_; ++c) buf_mag[c] = std::abs(buf_eyes[c]);
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T val = slm_b_ptr[c];
+                                const T* w_c = slm_w_ptr + c * 5;
+                                if (c >= 2) val += w_c[0] * buf_mag[c-2];
+                                if (c >= 1) val += w_c[1] * buf_mag[c-1];
+                                val += w_c[2] * buf_mag[c];
+                                if (c + 1 < in_channels_) val += w_c[3] * buf_mag[c+1];
+                                if (c + 2 < in_channels_) val += w_c[4] * buf_mag[c+2];
+                                buf_gate[c] = 1.0f / (1.0f + std::exp(-val));
+
+                                // Apply Gate
+                                buf_eyes[c] *= buf_gate[c];
+                            }
+                        }
+
                         if (training_ && spectral_dropout_rate_ > 0.0f) {
                             for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] *= (dropout_mask_[c] * dropout_scale);
                         }
@@ -454,18 +545,99 @@ public:
 
                         for(size_t c=0; c<in_channels_; ++c) {
                             // dL/dScale
-                            // d_eyes is the gradient w.r.t. the scaled spectral input (backpropagated through Mixer).
-                            // buf_eyes is the scaled spectral input (Forward pass value).
-                            // We need unscaled input: WHT(eyes).
+                            // buf_eyes currently holds: (WHT(eyes) * SLM_Gate * Dropout) * Scale
+                            // d_eyes is gradient w.r.t. `buf_eyes`
+
+                            // We need unscaled value: buf_eyes / scale
                             T unscaled = (std::abs(scale_ptr[c]) > 1e-9) ? buf_eyes[c] / scale_ptr[c] : 0;
                             local_g_scale[c] += d_eyes[c] * unscaled;
 
-                            // Apply scale for next step (Backprop to input)
+                            // Propagate back through Scale
                             d_eyes[c] *= scale_ptr[c];
                         }
 
                         if (training_ && spectral_dropout_rate_ > 0.0f) {
                             for(size_t c=0; c<in_channels_; ++c) d_eyes[c] *= (dropout_mask_[c] * dropout_scale);
+                        }
+
+                        // SLM Backward
+                        if (use_slm_) {
+                            // d_eyes is now dL/d(WHT(x) * Gate)
+                            // Let u = WHT(x) (Recomputed earlier into buf_mag? No, buf_mag is abs(u))
+                            // We need u.
+                            // buf_eyes was modified in forward recompute.
+                            // We need to recover `u`.
+                            // `buf_eyes` currently holds `u * gate * dropout * scale` (at start of this block it held `u * gate`)
+                            // Wait, logic above modified `buf_eyes` in-place.
+                            // It's `u * gate`.
+                            // So `u = buf_eyes / gate`.
+
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                // dL/dGate = dL/d(u*g) * u
+                                // dL/du_branch1 = dL/d(u*g) * g
+
+                                T g = buf_gate[c];
+                                T u = (g > 1e-9) ? buf_eyes[c] / g : 0; // Recover u
+
+                                T d_out = d_eyes[c];
+
+                                // Branch 1: Through multiplication
+                                T d_u = d_out * g;
+
+                                // Branch 2: Through Gate
+                                // dGate = d_out * u
+                                T d_g = d_out * u;
+
+                                // Sigmoid derivative: g * (1-g)
+                                T d_z = d_g * g * (1.0f - g);
+
+                                // Backprop Conv1D
+                                // z[c] = bias[c] + sum(w[k,c] * mag[c+k-2])
+                                // dL/dBias[c] += d_z
+                                // dL/dW[k,c] += d_z * mag[c+k-2]
+                                // dL/dMag[n] += d_z * w[k,c] (where n = c+k-2)
+
+                                local_g_slm_b[c] += d_z;
+
+                                // We need to accumulate dL/dMag. Use d_gate buffer for dMag.
+                                // Initialize d_gate to 0 outside loop? Yes.
+                            }
+
+                            std::fill(d_gate.begin(), d_gate.end(), 0);
+
+                            // Conv Backward (Weights & Input)
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T g = buf_gate[c];
+                                T u = (g > 1e-9) ? buf_eyes[c] / g : 0;
+                                T d_g = d_eyes[c] * u;
+                                T d_z = d_g * g * (1.0f - g);
+
+                                T* w_c = local_g_slm_w.data() + c * 5;
+                                const T* w_fwd = slm_w_ptr + c * 5;
+
+                                if (c >= 2) { w_c[0] += d_z * buf_mag[c-2]; d_gate[c-2] += d_z * w_fwd[0]; }
+                                if (c >= 1) { w_c[1] += d_z * buf_mag[c-1]; d_gate[c-1] += d_z * w_fwd[1]; }
+                                w_c[2] += d_z * buf_mag[c]; d_gate[c] += d_z * w_fwd[2];
+                                if (c + 1 < in_channels_) { w_c[3] += d_z * buf_mag[c+1]; d_gate[c+1] += d_z * w_fwd[3]; }
+                                if (c + 2 < in_channels_) { w_c[4] += d_z * buf_mag[c+2]; d_gate[c+2] += d_z * w_fwd[4]; }
+                            }
+
+                            // Backprop Mag -> u
+                            // Mag = |u|
+                            // dMag/du = sgn(u)
+                            // dL/du += dL/dMag * sgn(u)
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T g = buf_gate[c];
+                                T u = (g > 1e-9) ? buf_eyes[c] / g : 0;
+                                T sgn = (u > 0) ? 1.0f : ((u < 0) ? -1.0f : 0.0f);
+
+                                T d_u_branch2 = d_gate[c] * sgn;
+
+                                // Combine with Branch 1
+                                // d_eyes was dL/dy. Now it becomes dL/du.
+                                // d_eyes[c] = d_out * g + d_u_branch2
+                                d_eyes[c] = d_eyes[c] * g + d_u_branch2;
+                            }
                         }
 
                         algo::WHT::fwht_1d(d_eyes.data(), in_channels_);
@@ -510,6 +682,10 @@ public:
                 for(size_t i=0; i<local_gw_L.size(); ++i) gw_L[i] += local_gw_L[i];
                 for(size_t i=0; i<local_gw_C.size(); ++i) gw_C[i] += local_gw_C[i];
                 for(size_t i=0; i<local_gw_R.size(); ++i) gw_R[i] += local_gw_R[i];
+                if (use_slm_) {
+                    for(size_t i=0; i<local_g_slm_w.size(); ++i) g_slm_w[i] += local_g_slm_w[i];
+                    for(size_t i=0; i<local_g_slm_b.size(); ++i) g_slm_b[i] += local_g_slm_b[i];
+                }
             }
         }
 
@@ -519,6 +695,10 @@ public:
     std::vector<Tensor<T>*> parameters() override {
         std::vector<Tensor<T>*> params = {&packed_weights_, &spectral_scales_, &mixing_weights_};
         if (use_gating_) params.push_back(&oracle_projection_);
+        if (use_slm_) {
+            params.push_back(&slm_weights_);
+            params.push_back(&slm_bias_);
+        }
         auto p = group_norm_->parameters();
         params.insert(params.end(), p.begin(), p.end());
         return params;
@@ -527,6 +707,10 @@ public:
     std::vector<Tensor<T>*> gradients() override {
         std::vector<Tensor<T>*> grads = {&grad_packed_weights_, &grad_spectral_scales_, &grad_mixing_weights_};
         if (use_gating_) grads.push_back(&grad_oracle_projection_);
+        if (use_slm_) {
+            grads.push_back(&grad_slm_weights_);
+            grads.push_back(&grad_slm_bias_);
+        }
         auto g = group_norm_->gradients();
         grads.insert(grads.end(), g.begin(), g.end());
         return grads;
@@ -543,6 +727,7 @@ private:
     bool use_gating_;
     size_t stride_;
     size_t upscale_;
+    bool use_slm_;
     float spectral_dropout_rate_ = 0.1f;
     bool training_ = true;
 
@@ -550,11 +735,15 @@ private:
     Tensor<T> spectral_scales_;
     Tensor<T> mixing_weights_;
     Tensor<T> oracle_projection_;
+    Tensor<T> slm_weights_;
+    Tensor<T> slm_bias_;
 
     Tensor<T> grad_packed_weights_;
     Tensor<T> grad_spectral_scales_;
     Tensor<T> grad_mixing_weights_;
     Tensor<T> grad_oracle_projection_;
+    Tensor<T> grad_slm_weights_;
+    Tensor<T> grad_slm_bias_;
 
     Tensor<T> input_cached_;
     Tensor<T> eyes_out_cached_;

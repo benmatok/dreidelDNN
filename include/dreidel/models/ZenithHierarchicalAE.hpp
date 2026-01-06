@@ -24,7 +24,7 @@ public:
     // Stage 2: PixelUnshuffle (factor=4), Fixed 2D Sinusoidal Embeddings, 2x ZenithBlock
     // Head: Mirrors encoder
 
-    ZenithHierarchicalAE(size_t input_channels = 3, size_t base_channels = 32, bool use_pe = true, const std::string& init_scheme = "he")
+    ZenithHierarchicalAE(size_t input_channels = 3, size_t base_channels = 32, bool use_pe = true, const std::string& init_scheme = "he", bool use_slm = false)
         : use_pe_(use_pe)
     {
         // Stem
@@ -38,7 +38,7 @@ public:
 
         // 1x ZenithBlock
         stage1_block_ = std::make_unique<layers::ZenithBlock<T>>(
-            stage1_channels_, stage1_channels_, 3, stage1_channels_, true, false, false, 1, 1, init_scheme
+            stage1_channels_, stage1_channels_, 3, stage1_channels_, true, false, false, 1, 1, init_scheme, false
         );
 
         // Stage 2 (Bottleneck)
@@ -48,11 +48,12 @@ public:
         stage2_channels_ = stage1_channels_ * 16;
 
         // 2x ZenithBlock
+        // Enable SLM here if requested (Stage 2 Only)
         stage2_block1_ = std::make_unique<layers::ZenithBlock<T>>(
-            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1, init_scheme
+            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1, init_scheme, use_slm
         );
         stage2_block2_ = std::make_unique<layers::ZenithBlock<T>>(
-            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1, init_scheme
+            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1, init_scheme, use_slm
         );
 
         // Positional Embedding Params (Fixed)
