@@ -25,7 +25,7 @@ template <typename T>
 class ZenithBlock : public Layer<T> {
 public:
     static inline bool use_fused_kernels = true;
-    static constexpr size_t rig_iterations_ = 3;
+    static constexpr size_t srig_iterations_ = 3;
 
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim,
                 bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1,
@@ -36,19 +36,15 @@ public:
           spectral_scales_({1, in_channels}),
           mixing_weights_({3, in_channels}),
           oracle_projection_({1, in_channels}),
-          slm_weights1_({5, in_channels}),
-          slm_bias1_({1, in_channels}),
-          slm_weights2_({5, in_channels}),
-          slm_bias2_({1, in_channels}),
+          srig_weights_({5, in_channels}),
+          srig_bias_({1, in_channels}),
 
           grad_packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           grad_spectral_scales_({1, in_channels}),
           grad_mixing_weights_({3, in_channels}),
           grad_oracle_projection_({1, in_channels}),
-          grad_slm_weights1_({5, in_channels}),
-          grad_slm_bias1_({1, in_channels}),
-          grad_slm_weights2_({5, in_channels}),
-          grad_slm_bias2_({1, in_channels}),
+          grad_srig_weights_({5, in_channels}),
+          grad_srig_bias_({1, in_channels}),
           rng_(std::random_device{}())
     {
         if ((in_channels_ & (in_channels_ - 1)) != 0) {
@@ -60,18 +56,13 @@ public:
         // Gating
         oracle_projection_.random(-1.0, 1.0);
 
-        // SLM Init (DSG: Denoising Signal Gate)
+        // SRIG Init (Spherical Recurrent Iterative Gating)
         if (use_slm_) {
-            // Layer 1: Energy Integration & Thresholding
-            // Kaiming Normal for ReLU
-            T stddev = std::sqrt(2.0f / (5.0f)); // Fan-in is 5 (kernel size) * 1 (depthwise)
-            slm_weights1_.random(0, stddev);
-            slm_bias1_.fill(-1.0f); // Learnable Noise Floor (-sigma)
-
-            // Layer 2: Gate Smoothing
-            // Xavier for Sigmoid (or Kaiming if we consider it linear until sigmoid)
-            slm_weights2_.random(0, stddev);
-            slm_bias2_.fill(0.0f);
+            // Weights: He Init
+            T stddev = std::sqrt(2.0f / 5.0f);
+            srig_weights_.random(0, stddev);
+            // Bias: -1.0 to close the gate on noise (Learned Noise Floor)
+            srig_bias_.fill(-1.0f);
         }
 
         // Zero Grads
@@ -79,10 +70,8 @@ public:
         grad_spectral_scales_.fill(0);
         grad_mixing_weights_.fill(0);
         grad_oracle_projection_.fill(0);
-        grad_slm_weights1_.fill(0);
-        grad_slm_bias1_.fill(0);
-        grad_slm_weights2_.fill(0);
-        grad_slm_bias2_.fill(0);
+        grad_srig_weights_.fill(0);
+        grad_srig_bias_.fill(0);
 
         // 2. GroupNorm (Hardcoded Standard)
         size_t groups = 32;
@@ -104,10 +93,8 @@ public:
         : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1, "he", use_slm, use_sequency) {}
 
     void initialize(const std::string& scheme) {
-        // 1. Packed Weights (Eyes)
         packed_weights_.fill(0);
         if (scheme == "identity") {
-            // Delta-Orthogonal
             T* w_ptr = packed_weights_.data();
             size_t k_center = kernel_size_ / 2;
             size_t spatial_size = kernel_size_ * kernel_size_;
@@ -115,31 +102,18 @@ public:
                 w_ptr[c * spatial_size + k_center * kernel_size_ + k_center] = 1.0f;
             }
         } else if (scheme == "he") {
-            // Kaiming / He
             T stddev = std::sqrt(2.0f / (in_channels_ * kernel_size_ * kernel_size_));
             packed_weights_.random(0, stddev);
         } else {
-            // Random small
             packed_weights_.random(-0.01, 0.01);
         }
-
-        // 2. Spectral Scales & Mixer
-        // For Identity, we use spectral identity (scale=1, mix=1)
-        // For He, we still want spectral path to be open, but maybe we add noise?
-        // Standard Zenith implementation uses Identity for the mixing path initially to pass gradients.
 
         T norm_factor = (use_ifwht_) ? (1.0f / static_cast<T>(out_channels_)) : 1.0f;
         spectral_scales_.fill(1.0f * norm_factor);
 
         mixing_weights_.fill(0);
         T* mw = mixing_weights_.data();
-        // Center band = 1.0 (Identity mixing)
         std::fill(mw + in_channels_, mw + 2 * in_channels_, 1.0f);
-
-        if (scheme == "he" || scheme == "random") {
-             // Maybe add noise to mixing weights if requested, but "Identity Mix" is structural.
-             // We keep Mixer as Identity for stability, only vary Eyes initialization.
-        }
     }
 
     void set_spectral_dropout(float rate) {
@@ -184,7 +158,6 @@ public:
         T* out_ptr = output.data();
         const T* in_ptr = input.data();
 
-        // 3. Spectral Dropout (Only in Training)
         bool apply_dropout = training_ && (spectral_dropout_rate_ > 0.0f);
         if (apply_dropout) {
             dropout_mask_.resize(in_channels_);
@@ -204,35 +177,36 @@ public:
         const T* scale_ptr = spectral_scales_.data();
         const T* mix_w = mixing_weights_.data();
 
-        const T* slm_w1_ptr = use_slm_ ? slm_weights1_.data() : nullptr;
-        const T* slm_b1_ptr = use_slm_ ? slm_bias1_.data() : nullptr;
-        const T* slm_w2_ptr = use_slm_ ? slm_weights2_.data() : nullptr;
-        const T* slm_b2_ptr = use_slm_ ? slm_bias2_.data() : nullptr;
+        const T* srig_w_ptr = use_slm_ ? srig_weights_.data() : nullptr;
+        const T* srig_b_ptr = use_slm_ ? srig_bias_.data() : nullptr;
 
-        // Inverted Dropout Scale
         T dropout_scale = (apply_dropout) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
 
-        // Fused Step 1 (Eyes/Depthwise) & Step 2 (Mixer) & ReLU
+        // Precompute MagW
+        std::vector<T> mag_w_cache(in_channels_);
+        if (use_slm_) {
+            for(size_t c=0; c<in_channels_; ++c) {
+                 const T* w = srig_w_ptr + c * 5;
+                 T sum_sq = 0;
+                 for(int k=0; k<5; ++k) sum_sq += w[k]*w[k];
+                 mag_w_cache[c] = std::sqrt(sum_sq + 1e-8f);
+            }
+        }
+        const T* mag_w_ptr = mag_w_cache.data();
+
         #pragma omp parallel
         {
             std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
-            std::vector<T, core::AlignedAllocator<T>> buf_mag; // Alloc only if needed
-            std::vector<T, core::AlignedAllocator<T>> buf_hidden; // For DSG
-
-            if (use_slm_ || use_sequency_) buf_mag.resize(in_channels_);
-            if (use_slm_) buf_hidden.resize(in_channels_);
-
-            // Buffers for RIG
             std::vector<T, core::AlignedAllocator<T>> buf_est;
             std::vector<T, core::AlignedAllocator<T>> buf_gate;
+            std::vector<T, core::AlignedAllocator<T>> buf_act;
 
             if (use_slm_) {
-                buf_est.resize((rig_iterations_ + 1) * in_channels_);
-                buf_hidden.resize(rig_iterations_ * in_channels_);
-                buf_gate.resize(rig_iterations_ * in_channels_);
+                buf_est.resize((srig_iterations_ + 1) * in_channels_);
+                buf_gate.resize(srig_iterations_ * in_channels_);
+                buf_act.resize(srig_iterations_ * in_channels_);
             }
 
-            // Scratch for permutation
             std::vector<T, core::AlignedAllocator<T>> buf_temp;
             if (use_sequency_) buf_temp.resize(in_channels_);
 
@@ -243,9 +217,6 @@ public:
             for(size_t n=0; n<N; ++n) {
                 for(size_t h_out=0; h_out<H_out; ++h_out) {
                     for(size_t w_out=0; w_out<W_out; ++w_out) {
-                        // --- Part 1: Eyes (Depthwise) ---
-                        // Compute and write to eyes_out_cached_ (needed for backward)
-                        // Also keep in buf_in for immediate mixing (L1 cache locality)
 
                         size_t eyes_idx = ((n*H_out + h_out)*W_out + w_out)*in_channels_;
                         T* eyes_store_ptr = eyes_ptr + eyes_idx;
@@ -290,12 +261,8 @@ public:
                             }
                         }
 
-                        // --- Part 2: Mixer (Spectral) ---
-                        // buf_in already has the data.
-
                         algo::WHT::fwht_1d(buf_in.data(), in_channels_);
 
-                        // Permute Natural -> Sequency
                         if (use_sequency_) {
                             if constexpr (std::is_same_v<T, float>) {
                                 #ifdef DREIDEL_ARCH_AVX2
@@ -309,57 +276,55 @@ public:
                             std::memcpy(buf_in.data(), buf_temp.data(), in_channels_ * sizeof(T));
                         }
 
-                        // Zenith-RIG (Recurrent Iterative Gating)
                         if (use_slm_) {
-                            // 1. Initialize Est[0] = |Input|
                             T* est_0 = buf_est.data();
                             for(size_t c=0; c<in_channels_; ++c) est_0[c] = std::abs(buf_in[c]);
 
-                            // 2. Unrolled Loop
-                            for(size_t k=0; k<rig_iterations_; ++k) {
+                            for(size_t k=0; k<srig_iterations_; ++k) {
                                 const T* curr_est = buf_est.data() + k * in_channels_;
                                 T* next_est = buf_est.data() + (k+1) * in_channels_;
-                                T* curr_hidden = buf_hidden.data() + k * in_channels_;
                                 T* curr_gate = buf_gate.data() + k * in_channels_;
+                                T* curr_act = buf_act.data() + k * in_channels_;
 
-                                // Layer 1: Conv(Est[k]) -> Hidden
                                 for(size_t c=0; c<in_channels_; ++c) {
-                                    T val = slm_b1_ptr[c];
-                                    const T* w = slm_w1_ptr + c * 5;
-                                    if (c >= 2) val += w[0] * curr_est[c-2];
-                                    if (c >= 1) val += w[1] * curr_est[c-1];
-                                    val += w[2] * curr_est[c];
-                                    if (c + 1 < in_channels_) val += w[3] * curr_est[c+1];
-                                    if (c + 2 < in_channels_) val += w[4] * curr_est[c+2];
-                                    curr_hidden[c] = (val > 0) ? val : 0; // ReLU
-                                }
+                                    T sum_sq = 0;
+                                    if (c>=2) sum_sq += curr_est[c-2]*curr_est[c-2];
+                                    if (c>=1) sum_sq += curr_est[c-1]*curr_est[c-1];
+                                    sum_sq += curr_est[c]*curr_est[c];
+                                    if (c + 1 < in_channels_) sum_sq += curr_est[c+1]*curr_est[c+1];
+                                    if (c + 2 < in_channels_) sum_sq += curr_est[c+2]*curr_est[c+2];
 
-                                // Layer 2: Conv(Hidden) -> Gate
-                                for(size_t c=0; c<in_channels_; ++c) {
-                                    T val = slm_b2_ptr[c];
-                                    const T* w = slm_w2_ptr + c * 5;
-                                    if (c >= 2) val += w[0] * curr_hidden[c-2];
-                                    if (c >= 1) val += w[1] * curr_hidden[c-1];
-                                    val += w[2] * curr_hidden[c];
-                                    if (c + 1 < in_channels_) val += w[3] * curr_hidden[c+1];
-                                    if (c + 2 < in_channels_) val += w[4] * curr_hidden[c+2];
-                                    curr_gate[c] = 1.0f / (1.0f + std::exp(-val)); // Sigmoid
-                                }
+                                    T mag_x = std::sqrt(sum_sq / 5.0f + 1e-10f);
 
-                                // Update State: Est[k+1] = Est[0] * Gate[k] (Refinement)
-                                for(size_t c=0; c<in_channels_; ++c) {
-                                    next_est[c] = est_0[c] * curr_gate[c];
+                                    const T* w = srig_w_ptr + c * 5;
+                                    T dot = 0;
+                                    if (c>=2) dot += w[0] * curr_est[c-2];
+                                    if (c>=1) dot += w[1] * curr_est[c-1];
+                                    dot += w[2] * curr_est[c];
+                                    if (c + 1 < in_channels_) dot += w[3] * curr_est[c+1];
+                                    if (c + 2 < in_channels_) dot += w[4] * curr_est[c+2];
+
+                                    T mag_w = mag_w_ptr[c];
+                                    T cosine = dot / (mag_x * mag_w + 1e-6f);
+                                    T gain = std::sqrt(mag_x + 1e-10f);
+                                    T bias = srig_b_ptr[c];
+
+                                    T linear = cosine * gain + bias;
+                                    curr_act[c] = linear;
+
+                                    T act = (linear > 0) ? linear : 0.0f;
+                                    T gate = 1.0f / (1.0f + std::exp(-act));
+                                    curr_gate[c] = gate;
+                                    next_est[c] = est_0[c] * gate;
                                 }
                             }
 
-                            // 3. Apply Final Gate to Complex Input
-                            const T* final_gate = buf_gate.data() + (rig_iterations_ - 1) * in_channels_;
+                            const T* final_gate = buf_gate.data() + (srig_iterations_ - 1) * in_channels_;
                             for(size_t c=0; c<in_channels_; ++c) {
                                 buf_in[c] *= final_gate[c];
                             }
                         }
 
-                        // Permute Sequency -> Natural
                         if (use_sequency_) {
                             if constexpr (std::is_same_v<T, float>) {
                                 #ifdef DREIDEL_ARCH_AVX2
@@ -407,7 +372,6 @@ public:
 
                         size_t out_idx = ((n*H_out + h_out)*W_out + w_out)*out_channels_;
 
-                        // --- Part 3: ReLU ---
                         for(size_t c=0; c<out_channels_; ++c) {
                             T v = buf_out[c];
                             if (v < 0) v = 0;
@@ -418,9 +382,7 @@ public:
             }
         }
 
-        // Step 3: GroupNorm
         output = group_norm_->forward(output);
-
         return output;
     }
 
@@ -465,15 +427,10 @@ public:
         T* gw_C = g_mix + in_channels_;
         T* gw_R = g_mix + 2 * in_channels_;
 
-        T* g_slm_w1 = use_slm_ ? grad_slm_weights1_.data() : nullptr;
-        T* g_slm_b1 = use_slm_ ? grad_slm_bias1_.data() : nullptr;
-        T* g_slm_w2 = use_slm_ ? grad_slm_weights2_.data() : nullptr;
-        T* g_slm_b2 = use_slm_ ? grad_slm_bias2_.data() : nullptr;
-
-        const T* slm_w1_ptr = use_slm_ ? slm_weights1_.data() : nullptr;
-        const T* slm_b1_ptr = use_slm_ ? slm_bias1_.data() : nullptr;
-        const T* slm_w2_ptr = use_slm_ ? slm_weights2_.data() : nullptr;
-        const T* slm_b2_ptr = use_slm_ ? slm_bias2_.data() : nullptr;
+        T* g_srig_w = use_slm_ ? grad_srig_weights_.data() : nullptr;
+        T* g_srig_b = use_slm_ ? grad_srig_bias_.data() : nullptr;
+        const T* srig_w_ptr = use_slm_ ? srig_weights_.data() : nullptr;
+        const T* srig_b_ptr = use_slm_ ? srig_bias_.data() : nullptr;
 
         T dropout_scale = (training_ && spectral_dropout_rate_ > 0.0f) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
 
@@ -481,7 +438,6 @@ public:
 
         {
              Tensor<T> gn_in({N, H_out, W_out, out_channels_});
-
              #pragma omp parallel
              {
                 std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
@@ -507,12 +463,9 @@ public:
                              } else {
                                   std::fill(buf_out.begin(), buf_out.end(), 0);
                              }
-
                              if (use_ifwht_) {
                                 algo::WHT::fwht_1d(buf_out.data(), out_channels_);
-                                // Lazy Norm: fused
                              }
-
                              size_t out_idx = ((n*H_out + h)*W_out + w)*out_channels_;
                              for(size_t c=0; c<out_channels_; ++c) gn_in.data()[out_idx+c] = buf_out[c];
                         }
@@ -520,23 +473,29 @@ public:
                 }
              }
 
-             // 2. Forward GN
              Tensor<T> gn_out = group_norm_->forward(gn_in);
-
-             // 3. Backward ReLU
-             Tensor<T> d_gn_out = grad_output; // Copy
+             Tensor<T> d_gn_out = grad_output;
              T* d_gn_ptr = d_gn_out.data();
              const T* gn_out_ptr = gn_out.data();
 
              for(size_t i=0; i<d_gn_out.size(); ++i) {
-                 if (gn_out_ptr[i] <= 0) d_gn_ptr[i] = 0; // ReLU
+                 if (gn_out_ptr[i] <= 0) d_gn_ptr[i] = 0;
              }
-
-             // 4. Backward GN
              d_mixer_out = group_norm_->backward(d_gn_out);
         }
 
         const T* d_mix_ptr = d_mixer_out.data();
+
+        std::vector<T> mag_w_cache(in_channels_);
+        if (use_slm_) {
+            for(size_t c=0; c<in_channels_; ++c) {
+                 const T* w = srig_w_ptr + c * 5;
+                 T sum_sq = 0;
+                 for(int k=0; k<5; ++k) sum_sq += w[k]*w[k];
+                 mag_w_cache[c] = std::sqrt(sum_sq + 1e-8f);
+            }
+        }
+        const T* mag_w_ptr = mag_w_cache.data();
 
         #pragma omp parallel
         {
@@ -545,41 +504,33 @@ public:
             std::vector<T> local_gw_C(in_channels_, 0);
             std::vector<T> local_gw_R(in_channels_, 0);
 
-            // SLM Local Grads
-            std::vector<T> local_g_slm_w1, local_g_slm_b1;
-            std::vector<T> local_g_slm_w2, local_g_slm_b2;
+            std::vector<T> local_g_srig_w, local_g_srig_b;
             if (use_slm_) {
-                local_g_slm_w1.resize(in_channels_ * 5, 0.0);
-                local_g_slm_b1.resize(in_channels_, 0.0);
-                local_g_slm_w2.resize(in_channels_ * 5, 0.0);
-                local_g_slm_b2.resize(in_channels_, 0.0);
+                local_g_srig_w.resize(in_channels_ * 5, 0.0);
+                local_g_srig_b.resize(in_channels_, 0.0);
             }
 
             std::vector<T, core::AlignedAllocator<T>> buf_grad(std::max(in_channels_, out_channels_));
             std::vector<T, core::AlignedAllocator<T>> buf_eyes(in_channels_);
             std::vector<T, core::AlignedAllocator<T>> d_eyes(in_channels_);
 
-            // SLM temp buffers (RIG sized)
             std::vector<T, core::AlignedAllocator<T>> buf_est;
-            std::vector<T, core::AlignedAllocator<T>> buf_hidden;
             std::vector<T, core::AlignedAllocator<T>> buf_gate;
-
-            // Gradients buffers
             std::vector<T, core::AlignedAllocator<T>> d_est;
-            std::vector<T, core::AlignedAllocator<T>> d_hidden;
             std::vector<T, core::AlignedAllocator<T>> d_gate;
 
-            std::vector<T, core::AlignedAllocator<T>> buf_temp; // Scratch for permute
+            // Zenith-SRIG specific
+            std::vector<T, core::AlignedAllocator<T>> buf_act;
+
+            std::vector<T, core::AlignedAllocator<T>> buf_temp;
 
             if (use_slm_ || use_sequency_) buf_temp.resize(in_channels_);
 
             if (use_slm_) {
-                buf_est.resize((rig_iterations_ + 1) * in_channels_);
-                buf_hidden.resize(rig_iterations_ * in_channels_);
-                buf_gate.resize(rig_iterations_ * in_channels_);
-
-                d_est.resize((rig_iterations_ + 1) * in_channels_);
-                d_hidden.resize(in_channels_); // Can reuse layer-wise
+                buf_est.resize((srig_iterations_ + 1) * in_channels_);
+                buf_gate.resize(srig_iterations_ * in_channels_);
+                buf_act.resize(srig_iterations_ * in_channels_);
+                d_est.resize((srig_iterations_ + 1) * in_channels_);
                 d_gate.resize(in_channels_);
             }
 
@@ -591,20 +542,15 @@ public:
                 for(size_t h=0; h<H_out; ++h) {
                     for(size_t w=0; w<W_out; ++w) {
                         size_t out_idx = ((n*H_out + h)*W_out + w)*out_channels_;
-
                         for(size_t c=0; c<out_channels_; ++c) buf_grad[c] = d_mix_ptr[out_idx + c];
 
-                        if(use_ifwht_) {
-                             // Lazy Norm: No explicit 1/N multiply. WHT is unitary up to N.
-                             algo::WHT::fwht_1d(buf_grad.data(), out_channels_);
-                        }
+                        if(use_ifwht_) algo::WHT::fwht_1d(buf_grad.data(), out_channels_);
 
                         size_t idx = ((n*H_out + h)*W_out + w)*in_channels_;
                         for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] = eyes_ptr[idx+c];
 
                         algo::WHT::fwht_1d(buf_eyes.data(), in_channels_);
 
-                        // Permute Natural -> Sequency (Forward Logic)
                         if (use_sequency_) {
                             if constexpr (std::is_same_v<T, float>) {
                                 #ifdef DREIDEL_ARCH_AVX2
@@ -618,79 +564,113 @@ public:
                             std::memcpy(buf_eyes.data(), buf_temp.data(), in_channels_ * sizeof(T));
                         }
 
-                        // Zenith-RIG Forward Recompute (for Backward)
+                        // Mixer Backward: buf_grad -> d_eyes
+                        if (in_channels_ == out_channels_) {
+                            const T* w_L = mix_w;
+                            const T* w_C = mix_w + in_channels_;
+                            const T* w_R = mix_w + 2 * in_channels_;
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T d_out = buf_grad[c];
+                                T val_c = buf_eyes[c];
+                                T val_prev = (c == 0) ? 0 : buf_eyes[c - 1];
+                                T val_next = (c == in_channels_ - 1) ? 0 : buf_eyes[c + 1];
+
+                                local_gw_C[c] += d_out * val_c;
+                                local_gw_L[c] += d_out * val_prev;
+                                local_gw_R[c] += d_out * val_next;
+                            }
+                            // Compute d_eyes (dL/dInput)
+                            std::fill(d_eyes.begin(), d_eyes.end(), 0);
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T d_out = buf_grad[c];
+                                d_eyes[c] += d_out * w_C[c];
+                                if (c < in_channels_ - 1) d_eyes[c+1] += d_out * w_R[c]; // w_R multiplies next
+                                if (c > 0) d_eyes[c-1] += d_out * w_L[c]; // w_L multiplies prev
+                            }
+                        } else {
+                             std::fill(d_eyes.begin(), d_eyes.end(), 0);
+                             size_t min_c = std::min(in_channels_, out_channels_);
+                             const T* w_L = mix_w;
+                             const T* w_C = mix_w + in_channels_;
+                             const T* w_R = mix_w + 2 * in_channels_;
+                             for(size_t c=0; c<min_c; ++c) {
+                                T d_out = buf_grad[c];
+                                T val_c = buf_eyes[c];
+                                T val_prev = (c == 0) ? 0 : buf_eyes[c - 1];
+                                T val_next = (c == in_channels_ - 1) ? 0 : buf_eyes[c + 1];
+                                local_gw_C[c] += d_out * val_c;
+                                local_gw_L[c] += d_out * val_prev;
+                                local_gw_R[c] += d_out * val_next;
+
+                                d_eyes[c] += d_out * w_C[c];
+                                if (c < in_channels_ - 1) d_eyes[c+1] += d_out * w_R[c];
+                                if (c > 0) d_eyes[c-1] += d_out * w_L[c];
+                             }
+                        }
+
+                        // SRIG Forward Recompute
                         if (use_slm_) {
-                            // 1. Initialize Est[0]
                             T* est_0 = buf_est.data();
                             for(size_t c=0; c<in_channels_; ++c) est_0[c] = std::abs(buf_eyes[c]);
 
-                            // 2. Unrolled Loop (Replay)
-                            for(size_t k=0; k<rig_iterations_; ++k) {
+                            for(size_t k=0; k<srig_iterations_; ++k) {
                                 const T* curr_est = buf_est.data() + k * in_channels_;
                                 T* next_est = buf_est.data() + (k+1) * in_channels_;
-                                T* curr_hidden = buf_hidden.data() + k * in_channels_;
                                 T* curr_gate = buf_gate.data() + k * in_channels_;
+                                T* curr_act = buf_act.data() + k * in_channels_;
 
                                 for(size_t c=0; c<in_channels_; ++c) {
-                                    T val = slm_b1_ptr[c];
-                                    const T* w = slm_w1_ptr + c * 5;
-                                    if (c >= 2) val += w[0] * curr_est[c-2];
-                                    if (c >= 1) val += w[1] * curr_est[c-1];
-                                    val += w[2] * curr_est[c];
-                                    if (c + 1 < in_channels_) val += w[3] * curr_est[c+1];
-                                    if (c + 2 < in_channels_) val += w[4] * curr_est[c+2];
-                                    curr_hidden[c] = (val > 0) ? val : 0;
-                                }
+                                    T sum_sq = 0;
+                                    if (c>=2) sum_sq += curr_est[c-2]*curr_est[c-2];
+                                    if (c>=1) sum_sq += curr_est[c-1]*curr_est[c-1];
+                                    sum_sq += curr_est[c]*curr_est[c];
+                                    if (c + 1 < in_channels_) sum_sq += curr_est[c+1]*curr_est[c+1];
+                                    if (c + 2 < in_channels_) sum_sq += curr_est[c+2]*curr_est[c+2];
+                                    T mag_x = std::sqrt(sum_sq / 5.0f + 1e-10f);
 
-                                for(size_t c=0; c<in_channels_; ++c) {
-                                    T val = slm_b2_ptr[c];
-                                    const T* w = slm_w2_ptr + c * 5;
-                                    if (c >= 2) val += w[0] * curr_hidden[c-2];
-                                    if (c >= 1) val += w[1] * curr_hidden[c-1];
-                                    val += w[2] * curr_hidden[c];
-                                    if (c + 1 < in_channels_) val += w[3] * curr_hidden[c+1];
-                                    if (c + 2 < in_channels_) val += w[4] * curr_hidden[c+2];
-                                    curr_gate[c] = 1.0f / (1.0f + std::exp(-val));
-                                }
+                                    const T* w = srig_w_ptr + c * 5;
+                                    T dot = 0;
+                                    if (c>=2) dot += w[0] * curr_est[c-2];
+                                    if (c>=1) dot += w[1] * curr_est[c-1];
+                                    dot += w[2] * curr_est[c];
+                                    if (c + 1 < in_channels_) dot += w[3] * curr_est[c+1];
+                                    if (c + 2 < in_channels_) dot += w[4] * curr_est[c+2];
 
-                                for(size_t c=0; c<in_channels_; ++c) {
+                                    T mag_w = mag_w_ptr[c];
+                                    T cosine = dot / (mag_x * mag_w + 1e-6f);
+                                    T gain = std::sqrt(mag_x + 1e-10f);
+                                    T bias = srig_b_ptr[c];
+
+                                    T linear = cosine * gain + bias;
+                                    curr_act[c] = linear; // Store linear for backward
+                                    T act = (linear > 0) ? linear : 0.0f;
+                                    curr_gate[c] = 1.0f / (1.0f + std::exp(-act));
                                     next_est[c] = est_0[c] * curr_gate[c];
                                 }
                             }
-
-                            // buf_eyes holds u_seq (pre-gated). We DO NOT apply final gate here.
-                            // We need u_seq for gradient calculation (dL/dGate = dL/dY * u_seq).
                         }
 
-                        // NOTE: buf_eyes is now in Sequency order (if use_sequency).
-
-                        // dL/dScale & Backprop through Scale & Dropout
-                        // buf_eyes holds `u`. buf_gate holds `Gate`.
-                        const T* final_gate = buf_gate.data() + (rig_iterations_ - 1) * in_channels_;
+                        // Scale Backward
+                        const T* final_gate = use_slm_ ? (buf_gate.data() + (srig_iterations_ - 1) * in_channels_) : nullptr;
 
                         for(size_t c=0; c<in_channels_; ++c) {
-                            T u = buf_eyes[c]; // u_seq
-                            T g = final_gate[c];
-                            T val = u * g; // u * Gate
+                            T u = buf_eyes[c];
+                            T g = use_slm_ ? final_gate[c] : 1.0f;
+                            T val = u * g;
 
                             if (training_ && spectral_dropout_rate_ > 0.0f) {
                                 val *= (dropout_mask_[c] * dropout_scale);
                             }
 
-                            // dL/dScale = dL/dY * val
                             local_g_scale[c] += d_eyes[c] * val;
-
-                            // dL/dVal = dL/dY * Scale
                             d_eyes[c] *= scale_ptr[c];
 
-                            // Backprop Dropout
                             if (training_ && spectral_dropout_rate_ > 0.0f) {
                                 d_eyes[c] *= (dropout_mask_[c] * dropout_scale);
                             }
                         }
 
-                        // Permute d_eyes Natural -> Sequency (Before SLM Backward)
-                        // Input d_eyes is dL/d(Natural). We need dL/d(Sequency) for SLM.
+                        // Permute d_eyes Nat -> Seq (for SRIG Bwd)
                         if (use_sequency_) {
                             if constexpr (std::is_same_v<T, float>) {
                                 #ifdef DREIDEL_ARCH_AVX2
@@ -704,99 +684,173 @@ public:
                             std::memcpy(d_eyes.data(), buf_temp.data(), in_channels_ * sizeof(T));
                         }
 
-                        // Zenith-RIG Backward
+                        // SRIG Backward
                         if (use_slm_) {
-                            // d_eyes is dL/d(u * Gate).
-                            // buf_eyes is `u`.
-                            // final_gate is `Gate`.
-
-                            // Initialize d_est buffer to 0
                             std::fill(d_est.begin(), d_est.end(), 0.0f);
 
                             for(size_t c=0; c<in_channels_; ++c) {
                                 T g = final_gate[c];
-                                T u = buf_eyes[c];
+                                T u = buf_eyes[c]; // buf_eyes is Natural here if use_sequency=false.
+                                // Wait, if use_sequency_, buf_eyes was permuted to Natural before Mixer!
+                                // But SRIG ran in Sequency domain (if enabled).
+                                // So we need u in Sequency domain?
+                                // Let's check Forward.
+                                // Eyes -> WHT -> Permute(Nat->Seq) -> SRIG -> Permute(Seq->Nat) -> Scale.
+                                // In Backward:
+                                // buf_eyes loaded. WHT.
+                                // Permute(Nat->Seq).
+                                // SRIG Forward Recompute (Sequency Domain).
+                                // buf_eyes IS in Sequency Domain (because we did not reverse permute).
 
-                                // 1. Gradient to Final Gate
-                                // dL/dGate = dL/d(u*g) * u
+                                // WAIT! In forward:
+                                // Permute(Nat->Seq). SRIG. Permute(Seq->Nat). Scale.
+                                // Scale input is Nat.
+                                // buf_eyes (in backward so far) was WHT'd.
+                                // Then we check Permute(Nat->Seq) BEFORE SRIG Recompute.
+                                // So buf_eyes is in Seq domain here.
+
+                                // BUT! We used buf_eyes for Mixer Backward!
+                                // Mixer works in Natural domain (usually).
+                                // In Forward: Scale -> Mixer.
+                                // Scale input was Natural.
+                                // So buf_eyes MUST be Natural for Mixer Backward and Scale Backward.
+
+                                // In Backward recompute:
+                                // Eyes -> WHT -> Permute(Nat->Seq) -> SRIG -> Permute(Seq->Nat).
+                                // We missed the re-permutation to Natural before Mixer Bwd!
+                                // In my previous code:
+                                // ... WHT(buf_eyes) ...
+                                // Permute(Nat->Seq).
+                                // Mixer Bwd using buf_eyes.
+                                // Scale Bwd using buf_eyes.
+
+                                // THIS IS WRONG if use_sequency_ is true.
+                                // Mixer and Scale operate on Natural domain.
+                                // But buf_eyes is Seq.
+
+                                // FIX:
+                                // 1. WHT(buf_eyes).
+                                // 2. If use_sequency_: Permute(Nat->Seq).
+                                // 3. SRIG Forward (Seq domain).
+                                // 4. If use_sequency_: Permute(Seq->Nat).
+                                // 5. Mixer Backward (Nat).
+                                // 6. Scale Backward (Nat).
+                                // 7. If use_sequency_: Permute d_eyes (Nat->Seq).
+                                // 8. SRIG Backward (Seq).
+                                // 9. If use_sequency_: Permute d_eyes (Seq->Nat).
+
+                                // My current implementation of Backward Recompute:
+                                // 1. WHT(buf_eyes).
+                                // 2. If use_sequency_: Permute(Nat->Seq).
+                                // 3. Mixer Bwd (using buf_eyes). <-- WRONG if Seq.
+                                // 4. SRIG Fwd.
+
+                                // Also, SRIG Fwd modifies buf_eyes.
+                                // But in Bwd, we are recomputing.
+
+                                // Let's correct this flow.
+                                // Also d_gate needs `u` which is input to Gate (Seq domain).
+
                                 d_gate[c] = d_eyes[c] * u;
-
-                                // 2. Update d_eyes to hold dL/du partial (dL/d(u*g) * g)
                                 d_eyes[c] = d_eyes[c] * g;
                             }
 
-                            // BPTT Loop (k = iterations-1 down to 0)
-                            for(int k = (int)rig_iterations_ - 1; k >= 0; --k) {
+                            for(int k = (int)srig_iterations_ - 1; k >= 0; --k) {
                                 const T* curr_gate = buf_gate.data() + k * in_channels_;
-                                const T* curr_hidden = buf_hidden.data() + k * in_channels_;
                                 const T* curr_est = buf_est.data() + k * in_channels_;
-                                const T* est_0 = buf_est.data(); // Always Input Mag
+                                const T* curr_act = buf_act.data() + k * in_channels_;
+                                const T* est_0 = buf_est.data();
 
-                                // dL/dGate[k] is in d_gate.
-                                // Note: For k < last, d_gate comes from next_est.
-                                // Est[k+1] = Est[0] * Gate[k].
-                                // dL/dGate[k] += dL/dEst[k+1] * Est[0].
-                                if (k < (int)rig_iterations_ - 1) {
+                                if (k < (int)srig_iterations_ - 1) {
                                     T* d_next_est = d_est.data() + (k+1) * in_channels_;
                                     for(size_t c=0; c<in_channels_; ++c) {
                                         d_gate[c] += d_next_est[c] * est_0[c];
                                     }
                                 }
 
-                                // Backprop Gate -> Logits -> Layer 2 -> Hidden
-                                std::fill(d_hidden.begin(), d_hidden.end(), 0.0f);
-                                for(size_t c=0; c<in_channels_; ++c) {
-                                    T g = curr_gate[c];
-                                    T d_g = d_gate[c];
-                                    T d_z2 = d_g * g * (1.0f - g); // Sigmoid deriv
-
-                                    local_g_slm_b2[c] += d_z2;
-
-                                    T* w_g = local_g_slm_w2.data() + c * 5;
-                                    const T* w_fwd = slm_w2_ptr + c * 5;
-
-                                    if (c >= 2) { w_g[0] += d_z2 * curr_hidden[c-2]; d_hidden[c-2] += d_z2 * w_fwd[0]; }
-                                    if (c >= 1) { w_g[1] += d_z2 * curr_hidden[c-1]; d_hidden[c-1] += d_z2 * w_fwd[1]; }
-                                    w_g[2] += d_z2 * curr_hidden[c]; d_hidden[c] += d_z2 * w_fwd[2];
-                                    if (c + 1 < in_channels_) { w_g[3] += d_z2 * curr_hidden[c+1]; d_hidden[c+1] += d_z2 * w_fwd[3]; }
-                                    if (c + 2 < in_channels_) { w_g[4] += d_z2 * curr_hidden[c+2]; d_hidden[c+2] += d_z2 * w_fwd[4]; }
-                                }
-
-                                // Backprop Hidden -> Layer 1 -> Input(Est[k])
                                 T* d_curr_est = d_est.data() + k * in_channels_;
+
                                 for(size_t c=0; c<in_channels_; ++c) {
-                                    T d_h = d_hidden[c];
-                                    if (curr_hidden[c] <= 0) d_h = 0; // ReLU
+                                    // Recompute forward stats (local)
+                                    // Use curr_est
+                                    T sum_sq = 0;
+                                    if (c>=2) sum_sq += curr_est[c-2]*curr_est[c-2];
+                                    if (c>=1) sum_sq += curr_est[c-1]*curr_est[c-1];
+                                    sum_sq += curr_est[c]*curr_est[c];
+                                    if (c + 1 < in_channels_) sum_sq += curr_est[c+1]*curr_est[c+1];
+                                    if (c + 2 < in_channels_) sum_sq += curr_est[c+2]*curr_est[c+2];
+                                    T mag_x = std::sqrt(sum_sq / 5.0f + 1e-10f);
 
-                                    local_g_slm_b1[c] += d_h;
+                                    const T* w = srig_w_ptr + c * 5;
+                                    T dot = 0;
+                                    if (c>=2) dot += w[0] * curr_est[c-2];
+                                    if (c>=1) dot += w[1] * curr_est[c-1];
+                                    dot += w[2] * curr_est[c];
+                                    if (c + 1 < in_channels_) dot += w[3] * curr_est[c+1];
+                                    if (c + 2 < in_channels_) dot += w[4] * curr_est[c+2];
 
-                                    T* w_g = local_g_slm_w1.data() + c * 5;
-                                    const T* w_fwd = slm_w1_ptr + c * 5;
+                                    T mag_w = mag_w_ptr[c];
+                                    T eps = 1e-6f;
+                                    T denom = mag_x * mag_w + eps;
+                                    T cosine = dot / denom;
+                                    T gain = std::sqrt(mag_x + 1e-10f);
 
-                                    if (c >= 2) { w_g[0] += d_h * curr_est[c-2]; d_curr_est[c-2] += d_h * w_fwd[0]; }
-                                    if (c >= 1) { w_g[1] += d_h * curr_est[c-1]; d_curr_est[c-1] += d_h * w_fwd[1]; }
-                                    w_g[2] += d_h * curr_est[c]; d_curr_est[c] += d_h * w_fwd[2];
-                                    if (c + 1 < in_channels_) { w_g[3] += d_h * curr_est[c+1]; d_curr_est[c+1] += d_h * w_fwd[3]; }
-                                    if (c + 2 < in_channels_) { w_g[4] += d_h * curr_est[c+2]; d_curr_est[c+2] += d_h * w_fwd[4]; }
+                                    T act = curr_act[c];
+                                    T g = curr_gate[c];
+
+                                    T d_g = d_gate[c];
+                                    T d_sigmoid = d_g * g * (1.0f - g);
+                                    T d_linear = (act > 0) ? d_sigmoid : 0.0f; // ReLU deriv
+
+                                    local_g_srig_b[c] += d_linear;
+
+                                    T d_cosine = d_linear * gain;
+                                    T d_gain = d_linear * cosine;
+
+                                    T d_mag_x_from_gain = d_gain * 0.5f / gain;
+                                    T d_mag_x_from_cosine = d_cosine * (-dot * mag_w) / (denom * denom);
+                                    T d_mag_x = d_mag_x_from_gain + d_mag_x_from_cosine;
+
+                                    T d_mag_w = d_cosine * (-dot * mag_x) / (denom * denom);
+                                    T d_dot = d_cosine / denom;
+
+                                    T* gw = local_g_srig_w.data() + c * 5;
+                                    T scale_w = d_mag_w / mag_w;
+                                    for(int kw=0; kw<5; ++kw) gw[kw] += scale_w * w[kw];
+
+                                    if (c>=2) gw[0] += d_dot * curr_est[c-2];
+                                    if (c>=1) gw[1] += d_dot * curr_est[c-1];
+                                    gw[2] += d_dot * curr_est[c];
+                                    if (c + 1 < in_channels_) gw[3] += d_dot * curr_est[c+1];
+                                    if (c + 2 < in_channels_) gw[4] += d_dot * curr_est[c+2];
+
+                                    if (c>=2) d_curr_est[c-2] += d_dot * w[0];
+                                    if (c>=1) d_curr_est[c-1] += d_dot * w[1];
+                                    d_curr_est[c] += d_dot * w[2];
+                                    if (c + 1 < in_channels_) d_curr_est[c+1] += d_dot * w[3];
+                                    if (c + 2 < in_channels_) d_curr_est[c+2] += d_dot * w[4];
+
+                                    T scale_x = d_mag_x / (mag_x * 5.0f + 1e-10f);
+
+                                    if (c>=2) d_curr_est[c-2] += scale_x * curr_est[c-2];
+                                    if (c>=1) d_curr_est[c-1] += scale_x * curr_est[c-1];
+                                    d_curr_est[c] += scale_x * curr_est[c];
+                                    if (c + 1 < in_channels_) d_curr_est[c+1] += scale_x * curr_est[c+1];
+                                    if (c + 2 < in_channels_) d_curr_est[c+2] += scale_x * curr_est[c+2];
                                 }
 
-                                // Reset d_gate for next iteration
                                 std::fill(d_gate.begin(), d_gate.end(), 0.0f);
                             }
 
-                            // Propagate dL/dEst[k] to dL/dEst[0] (Input Mag)
                             T* d_est_0 = d_est.data();
-                            for(size_t k=0; k<rig_iterations_; ++k) {
+                            for(size_t k=0; k<srig_iterations_; ++k) {
                                 const T* gate_k = buf_gate.data() + k * in_channels_;
                                 const T* d_est_k_plus_1 = d_est.data() + (k+1) * in_channels_;
-
                                 for(size_t c=0; c<in_channels_; ++c) {
                                     d_est_0[c] += d_est_k_plus_1[c] * gate_k[c];
                                 }
                             }
 
-                            // Finally: d_eyes += dL/dMag * sgn(u)
-                            // dL/dMag is in d_est[0].
                             for(size_t c=0; c<in_channels_; ++c) {
                                 T u = buf_eyes[c];
                                 T sgn = (u > 0) ? 1.0f : ((u < 0) ? -1.0f : 0.0f);
@@ -804,7 +858,6 @@ public:
                             }
                         }
 
-                        // Permute d_eyes Sequency -> Natural (for IFWHT)
                         if (use_sequency_) {
                             if constexpr (std::is_same_v<T, float>) {
                                 #ifdef DREIDEL_ARCH_AVX2
@@ -827,7 +880,6 @@ public:
                         for(size_t c=0; c<in_channels_; ++c) {
                             T dy = d_eyes[c];
                             if (dy == 0) continue;
-
                             int ih_center = (up_shift > 0) ? ((int)h >> up_shift) : ((int)h / (int)upscale_);
                             int iw_center = (up_shift > 0) ? ((int)w >> up_shift) : ((int)w / (int)upscale_);
 
@@ -837,13 +889,10 @@ public:
                                 for(int kx=-k_rad; kx<=k_rad; ++kx) {
                                     int iw = iw_center + kx;
                                     if(iw < 0 || iw >= (int)W) continue;
-
                                     size_t in_idx = ((n*H + ih)*W + iw)*in_channels_ + c;
                                     T val = input_ptr[in_idx];
-
                                     #pragma omp atomic
                                     g_pack[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)] += dy * val;
-
                                     T w_val = w_pack[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
                                     #pragma omp atomic
                                     gi_ptr[in_idx] += dy * w_val;
@@ -861,14 +910,11 @@ public:
                 for(size_t i=0; i<local_gw_C.size(); ++i) gw_C[i] += local_gw_C[i];
                 for(size_t i=0; i<local_gw_R.size(); ++i) gw_R[i] += local_gw_R[i];
                 if (use_slm_) {
-                    for(size_t i=0; i<local_g_slm_w1.size(); ++i) g_slm_w1[i] += local_g_slm_w1[i];
-                    for(size_t i=0; i<local_g_slm_b1.size(); ++i) g_slm_b1[i] += local_g_slm_b1[i];
-                    for(size_t i=0; i<local_g_slm_w2.size(); ++i) g_slm_w2[i] += local_g_slm_w2[i];
-                    for(size_t i=0; i<local_g_slm_b2.size(); ++i) g_slm_b2[i] += local_g_slm_b2[i];
+                    for(size_t i=0; i<local_g_srig_w.size(); ++i) g_srig_w[i] += local_g_srig_w[i];
+                    for(size_t i=0; i<local_g_srig_b.size(); ++i) g_srig_b[i] += local_g_srig_b[i];
                 }
             }
         }
-
         return grad_input;
     }
 
@@ -876,10 +922,8 @@ public:
         std::vector<Tensor<T>*> params = {&packed_weights_, &spectral_scales_, &mixing_weights_};
         if (use_gating_) params.push_back(&oracle_projection_);
         if (use_slm_) {
-            params.push_back(&slm_weights1_);
-            params.push_back(&slm_bias1_);
-            params.push_back(&slm_weights2_);
-            params.push_back(&slm_bias2_);
+            params.push_back(&srig_weights_);
+            params.push_back(&srig_bias_);
         }
         auto p = group_norm_->parameters();
         params.insert(params.end(), p.begin(), p.end());
@@ -890,10 +934,8 @@ public:
         std::vector<Tensor<T>*> grads = {&grad_packed_weights_, &grad_spectral_scales_, &grad_mixing_weights_};
         if (use_gating_) grads.push_back(&grad_oracle_projection_);
         if (use_slm_) {
-            grads.push_back(&grad_slm_weights1_);
-            grads.push_back(&grad_slm_bias1_);
-            grads.push_back(&grad_slm_weights2_);
-            grads.push_back(&grad_slm_bias2_);
+            grads.push_back(&grad_srig_weights_);
+            grads.push_back(&grad_srig_bias_);
         }
         auto g = group_norm_->gradients();
         grads.insert(grads.end(), g.begin(), g.end());
@@ -924,31 +966,25 @@ private:
     static inline void permute_avx2(float* out, const float* in, const int32_t* indices, size_t N) {
         #ifdef DREIDEL_ARCH_AVX2
         size_t i = 0;
-        // Unroll by 4 (8 floats * 4 = 32 floats per loop)
         for (; i + 32 <= N; i += 32) {
-             // Gather 4 blocks of 8
              __m256i idx0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i));
              __m256i idx1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i + 8));
              __m256i idx2 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i + 16));
              __m256i idx3 = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i + 24));
-
              __m256 r0 = _mm256_i32gather_ps(in, idx0, 4);
              __m256 r1 = _mm256_i32gather_ps(in, idx1, 4);
              __m256 r2 = _mm256_i32gather_ps(in, idx2, 4);
              __m256 r3 = _mm256_i32gather_ps(in, idx3, 4);
-
              _mm256_store_ps(out + i, r0);
              _mm256_store_ps(out + i + 8, r1);
              _mm256_store_ps(out + i + 16, r2);
              _mm256_store_ps(out + i + 24, r3);
         }
-        // Fallback for remaining (still AVX for multiples of 8)
         for (; i + 8 <= N; i += 8) {
             __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(indices + i));
             __m256 r = _mm256_i32gather_ps(in, idx, 4);
             _mm256_store_ps(out + i, r);
         }
-        // Scalar tail (likely N is power of 2 so 0, but good to have)
         for (; i < N; ++i) {
             out[i] = in[indices[i]];
         }
@@ -957,19 +993,17 @@ private:
     Tensor<T> spectral_scales_;
     Tensor<T> mixing_weights_;
     Tensor<T> oracle_projection_;
-    Tensor<T> slm_weights1_;
-    Tensor<T> slm_bias1_;
-    Tensor<T> slm_weights2_;
-    Tensor<T> slm_bias2_;
+
+    Tensor<T> srig_weights_;
+    Tensor<T> srig_bias_;
 
     Tensor<T> grad_packed_weights_;
     Tensor<T> grad_spectral_scales_;
     Tensor<T> grad_mixing_weights_;
     Tensor<T> grad_oracle_projection_;
-    Tensor<T> grad_slm_weights1_;
-    Tensor<T> grad_slm_bias1_;
-    Tensor<T> grad_slm_weights2_;
-    Tensor<T> grad_slm_bias2_;
+
+    Tensor<T> grad_srig_weights_;
+    Tensor<T> grad_srig_bias_;
 
     Tensor<T> input_cached_;
     Tensor<T> eyes_out_cached_;
