@@ -43,7 +43,7 @@ void test_l1_resident_eye() {
     // If spectral_dim is 1024*1024, we use:
     // ZenithBlock(in, out, k, spectral_dim, ifwht, ...)
     // Explicitly cast spectral_dim to size_t to avoid int -> bool ambiguity
-    layers::ZenithBlock<float> zenith(C, C, K, (size_t)(1024*1024), false); // Explicit in, out, k, spectral, ifwht
+    layers::ZenithBlock<float> zenith(C, C, K, (size_t)(1024*1024), false, false, false, 1, 1, "he", false, false); // Explicit in, out, k, spectral, ifwht
 
     // Input Tensor (Random)
     Tensor<float> input({1, H, W, C});
@@ -82,7 +82,7 @@ void test_memory_wall() {
     size_t W = 512;
     size_t K = 3;
 
-    layers::ZenithBlock<float> zenith(C, C, K, (size_t)(10*1024*1024), false); // Larger arena -> spectral_dim
+    layers::ZenithBlock<float> zenith(C, C, K, (size_t)(10*1024*1024), false, false, false, 1, 1, "he", false, false); // Larger arena -> spectral_dim
 
     Tensor<float> input({1, H, W, C});
     input.random(-1.0, 1.0);
@@ -128,11 +128,11 @@ void test_sparsity_breakeven() {
     input.random(-1.0, 1.0);
 
     // Gating OFF
-    layers::ZenithBlock<float> zenith_off(C, C, K, 1024*1024, false, false, false); // ... ifwht, dilated, gating
+    layers::ZenithBlock<float> zenith_off(C, C, K, (size_t)(1024*1024), false, false, false, 1, 1, "he", false, false); // ... ifwht, dilated, gating
     double t_off = time_execution([&]() { zenith_off.forward(input); }, 100);
 
     // Gating ON
-    layers::ZenithBlock<float> zenith_on(C, C, K, 1024*1024, false, false, true); // ... ifwht, dilated, gating
+    layers::ZenithBlock<float> zenith_on(C, C, K, (size_t)(1024*1024), false, false, true, 1, 1, "he", false, false); // ... ifwht, dilated, gating
     double t_on = time_execution([&]() { zenith_on.forward(input); }, 100);
 
     std::cout << "  - Gating OFF Time: " << t_off << "s" << std::endl;

@@ -15,12 +15,12 @@ struct Ops {
 
     // Load 16 floats
     static inline __m512 load(const float* src) {
-        return _mm512_load_ps(src);
+        return _mm512_loadu_ps(src);
     }
 
     // Store 16 floats
     static inline void store(float* dst, __m512 val) {
-        _mm512_store_ps(dst, val);
+        _mm512_storeu_ps(dst, val);
     }
 
     // Streaming Store (Non-Temporal)
@@ -71,11 +71,11 @@ struct Ops {
     static constexpr int SIMD_WIDTH = 8; // 8 floats in 256 bits
 
     static inline __m256 load(const float* src) {
-        return _mm256_load_ps(src);
+        return _mm256_loadu_ps(src);
     }
 
     static inline void store(float* dst, __m256 val) {
-        _mm256_store_ps(dst, val);
+        _mm256_storeu_ps(dst, val);
     }
 
     // Streaming Store (Non-Temporal)

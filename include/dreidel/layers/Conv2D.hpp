@@ -104,7 +104,8 @@ public:
         auto i_shape = input_.shape();
         size_t H = i_shape[1];
         size_t W = i_shape[2];
-        size_t C_in = in_channels_;
+        // Use actual input channels to prevent OOB if mismatch occurred
+        size_t C_in = i_shape.size() > 3 ? i_shape[3] : in_channels_;
 
         Tensor<T> grad_input(i_shape);
         grad_input.fill(0);

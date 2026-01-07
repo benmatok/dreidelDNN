@@ -8,6 +8,7 @@
 #include <numeric>
 #include <fstream>
 #include <iomanip>
+#include <cmath>
 
 using namespace dreidel;
 
@@ -28,28 +29,26 @@ T compute_mse(const Tensor<T>& a, const Tensor<T>& b) {
 }
 
 template <typename T>
-void train_model(layers::Layer<T>* model, const std::vector<Tensor<T>>& dataset, const std::string& name,
-                 int steps, size_t batch_size, std::vector<double>& loss_history, bool use_clipping = false) {
+double train_run(const std::vector<Tensor<T>>& dataset, int steps, bool use_slm, size_t base_channels) {
+    // Instantiate a fresh model
+    // base_channels=8 for speed (vs 32 default)
+    // 8 -> 128 -> 2048 channels.
+    models::ZenithHierarchicalAE<T> model(3, base_channels, true, "he", use_slm);
 
-    std::cout << "Training " << name << "..." << std::endl;
-
-    optim::SimpleAdam<T> optimizer(0.0005);
-    if (use_clipping) {
-        optimizer.set_coordinate_wise_clipping(true, 1.0);
-    }
-    optimizer.add_parameters(model->parameters(), model->gradients());
+    optim::SimpleAdam<T> optimizer(0.0001); // Stable LR
+    optimizer.add_parameters(model.parameters(), model.gradients());
 
     size_t dataset_size = dataset.size();
+    double final_loss = 0;
 
     for(int step=0; step<steps; ++step) {
-        // Sample random image from dataset (Simple cycling for benchmark)
         const Tensor<T>& input = dataset[step % dataset_size];
 
         optimizer.zero_grad();
-        Tensor<T> output = model->forward(input);
+        Tensor<T> output = model.forward(input);
 
         T mse = compute_mse(input, output);
-        loss_history.push_back(static_cast<double>(mse));
+        final_loss = static_cast<double>(mse);
 
         // Backward
         Tensor<T> grad_output(output.shape());
@@ -63,13 +62,10 @@ void train_model(layers::Layer<T>* model, const std::vector<Tensor<T>>& dataset,
             g_ptr[i] = (out_ptr[i] - in_ptr[i]) * scale;
         }
 
-        model->backward(grad_output);
+        model.backward(grad_output);
         optimizer.step();
-
-        if (step % 500 == 0) {
-            std::cout << "  Step " << step << " | Loss: " << mse << std::endl;
-        }
     }
+    return final_loss;
 }
 
 int main() {
@@ -78,43 +74,70 @@ int main() {
     size_t C = 3;
     size_t batch_size = 4;
 
-    // Reduced to 1500 to fit sandbox limits
-    int steps = 1500;
-    int dataset_size = 200; // 200 distinct batches
+    int steps = 800;
+    int num_runs = 5;
+    size_t base_channels = 8; // Reduced for speed
 
-    std::cout << "Pre-generating dataset (" << dataset_size << " batches)..." << std::endl;
+    std::cout << "Pre-generating dataset (200 batches)..." << std::endl;
     utils::WaveletGenerator2D<float> gen(H, W);
     std::vector<Tensor<float>> dataset;
-    dataset.reserve(dataset_size);
-    for(int i=0; i<dataset_size; ++i) {
+    dataset.reserve(200);
+    for(int i=0; i<200; ++i) {
         Tensor<float> t({batch_size, H, W, C});
         gen.generate_batch(t, batch_size);
         dataset.push_back(std::move(t));
     }
 
-    // 1. Standard Zenith (He, PE=True, SLM=False)
-    std::cout << "=== Experiment 1: Standard Zenith (He, PE) ===" << std::endl;
-    models::ZenithHierarchicalAE<float> model_std(C, 32, true, "he", false);
-    std::vector<double> loss_std;
-    train_model(&model_std, dataset, "Standard Zenith", steps, batch_size, loss_std, false);
+    std::cout << "\nStarting Statistical Benchmark (" << num_runs << " runs, " << steps << " steps, base_ch=" << base_channels << ")" << std::endl;
 
-    // 2. Zenith-SLM (He, PE=True, SLM=True)
-    std::cout << "\n=== Experiment 2: Zenith-SLM (He, PE, SLM) ===" << std::endl;
-    models::ZenithHierarchicalAE<float> model_slm(C, 32, true, "he", true);
-    std::vector<double> loss_slm;
-    train_model(&model_slm, dataset, "Zenith-SLM", steps, batch_size, loss_slm, false);
-
-    // Save Results
-    std::ofstream csv("benchmark_results_slm.csv");
-    csv << "Step,Standard,SLM\n";
-    for(size_t i=0; i<loss_std.size(); ++i) {
-        if (i % 10 == 0) {
-             csv << i << "," << loss_std[i] << "," << loss_slm[i] << "\n";
-        }
+    // 1. Standard Zenith
+    std::cout << "\n--- Standard Zenith (No SLM) ---" << std::endl;
+    std::vector<double> std_losses;
+    for(int i=0; i<num_runs; ++i) {
+        auto start = std::chrono::high_resolution_clock::now();
+        double loss = train_run(dataset, steps, false, base_channels);
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        std_losses.push_back(loss);
+        std::cout << "Run " << i+1 << ": Loss = " << loss << " (" << elapsed.count() << "s)" << std::endl;
     }
-    csv.close();
 
-    std::cout << "Results saved to benchmark_results_ablation.csv" << std::endl;
+    // 2. Zenith-SRIG
+    std::cout << "\n--- Zenith-SRIG (With SLM) ---" << std::endl;
+    std::vector<double> srig_losses;
+    for(int i=0; i<num_runs; ++i) {
+        auto start = std::chrono::high_resolution_clock::now();
+        double loss = train_run(dataset, steps, true, base_channels);
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        srig_losses.push_back(loss);
+        std::cout << "Run " << i+1 << ": Loss = " << loss << " (" << elapsed.count() << "s)" << std::endl;
+    }
+
+    // Statistics
+    auto compute_stats = [](const std::vector<double>& v) {
+        double sum = std::accumulate(v.begin(), v.end(), 0.0);
+        double mean = sum / v.size();
+        double sq_sum = std::inner_product(v.begin(), v.end(), v.begin(), 0.0);
+        double stdev = std::sqrt(sq_sum / v.size() - mean * mean);
+        return std::make_pair(mean, stdev);
+    };
+
+    auto [std_mean, std_dev] = compute_stats(std_losses);
+    auto [srig_mean, srig_dev] = compute_stats(srig_losses);
+
+    std::cout << "\n=== Results Summary ===" << std::endl;
+    std::cout << "Standard Zenith: Mean Loss = " << std_mean << " (std: " << std_dev << ")" << std::endl;
+    std::cout << "Zenith-SRIG    : Mean Loss = " << srig_mean << " (std: " << srig_dev << ")" << std::endl;
+
+    double improvement = (std_mean - srig_mean) / std_mean * 100.0;
+    std::cout << "Improvement: " << improvement << "%" << std::endl;
+
+    if (srig_mean < std_mean && (std_mean - srig_mean) > srig_dev) {
+        std::cout << "Result: CONSISTENT IMPROVEMENT" << std::endl;
+    } else {
+        std::cout << "Result: INCONCLUSIVE (High Variance)" << std::endl;
+    }
 
     return 0;
 }
