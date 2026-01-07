@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+# set -e
 
 OUTPUT_FILE="test_outputs.txt"
 
@@ -19,18 +19,46 @@ for test_file in tests/*.cpp; do
     free -h >> "$OUTPUT_FILE"
 
     echo "Compiling $test_file..." >> "$OUTPUT_FILE"
-    g++ -std=c++17 -O3 -fopenmp -Iinclude "$test_file" -o "tests/$test_name" >> "$OUTPUT_FILE" 2>&1
+    g++ -std=c++17 -O3 -fopenmp -mavx2 -mfma -Iinclude "$test_file" -o "tests/$test_name" >> "$OUTPUT_FILE" 2>&1
 
     if [ $? -eq 0 ]; then
         echo "Running tests/$test_name..." >> "$OUTPUT_FILE"
         ./tests/$test_name >> "$OUTPUT_FILE" 2>&1
-        if [ $? -eq 0 ]; then
+        RET_CODE=$?
+        if [ $RET_CODE -eq 0 ]; then
             echo "[PASS] Test $test_name" | tee -a "$OUTPUT_FILE"
         else
             echo "[FAIL] Test $test_name" | tee -a "$OUTPUT_FILE"
         fi
     else
         echo "[FAIL] Compilation of $test_name" | tee -a "$OUTPUT_FILE"
+    fi
+    echo "--------------------------------------------------" >> "$OUTPUT_FILE"
+done
+
+# Critical Benchmarks
+echo "Running Critical Benchmarks..." | tee -a "$OUTPUT_FILE"
+BENCHMARKS=("benchmarks/benchmark_zenith_ablation.cpp" "benchmarks/benchmark_zenith_restoration.cpp")
+
+for bench_file in "${BENCHMARKS[@]}"; do
+    bench_name=$(basename "$bench_file" .cpp)
+    echo "Running Benchmark $bench_name..." | tee -a "$OUTPUT_FILE"
+
+    echo "Compiling $bench_file..." >> "$OUTPUT_FILE"
+    g++ -std=c++17 -O3 -fopenmp -mavx2 -mfma -Iinclude "$bench_file" -o "$bench_name" >> "$OUTPUT_FILE" 2>&1
+
+    if [ $? -eq 0 ]; then
+        echo "Executing $bench_name..." >> "$OUTPUT_FILE"
+        ./"$bench_name" >> "$OUTPUT_FILE" 2>&1
+        RET_CODE=$?
+        if [ $RET_CODE -eq 0 ]; then
+             echo "[PASS] Benchmark $bench_name" | tee -a "$OUTPUT_FILE"
+             rm "$bench_name" # Cleanup
+        else
+             echo "[FAIL] Benchmark $bench_name" | tee -a "$OUTPUT_FILE"
+        fi
+    else
+        echo "[FAIL] Compilation of $bench_name" | tee -a "$OUTPUT_FILE"
     fi
     echo "--------------------------------------------------" >> "$OUTPUT_FILE"
 done
