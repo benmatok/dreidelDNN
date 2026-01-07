@@ -38,6 +38,7 @@ public:
           oracle_projection_({1, in_channels}),
           srig_weights_({5, in_channels}),
           srig_bias_({1, in_channels}),
+          srig_gamma_({1, in_channels}),
 
           grad_packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           grad_spectral_scales_({1, in_channels}),
@@ -45,6 +46,7 @@ public:
           grad_oracle_projection_({1, in_channels}),
           grad_srig_weights_({5, in_channels}),
           grad_srig_bias_({1, in_channels}),
+          grad_srig_gamma_({1, in_channels}),
           rng_(std::random_device{}())
     {
         if ((in_channels_ & (in_channels_ - 1)) != 0) {
@@ -61,8 +63,10 @@ public:
             // Weights: He Init
             T stddev = std::sqrt(2.0f / 5.0f);
             srig_weights_.random(0, stddev);
-            // Bias: -1.0 to close the gate on noise (Learned Noise Floor)
-            srig_bias_.fill(-1.0f);
+            // Bias: 0.5 (Barrier)
+            srig_bias_.fill(0.5f);
+            // Gamma: 0.1 (Sensitivity)
+            srig_gamma_.fill(0.1f);
         }
 
         // Zero Grads
@@ -72,6 +76,7 @@ public:
         grad_oracle_projection_.fill(0);
         grad_srig_weights_.fill(0);
         grad_srig_bias_.fill(0);
+        grad_srig_gamma_.fill(0);
 
         // 2. GroupNorm (Hardcoded Standard)
         size_t groups = 32;
@@ -187,6 +192,7 @@ public:
 
         const T* srig_w_ptr = use_slm_ ? srig_weights_.data() : nullptr;
         const T* srig_b_ptr = use_slm_ ? srig_bias_.data() : nullptr;
+        const T* srig_g_ptr = use_slm_ ? srig_gamma_.data() : nullptr;
 
         T dropout_scale = (apply_dropout) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
 
@@ -322,18 +328,29 @@ public:
 
                                     T mag_w = mag_w_ptr[c];
                                     T cosine = dot / (mag_x * mag_w + 1e-6f);
-                                    T gain = std::sqrt(mag_x + 1e-10f);
-                                    T bias_param = srig_b_ptr[c];
+                                    // T gain = std::sqrt(mag_x + 1e-10f); // Unused
 
-                                    // Zenith-L0 Logic: Adaptive Bias
-                                    T denom_bias = std::abs(curr_est[c]) + 1e-3f;
-                                    T adaptive_bias = bias_param / denom_bias;
+                                    T bias_val = srig_b_ptr[c];
+                                    T gamma_val = srig_g_ptr[c];
+                                    T est_mag = std::abs(curr_est[c]);
 
-                                    T linear = cosine * gain + adaptive_bias;
-                                    curr_act[c] = linear;
+                                    T bias_reduction = bias_val - (gamma_val * est_mag);
+                                    T effective_bias = (bias_reduction > 0) ? bias_reduction : 0.0f;
+                                    T activation = cosine - effective_bias;
 
-                                    T act = (linear > 0) ? linear : 0.0f;
-                                    T gate = 1.0f / (1.0f + std::exp(-act));
+                                    T gate = (activation > 0) ? activation : 0.0f;
+
+                                    if (monitor_sparsity_ && n==0 && h_out==0 && w_out==0 && c==0) {
+                                        std::cout << "DEBUG k=" << k
+                                                  << " est=" << curr_est[c]
+                                                  << " bias=" << bias_val
+                                                  << " gamma=" << gamma_val
+                                                  << " eff_bias=" << effective_bias
+                                                  << " act=" << activation
+                                                  << " gate=" << gate << std::endl;
+                                    }
+
+                                    curr_act[c] = activation;
                                     curr_gate[c] = gate;
                                     next_est[c] = est_0[c] * gate;
                                 }
@@ -466,8 +483,10 @@ public:
 
         T* g_srig_w = use_slm_ ? grad_srig_weights_.data() : nullptr;
         T* g_srig_b = use_slm_ ? grad_srig_bias_.data() : nullptr;
+        T* g_srig_g = use_slm_ ? grad_srig_gamma_.data() : nullptr;
         const T* srig_w_ptr = use_slm_ ? srig_weights_.data() : nullptr;
         const T* srig_b_ptr = use_slm_ ? srig_bias_.data() : nullptr;
+        const T* srig_g_ptr = use_slm_ ? srig_gamma_.data() : nullptr;
 
         T dropout_scale = (training_ && spectral_dropout_rate_ > 0.0f) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
 
@@ -541,10 +560,11 @@ public:
             std::vector<T> local_gw_C(in_channels_, 0);
             std::vector<T> local_gw_R(in_channels_, 0);
 
-            std::vector<T> local_g_srig_w, local_g_srig_b;
+            std::vector<T> local_g_srig_w, local_g_srig_b, local_g_srig_g;
             if (use_slm_) {
                 local_g_srig_w.resize(in_channels_ * 5, 0.0);
                 local_g_srig_b.resize(in_channels_, 0.0);
+                local_g_srig_g.resize(in_channels_, 0.0);
             }
 
             std::vector<T, core::AlignedAllocator<T>> buf_grad(std::max(in_channels_, out_channels_));
@@ -675,17 +695,18 @@ public:
 
                                     T mag_w = mag_w_ptr[c];
                                     T cosine = dot / (mag_x * mag_w + 1e-6f);
-                                    T gain = std::sqrt(mag_x + 1e-10f);
-                                    T bias_param = srig_b_ptr[c];
+                                    // T gain = std::sqrt(mag_x + 1e-10f); // Unused
 
-                                    // Zenith-L0 Logic: Adaptive Bias
-                                    T denom_bias = std::abs(curr_est[c]) + 1e-3f;
-                                    T adaptive_bias = bias_param / denom_bias;
+                                    T bias_val = srig_b_ptr[c];
+                                    T gamma_val = srig_g_ptr[c];
+                                    T est_mag = std::abs(curr_est[c]);
 
-                                    T linear = cosine * gain + adaptive_bias;
-                                    curr_act[c] = linear; // Store linear for backward
-                                    T act = (linear > 0) ? linear : 0.0f;
-                                    curr_gate[c] = 1.0f / (1.0f + std::exp(-act));
+                                    T bias_reduction = bias_val - (gamma_val * est_mag);
+                                    T effective_bias = (bias_reduction > 0) ? bias_reduction : 0.0f;
+                                    T activation = cosine - effective_bias;
+
+                                    curr_act[c] = activation;
+                                    curr_gate[c] = (activation > 0) ? activation : 0.0f;
                                     next_est[c] = est_0[c] * curr_gate[c];
                                 }
                             }
@@ -834,31 +855,30 @@ public:
                                     T eps = 1e-6f;
                                     T denom = mag_x * mag_w + eps;
                                     T cosine = dot / denom;
-                                    T gain = std::sqrt(mag_x + 1e-10f);
 
                                     T act = curr_act[c];
-                                    T g = curr_gate[c];
 
                                     T d_g = d_gate[c];
-                                    T d_sigmoid = d_g * g * (1.0f - g);
-                                    T d_linear = (act > 0) ? d_sigmoid : 0.0f; // ReLU deriv
+                                    T d_act = (act > 0) ? d_g : 0.0f;
 
-                                    // Zenith-L0 Backward
-                                    T bias_param = srig_b_ptr[c];
-                                    T denom_bias = std::abs(curr_est[c]) + 1e-3f;
+                                    T bias_val = srig_b_ptr[c];
+                                    T gamma_val = srig_g_ptr[c];
+                                    T est_mag = std::abs(curr_est[c]);
+                                    T bias_reduction = bias_val - (gamma_val * est_mag);
 
-                                    local_g_srig_b[c] += d_linear / denom_bias;
+                                    T d_cosine = d_act;
+                                    T d_eff_bias = -d_act;
 
-                                    T d_denom = d_linear * (-bias_param) / (denom_bias * denom_bias);
+                                    T d_bias_red = (bias_reduction > 0) ? d_eff_bias : 0.0f;
+
+                                    local_g_srig_b[c] += d_bias_red;
+                                    local_g_srig_g[c] += d_bias_red * (-est_mag);
+
+                                    T d_est_mag = d_bias_red * (-gamma_val);
                                     T sgn_est = (curr_est[c] > 0) ? 1.0f : ((curr_est[c] < 0) ? -1.0f : 0.0f);
-                                    d_curr_est[c] += d_denom * sgn_est;
+                                    d_curr_est[c] += d_est_mag * sgn_est;
 
-                                    T d_cosine = d_linear * gain;
-                                    T d_gain = d_linear * cosine;
-
-                                    T d_mag_x_from_gain = d_gain * 0.5f / gain;
-                                    T d_mag_x_from_cosine = d_cosine * (-dot * mag_w) / (denom * denom);
-                                    T d_mag_x = d_mag_x_from_gain + d_mag_x_from_cosine;
+                                    T d_mag_x = d_cosine * (-dot * mag_w) / (denom * denom);
 
                                     T d_mag_w = d_cosine * (-dot * mag_x) / (denom * denom);
                                     T d_dot = d_cosine / denom;
@@ -961,6 +981,7 @@ public:
                 if (use_slm_) {
                     for(size_t i=0; i<local_g_srig_w.size(); ++i) g_srig_w[i] += local_g_srig_w[i];
                     for(size_t i=0; i<local_g_srig_b.size(); ++i) g_srig_b[i] += local_g_srig_b[i];
+                    for(size_t i=0; i<local_g_srig_g.size(); ++i) g_srig_g[i] += local_g_srig_g[i];
                 }
             }
         }
@@ -973,6 +994,7 @@ public:
         if (use_slm_) {
             params.push_back(&srig_weights_);
             params.push_back(&srig_bias_);
+            params.push_back(&srig_gamma_);
         }
         auto p = group_norm_->parameters();
         params.insert(params.end(), p.begin(), p.end());
@@ -985,6 +1007,7 @@ public:
         if (use_slm_) {
             grads.push_back(&grad_srig_weights_);
             grads.push_back(&grad_srig_bias_);
+            grads.push_back(&grad_srig_gamma_);
         }
         auto g = group_norm_->gradients();
         grads.insert(grads.end(), g.begin(), g.end());
@@ -1055,6 +1078,7 @@ private:
 
     Tensor<T> srig_weights_;
     Tensor<T> srig_bias_;
+    Tensor<T> srig_gamma_;
 
     Tensor<T> grad_packed_weights_;
     Tensor<T> grad_spectral_scales_;
@@ -1063,6 +1087,7 @@ private:
 
     Tensor<T> grad_srig_weights_;
     Tensor<T> grad_srig_bias_;
+    Tensor<T> grad_srig_gamma_;
 
     Tensor<T> input_cached_;
     Tensor<T> eyes_out_cached_;
