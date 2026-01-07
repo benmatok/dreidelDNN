@@ -122,8 +122,15 @@ public:
         head_shuffle_stem_ = std::make_unique<layers::PixelShuffle<T>>(2);
         // Input C=32. Output C=8. H_out = H_in * 2.
 
-        // Final Conv: 8 -> 3. Use Padding=1 to preserve 3x3 convolution size (H_out = H_in).
-        final_conv_ = std::make_unique<layers::Conv2D<T>>(8, 3, 3, 1, 1);
+        // Final Conv: base_channels/4 -> 3. (e.g. 8->2->3 or 32->8->3).
+        // PixelShuffle(2) reduces channels by factor of 4.
+        // Stem produced base_channels. Mirrors imply we return to base_channels before Shuffle?
+        // No, Stage 1 Shuffle output is base_channels (128/16 = 8).
+        // Then Shuffle Stem (2) -> base_channels / 4.
+        size_t final_in_channels = base_channels / 4;
+        if (final_in_channels == 0) final_in_channels = 1; // Safety
+
+        final_conv_ = std::make_unique<layers::Conv2D<T>>(final_in_channels, 3, 3, 1, 1);
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
