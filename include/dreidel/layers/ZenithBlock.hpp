@@ -124,6 +124,14 @@ public:
         training_ = training;
     }
 
+    void set_monitor_sparsity(bool monitor) {
+        monitor_sparsity_ = monitor;
+    }
+
+    float get_last_sparsity() const {
+        return last_sparsity_;
+    }
+
     void set_sequency_ordering(bool use) {
         use_sequency_ = use;
         if (use_sequency_ && sequency_map_.empty()) {
@@ -194,12 +202,20 @@ public:
         }
         const T* mag_w_ptr = mag_w_cache.data();
 
+        if (monitor_sparsity_) {
+            debug_zeros_ = 0;
+            debug_total_ = 0;
+        }
+
         #pragma omp parallel
         {
             std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
             std::vector<T, core::AlignedAllocator<T>> buf_est;
             std::vector<T, core::AlignedAllocator<T>> buf_gate;
             std::vector<T, core::AlignedAllocator<T>> buf_act;
+
+            size_t local_zeros = 0;
+            size_t local_total = 0;
 
             if (use_slm_) {
                 buf_est.resize((srig_iterations_ + 1) * in_channels_);
@@ -307,9 +323,13 @@ public:
                                     T mag_w = mag_w_ptr[c];
                                     T cosine = dot / (mag_x * mag_w + 1e-6f);
                                     T gain = std::sqrt(mag_x + 1e-10f);
-                                    T bias = srig_b_ptr[c];
+                                    T bias_param = srig_b_ptr[c];
 
-                                    T linear = cosine * gain + bias;
+                                    // Zenith-L0 Logic: Adaptive Bias
+                                    T denom_bias = std::abs(curr_est[c]) + 1e-3f;
+                                    T adaptive_bias = bias_param / denom_bias;
+
+                                    T linear = cosine * gain + adaptive_bias;
                                     curr_act[c] = linear;
 
                                     T act = (linear > 0) ? linear : 0.0f;
@@ -322,6 +342,13 @@ public:
                             const T* final_gate = buf_gate.data() + (srig_iterations_ - 1) * in_channels_;
                             for(size_t c=0; c<in_channels_; ++c) {
                                 buf_in[c] *= final_gate[c];
+                            }
+
+                            if (monitor_sparsity_) {
+                                for(size_t c=0; c<in_channels_; ++c) {
+                                    if (final_gate[c] <= 1e-3f) local_zeros++;
+                                }
+                                local_total += in_channels_;
                             }
                         }
 
@@ -380,6 +407,16 @@ public:
                     }
                 }
             }
+            if (monitor_sparsity_) {
+                #pragma omp atomic
+                debug_zeros_ += local_zeros;
+                #pragma omp atomic
+                debug_total_ += local_total;
+            }
+        }
+
+        if (monitor_sparsity_ && debug_total_ > 0) {
+            last_sparsity_ = (float)debug_zeros_ / (float)debug_total_;
         }
 
         output = group_norm_->forward(output);
@@ -639,9 +676,13 @@ public:
                                     T mag_w = mag_w_ptr[c];
                                     T cosine = dot / (mag_x * mag_w + 1e-6f);
                                     T gain = std::sqrt(mag_x + 1e-10f);
-                                    T bias = srig_b_ptr[c];
+                                    T bias_param = srig_b_ptr[c];
 
-                                    T linear = cosine * gain + bias;
+                                    // Zenith-L0 Logic: Adaptive Bias
+                                    T denom_bias = std::abs(curr_est[c]) + 1e-3f;
+                                    T adaptive_bias = bias_param / denom_bias;
+
+                                    T linear = cosine * gain + adaptive_bias;
                                     curr_act[c] = linear; // Store linear for backward
                                     T act = (linear > 0) ? linear : 0.0f;
                                     curr_gate[c] = 1.0f / (1.0f + std::exp(-act));
@@ -802,7 +843,15 @@ public:
                                     T d_sigmoid = d_g * g * (1.0f - g);
                                     T d_linear = (act > 0) ? d_sigmoid : 0.0f; // ReLU deriv
 
-                                    local_g_srig_b[c] += d_linear;
+                                    // Zenith-L0 Backward
+                                    T bias_param = srig_b_ptr[c];
+                                    T denom_bias = std::abs(curr_est[c]) + 1e-3f;
+
+                                    local_g_srig_b[c] += d_linear / denom_bias;
+
+                                    T d_denom = d_linear * (-bias_param) / (denom_bias * denom_bias);
+                                    T sgn_est = (curr_est[c] > 0) ? 1.0f : ((curr_est[c] < 0) ? -1.0f : 0.0f);
+                                    d_curr_est[c] += d_denom * sgn_est;
 
                                     T d_cosine = d_linear * gain;
                                     T d_gain = d_linear * cosine;
@@ -957,6 +1006,10 @@ private:
     bool use_sequency_ = false;
     float spectral_dropout_rate_ = 0.1f;
     bool training_ = true;
+    bool monitor_sparsity_ = false;
+    mutable float last_sparsity_ = 0.0f;
+    mutable size_t debug_zeros_ = 0;
+    mutable size_t debug_total_ = 0;
 
     std::vector<int32_t, core::AlignedAllocator<int32_t>> sequency_map_;
     std::vector<int32_t, core::AlignedAllocator<int32_t>> natural_map_;
