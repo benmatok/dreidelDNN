@@ -196,17 +196,21 @@ public:
 
         T dropout_scale = (apply_dropout) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
 
-        // Precompute MagW
-        std::vector<T> mag_w_cache(in_channels_);
+        // Precompute InvMagW
+        std::vector<T> inv_mag_w_cache(in_channels_);
         if (use_slm_) {
             for(size_t c=0; c<in_channels_; ++c) {
-                 const T* w = srig_w_ptr + c * 5;
+                 // Weight layout {5, C} - assuming flat array
                  T sum_sq = 0;
-                 for(int k=0; k<5; ++k) sum_sq += w[k]*w[k];
-                 mag_w_cache[c] = std::sqrt(sum_sq + 1e-8f);
+                 for(int k=0; k<5; ++k) {
+                     // If srig_weights is {5, C}, then w[k] is at k*C + c
+                     T val = srig_w_ptr[k * in_channels_ + c];
+                     sum_sq += val*val;
+                 }
+                 inv_mag_w_cache[c] = 1.0f / std::sqrt(sum_sq + 1e-8f);
             }
         }
-        const T* mag_w_ptr = mag_w_cache.data();
+        const T* inv_mag_w_ptr = inv_mag_w_cache.data();
 
         if (monitor_sparsity_) {
             debug_zeros_ = 0;
@@ -309,6 +313,18 @@ public:
                                 T* curr_act = buf_act.data() + k * in_channels_;
 
                                 for(size_t c=0; c<in_channels_; ++c) {
+                                    // Dispatch to AVX2 if Float
+                                    if constexpr (std::is_same_v<T, float>) {
+                                        #ifdef DREIDEL_ARCH_AVX2
+                                        avx2_srig_step(curr_est, next_est, curr_act, curr_gate,
+                                                       srig_w_ptr, srig_b_ptr, srig_g_ptr,
+                                                       inv_mag_w_ptr, est_0, in_channels_);
+                                        // Skip scalar loop
+                                        c = in_channels_;
+                                        continue;
+                                        #endif
+                                    }
+
                                     T sum_sq = 0;
                                     if (c>=2) sum_sq += curr_est[c-2]*curr_est[c-2];
                                     if (c>=1) sum_sq += curr_est[c-1]*curr_est[c-1];
@@ -318,17 +334,16 @@ public:
 
                                     T mag_x = std::sqrt(sum_sq / 5.0f + 1e-10f);
 
-                                    const T* w = srig_w_ptr + c * 5;
+                                    // Scalar Fallback (Fixed Layout {5, C})
                                     T dot = 0;
-                                    if (c>=2) dot += w[0] * curr_est[c-2];
-                                    if (c>=1) dot += w[1] * curr_est[c-1];
-                                    dot += w[2] * curr_est[c];
-                                    if (c + 1 < in_channels_) dot += w[3] * curr_est[c+1];
-                                    if (c + 2 < in_channels_) dot += w[4] * curr_est[c+2];
+                                    // w[k] is at k*C + c
+                                    if (c>=2) dot += srig_w_ptr[c] * curr_est[c-2];
+                                    if (c>=1) dot += srig_w_ptr[in_channels_ + c] * curr_est[c-1];
+                                    dot += srig_w_ptr[2*in_channels_ + c] * curr_est[c];
+                                    if (c + 1 < in_channels_) dot += srig_w_ptr[3*in_channels_ + c] * curr_est[c+1];
+                                    if (c + 2 < in_channels_) dot += srig_w_ptr[4*in_channels_ + c] * curr_est[c+2];
 
-                                    T mag_w = mag_w_ptr[c];
-                                    T cosine = dot / (mag_x * mag_w + 1e-6f);
-                                    // T gain = std::sqrt(mag_x + 1e-10f); // Unused
+                                    T cosine = dot / (mag_x + 1e-6f) * inv_mag_w_ptr[c];
 
                                     T bias_val = srig_b_ptr[c];
                                     T gamma_val = srig_g_ptr[c];
@@ -340,20 +355,11 @@ public:
 
                                     T gate = (activation > 0) ? activation : 0.0f;
 
-                                    if (monitor_sparsity_ && n==0 && h_out==0 && w_out==0 && c==0) {
-                                        std::cout << "DEBUG k=" << k
-                                                  << " est=" << curr_est[c]
-                                                  << " bias=" << bias_val
-                                                  << " gamma=" << gamma_val
-                                                  << " eff_bias=" << effective_bias
-                                                  << " act=" << activation
-                                                  << " gate=" << gate << std::endl;
-                                    }
-
                                     curr_act[c] = activation;
                                     curr_gate[c] = gate;
                                     next_est[c] = est_0[c] * gate;
                                 }
+
                             }
 
                             const T* final_gate = buf_gate.data() + (srig_iterations_ - 1) * in_channels_;
@@ -1038,6 +1044,127 @@ private:
     std::vector<int32_t, core::AlignedAllocator<int32_t>> natural_map_;
 
     Tensor<T> packed_weights_;
+
+    // AVX2 Optimized SRIG Step
+    static inline void avx2_srig_step(const float* curr_est, float* next_est, float* curr_act, float* curr_gate,
+                                      const float* weights, const float* biases, const float* gammas,
+                                      const float* inv_mag_w, const float* est_0, size_t C) {
+        #ifdef DREIDEL_ARCH_AVX2
+        for (size_t c = 0; c < C; c += 8) {
+            // Check boundary condition for safe vector load of neighbors
+            // We need [c-2] to [c+7+2] = [c-2..c+9]
+            if (c >= 8 && c + 16 <= C) {
+                // Safe vector path
+                __m256 v_c = _mm256_load_ps(curr_est + c);
+                __m256 v_cm1 = _mm256_loadu_ps(curr_est + c - 1);
+                __m256 v_cm2 = _mm256_loadu_ps(curr_est + c - 2);
+                __m256 v_cp1 = _mm256_loadu_ps(curr_est + c + 1);
+                __m256 v_cp2 = _mm256_loadu_ps(curr_est + c + 2);
+
+                // Sum Squares (Local Energy)
+                __m256 sum_sq = _mm256_mul_ps(v_c, v_c);
+                sum_sq = _mm256_fmadd_ps(v_cm1, v_cm1, sum_sq);
+                sum_sq = _mm256_fmadd_ps(v_cm2, v_cm2, sum_sq);
+                sum_sq = _mm256_fmadd_ps(v_cp1, v_cp1, sum_sq);
+                sum_sq = _mm256_fmadd_ps(v_cp2, v_cp2, sum_sq);
+
+                // mag_x = sqrt(sum / 5 + eps) -> rsqrt
+                __m256 v_fifth = _mm256_set1_ps(0.2f);
+                __m256 v_eps = _mm256_set1_ps(1e-10f);
+                __m256 mag_x_sq = _mm256_fmadd_ps(sum_sq, v_fifth, v_eps);
+                __m256 inv_mag_x = _mm256_rsqrt_ps(mag_x_sq);
+
+                // Dot Product: weights [5, C] unshared
+                const float* w0_ptr = weights;
+                const float* w1_ptr = weights + C;
+                const float* w2_ptr = weights + 2*C;
+                const float* w3_ptr = weights + 3*C;
+                const float* w4_ptr = weights + 4*C;
+
+                __m256 w0 = _mm256_load_ps(w0_ptr + c);
+                __m256 w1 = _mm256_load_ps(w1_ptr + c);
+                __m256 w2 = _mm256_load_ps(w2_ptr + c);
+                __m256 w3 = _mm256_load_ps(w3_ptr + c);
+                __m256 w4 = _mm256_load_ps(w4_ptr + c);
+
+                // Convolution
+                __m256 dot = _mm256_mul_ps(w2, v_c);
+                dot = _mm256_fmadd_ps(w0, v_cm2, dot);
+                dot = _mm256_fmadd_ps(w1, v_cm1, dot);
+                dot = _mm256_fmadd_ps(w3, v_cp1, dot);
+                dot = _mm256_fmadd_ps(w4, v_cp2, dot);
+
+                // Cosine = dot * inv_mag_x * inv_mag_w
+                __m256 inv_mw = _mm256_load_ps(inv_mag_w + c);
+                __m256 cosine = _mm256_mul_ps(dot, inv_mag_x);
+                cosine = _mm256_mul_ps(cosine, inv_mw);
+
+                // L0 Logic
+                // bias_red = bias - gamma * |est|
+                __m256 bias = _mm256_load_ps(biases + c);
+                __m256 gamma = _mm256_load_ps(gammas + c);
+
+                // Absolute value of estimate: |v_c|
+                // Use bitwise AND with mask to clear sign bit
+                __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+                __m256 abs_est = _mm256_and_ps(v_c, abs_mask);
+
+                __m256 bias_red = _mm256_fnmadd_ps(gamma, abs_est, bias); // bias - gamma*|est|
+                __m256 zeros = _mm256_setzero_ps();
+                __m256 eff_bias = _mm256_max_ps(zeros, bias_red);
+
+                __m256 act = _mm256_sub_ps(cosine, eff_bias);
+                __m256 gate = _mm256_max_ps(zeros, act);
+
+                // Store
+                _mm256_store_ps(curr_act + c, act);
+                _mm256_store_ps(curr_gate + c, gate);
+
+                // Next Est = Est0 * Gate
+                __m256 e0 = _mm256_load_ps(est_0 + c);
+                __m256 n_est = _mm256_mul_ps(e0, gate);
+                _mm256_store_ps(next_est + c, n_est);
+
+            } else {
+                // Scalar Fallback for edges
+                for (size_t i = 0; i < 8 && c + i < C; ++i) {
+                    size_t idx = c + i;
+                    float sum_sq = 0;
+                    if (idx>=2) sum_sq += curr_est[idx-2]*curr_est[idx-2];
+                    if (idx>=1) sum_sq += curr_est[idx-1]*curr_est[idx-1];
+                    sum_sq += curr_est[idx]*curr_est[idx];
+                    if (idx+1 < C) sum_sq += curr_est[idx+1]*curr_est[idx+1];
+                    if (idx+2 < C) sum_sq += curr_est[idx+2]*curr_est[idx+2];
+
+                    float mag_x = std::sqrt(sum_sq / 5.0f + 1e-10f);
+
+                    float dot = 0;
+                    // Weights are {5, C} layout
+                    if (idx>=2) dot += weights[idx] * curr_est[idx-2];
+                    if (idx>=1) dot += weights[C + idx] * curr_est[idx-1];
+                    dot += weights[2*C + idx] * curr_est[idx];
+                    if (idx+1 < C) dot += weights[3*C + idx] * curr_est[idx+1];
+                    if (idx+2 < C) dot += weights[4*C + idx] * curr_est[idx+2];
+
+                    float cosine = dot / (mag_x + 1e-10f) * inv_mag_w[idx];
+
+                    float b = biases[idx];
+                    float g = gammas[idx];
+                    float est = curr_est[idx];
+
+                    float b_red = b - g * est;
+                    float eff_b = (b_red > 0) ? b_red : 0.0f;
+                    float act = cosine - eff_b;
+                    float gate = (act > 0) ? act : 0.0f;
+
+                    curr_act[idx] = act;
+                    curr_gate[idx] = gate;
+                    next_est[idx] = est_0[idx] * gate;
+                }
+            }
+        }
+        #endif
+    }
 
     static inline void permute_avx2(float* out, const float* in, const int32_t* indices, size_t N) {
         #ifdef DREIDEL_ARCH_AVX2
