@@ -69,9 +69,13 @@ int main() {
     input.random(0.0f, 1.0f);
 
     models::ZenithHierarchicalAE<float> zenith_ae;
+    // Set to inference mode to avoid noise injection overhead and ensure fair comparison
+    zenith_ae.set_gate_training(false);
     auto res_zenith = run_benchmark(&zenith_ae, input, "ZenithHierarchicalAE", iterations);
 
-    models::ZenithHierarchicalAE<float> zenith_slm_ae(3, 32, true, "he", true);
+    models::ZenithHierarchicalAE<float> zenith_slm_ae(3, 32, "he", true);
+    // Explicitly set to inference mode for benchmarking (disable noise/soft-gating)
+    zenith_slm_ae.set_gate_training(false);
     auto res_zenith_slm = run_benchmark(&zenith_slm_ae, input, "Zenith-SLM", iterations);
 
     models::ConvBaselineAE<float> conv_ae;
