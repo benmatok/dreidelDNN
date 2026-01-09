@@ -135,6 +135,10 @@ public:
         }
     }
 
+    void set_pruning_mask(const Tensor<T>* mask) {
+        pruning_mask_ = mask;
+    }
+
     Tensor<T> forward(const Tensor<T>& input) override {
         input_cached_ = input;
         auto shape = input.shape();
@@ -194,6 +198,10 @@ public:
         }
         const T* mag_w_ptr = mag_w_cache.data();
 
+        // Cache mask pointer locally for thread safety
+        const T* mask_ptr = (pruning_mask_ && !pruning_mask_->shape().empty()) ? pruning_mask_->data() : nullptr;
+        size_t mask_blocks_stride = (mask_ptr) ? (in_channels_ / 8) : 0;
+
         #pragma omp parallel
         {
             std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
@@ -221,7 +229,18 @@ public:
                         size_t eyes_idx = ((n*H_out + h_out)*W_out + w_out)*in_channels_;
                         T* eyes_store_ptr = eyes_ptr + eyes_idx;
 
+                        // Calculate mask offset for current pixel
+                        // Mask layout: N * H * W * blocks
+                        // Assuming H_out == H and W_out == W (Stride 1, Upscale 1) for Stage 2
+                        // If dimensions differ, mapping is complex. We fallback to dense.
+                        const T* pixel_mask = nullptr;
+                        if (mask_ptr && stride_ == 1 && upscale_ == 1) {
+                            size_t mask_idx = ((n*H_out + h_out)*W_out + w_out) * mask_blocks_stride;
+                            pixel_mask = mask_ptr + mask_idx;
+                        }
+
                         if (upscale_ > 1) {
+                             // Upscale path (dense for now)
                              for(size_t c=0; c<C; ++c) {
                                 T val = 0;
                                 for(int ky=-k_rad; ky<=k_rad; ++ky) {
@@ -241,9 +260,49 @@ public:
                                 buf_in[c] = val;
                             }
                         } else {
+                            // Stride 1 or >1 path
                             int h_in_center = h_out * stride_;
                             int w_in_center = w_out * stride_;
-                            for(size_t c=0; c<C; ++c) {
+
+                            // Block-sparse iteration
+                            size_t c = 0;
+                            // Process blocks of 8
+                            if (pixel_mask) {
+                                for(size_t b=0; b < mask_blocks_stride; ++b) {
+                                    // Check if block is pruned (mask == 0)
+                                    // Gate returns x * mask. If mask=0, x=0.
+                                    // We check mask value.
+                                    if (pixel_mask[b] == 0.0f) {
+                                        // Pruned: Skip Eyes
+                                        // Set 8 channels to 0
+                                        std::memset(eyes_store_ptr + b*8, 0, 8 * sizeof(T));
+                                        std::memset(buf_in.data() + b*8, 0, 8 * sizeof(T));
+                                        c += 8;
+                                        continue;
+                                    }
+
+                                    // Active: Compute Eyes for 8 channels
+                                    for(size_t k=0; k<8; ++k, ++c) {
+                                        T val = 0;
+                                        for(int ky=-k_rad; ky<=k_rad; ++ky) {
+                                            int ih = h_in_center + ky;
+                                            if(ih < 0 || ih >= (int)H) continue;
+                                            for(int kx=-k_rad; kx<=k_rad; ++kx) {
+                                                int iw = w_in_center + kx;
+                                                if(iw < 0 || iw >= (int)W) continue;
+                                                T pixel = in_ptr[((n*H + ih)*W + iw)*C + c];
+                                                T weight = w_ptr[c*kernel_size_*kernel_size_ + (ky+k_rad)*kernel_size_ + (kx+k_rad)];
+                                                val += pixel * weight;
+                                            }
+                                        }
+                                        eyes_store_ptr[c] = val;
+                                        buf_in[c] = val;
+                                    }
+                                }
+                            }
+
+                            // Tail or non-masked dense fallback
+                            for(; c<C; ++c) {
                                 T val = 0;
                                 for(int ky=-k_rad; ky<=k_rad; ++ky) {
                                     int ih = h_in_center + ky;
@@ -1018,6 +1077,9 @@ private:
     std::vector<float> dropout_mask_;
 
     std::unique_ptr<GroupNorm<T>> group_norm_;
+
+    // Pruning
+    const Tensor<T>* pruning_mask_ = nullptr;
 };
 
 } // namespace layers

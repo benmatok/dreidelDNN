@@ -94,10 +94,12 @@ public:
 
         // Apply Gate 1 -> Block 1
         x = stage2_gate1_->forward(x);
+        stage2_block1_->set_pruning_mask(stage2_gate1_->get_last_mask());
         x = stage2_block1_->forward(x);
 
         // Apply Gate 2 -> Block 2
         x = stage2_gate2_->forward(x);
+        stage2_block2_->set_pruning_mask(stage2_gate2_->get_last_mask());
         x = stage2_block2_->forward(x);
 
         // Head (Decoder)
