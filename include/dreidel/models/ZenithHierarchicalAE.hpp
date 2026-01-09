@@ -38,7 +38,7 @@ public:
 
         // 1x ZenithBlock
         stage1_block_ = std::make_unique<layers::ZenithBlock<T>>(
-            stage1_channels_, stage1_channels_, 3, stage1_channels_, true, false, false, 1, 1, init_scheme, false
+            stage1_channels_, stage1_channels_, 3, stage1_channels_, true, false, false, 1, 1, init_scheme, false, false, true
         );
 
         // Stage 2 (Bottleneck)
@@ -53,13 +53,13 @@ public:
         // Gate for block 1
         stage2_gate1_ = std::make_unique<layers::ZenithAVXGate<T>>(stage2_channels_);
         stage2_block1_ = std::make_unique<layers::ZenithBlock<T>>(
-            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1, init_scheme, use_slm
+            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1, init_scheme, use_slm, false, true
         );
 
         // Gate for block 2
         stage2_gate2_ = std::make_unique<layers::ZenithAVXGate<T>>(stage2_channels_);
         stage2_block2_ = std::make_unique<layers::ZenithBlock<T>>(
-            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1, init_scheme, use_slm
+            stage2_channels_, stage2_channels_, 3, stage2_channels_, true, false, false, 1, 1, init_scheme, use_slm, false, true
         );
 
         // Decoder Head
@@ -87,20 +87,30 @@ public:
 
         // Stage 1
         x = stage1_unshuffle_->forward(x); // H/8, W/8, C=512
-        x = stage1_block_->forward(x);
+
+        // Residual Block 1
+        Tensor<T> res1 = x;
+        Tensor<T> out1 = stage1_block_->forward(x);
+        x = res1 + out1; // Add residual
 
         // Stage 2
         x = stage2_unshuffle_->forward(x); // H/32, W/32, C=8192
 
-        // Apply Gate 1 -> Block 1
-        x = stage2_gate1_->forward(x);
+        // Block 1 with Gate
+        Tensor<T> res2_1 = x;
+        // Gate modifies x in place? No, returns new tensor usually but let's assume it modifies or returns.
+        // ZenithAVXGate::forward returns modified tensor.
+        Tensor<T> x_gated = stage2_gate1_->forward(x);
         stage2_block1_->set_pruning_mask(stage2_gate1_->get_last_mask());
-        x = stage2_block1_->forward(x);
+        Tensor<T> out2_1 = stage2_block1_->forward(x_gated);
+        x = res2_1 + out2_1; // Residual bypasses gate
 
-        // Apply Gate 2 -> Block 2
-        x = stage2_gate2_->forward(x);
+        // Block 2 with Gate
+        Tensor<T> res2_2 = x;
+        x_gated = stage2_gate2_->forward(x);
         stage2_block2_->set_pruning_mask(stage2_gate2_->get_last_mask());
-        x = stage2_block2_->forward(x);
+        Tensor<T> out2_2 = stage2_block2_->forward(x_gated);
+        x = res2_2 + out2_2; // Residual bypasses gate
 
         // Head (Decoder)
         // Mirror Stage 2
@@ -125,15 +135,28 @@ public:
         dx = head_shuffle2_->backward(dx);
 
         // Block 2 -> Gate 2
-        dx = stage2_block2_->backward(dx);
-        dx = stage2_gate2_->backward(dx);
+        // dx is dL/d(x_out).
+        // x_out = x_in + Block(Gate(x_in))
+        // dL/dx_in = dL/dx_out + dL/d(Block) * d(Block)/d(Gate) * d(Gate)/dx_in
+
+        Tensor<T> dx_res2_2 = dx; // Residual gradient
+        Tensor<T> dx_block2 = stage2_block2_->backward(dx);
+        Tensor<T> dx_gate2 = stage2_gate2_->backward(dx_block2);
+        dx = dx_res2_2 + dx_gate2;
 
         // Block 1 -> Gate 1
-        dx = stage2_block1_->backward(dx);
-        dx = stage2_gate1_->backward(dx);
+        Tensor<T> dx_res2_1 = dx;
+        Tensor<T> dx_block1 = stage2_block1_->backward(dx);
+        Tensor<T> dx_gate1 = stage2_gate1_->backward(dx_block1);
+        dx = dx_res2_1 + dx_gate1;
 
         dx = stage2_unshuffle_->backward(dx);
-        dx = stage1_block_->backward(dx);
+
+        // Stage 1 Block
+        Tensor<T> dx_res1 = dx;
+        Tensor<T> dx_out1 = stage1_block_->backward(dx);
+        dx = dx_res1 + dx_out1;
+
         dx = stage1_unshuffle_->backward(dx);
         dx = stem_->backward(dx);
 

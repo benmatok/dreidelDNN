@@ -29,7 +29,7 @@ public:
 
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim,
                 bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1,
-                const std::string& init_scheme = "he", bool use_slm = false, bool use_sequency = false)
+                const std::string& init_scheme = "he", bool use_slm = false, bool use_sequency = false, bool zero_init = false)
         : in_channels_(in_channels), out_channels_(out_channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
           use_ifwht_(use_ifwht), use_gating_(use_gating), stride_(stride), upscale_(upscale), use_slm_(use_slm), use_sequency_(use_sequency),
           packed_weights_({in_channels, 1, kernel_size, kernel_size}),
@@ -78,6 +78,14 @@ public:
         if (out_channels_ % groups != 0) groups = 1;
         group_norm_ = std::make_unique<GroupNorm<T>>(groups, out_channels_);
 
+        // Zero Gamma Init for Residuals
+        if (zero_init) {
+            auto params = group_norm_->parameters();
+            if (!params.empty()) {
+                params[0]->fill(0.0f); // Gamma is first parameter
+            }
+        }
+
         // Sequency Map
         if (use_sequency_) {
             auto s_map = algo::Sequency::compute_to_natural_map(in_channels_);
@@ -89,8 +97,8 @@ public:
     }
 
     ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim,
-                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, bool use_slm = false, bool use_sequency = false)
-        : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1, "he", use_slm, use_sequency) {}
+                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, bool use_slm = false, bool use_sequency = false, bool zero_init = false)
+        : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1, "he", use_slm, use_sequency, zero_init) {}
 
     void initialize(const std::string& scheme) {
         packed_weights_.fill(0);
@@ -108,8 +116,9 @@ public:
             packed_weights_.random(-0.01, 0.01);
         }
 
-        T norm_factor = (use_ifwht_) ? (1.0f / static_cast<T>(out_channels_)) : 1.0f;
-        spectral_scales_.fill(1.0f * norm_factor);
+        // Initialize scales to 0.1 for better residual stability (instead of 1.0)
+        // With Zero Gamma on GN, this matters less for output but helps internal flow.
+        spectral_scales_.fill(0.1f);
 
         mixing_weights_.fill(0);
         T* mw = mixing_weights_.data();
@@ -185,6 +194,8 @@ public:
         const T* srig_b_ptr = use_slm_ ? srig_bias_.data() : nullptr;
 
         T dropout_scale = (apply_dropout) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
+        T inv_sqrt_in = 1.0f / std::sqrt((T)in_channels_);
+        T inv_sqrt_out = 1.0f / std::sqrt((T)out_channels_);
 
         // Precompute MagW
         std::vector<T> mag_w_cache(in_channels_);
@@ -229,10 +240,6 @@ public:
                         size_t eyes_idx = ((n*H_out + h_out)*W_out + w_out)*in_channels_;
                         T* eyes_store_ptr = eyes_ptr + eyes_idx;
 
-                        // Calculate mask offset for current pixel
-                        // Mask layout: N * H * W * blocks
-                        // Assuming H_out == H and W_out == W (Stride 1, Upscale 1) for Stage 2
-                        // If dimensions differ, mapping is complex. We fallback to dense.
                         const T* pixel_mask = nullptr;
                         if (mask_ptr && stride_ == 1 && upscale_ == 1) {
                             size_t mask_idx = ((n*H_out + h_out)*W_out + w_out) * mask_blocks_stride;
@@ -240,7 +247,7 @@ public:
                         }
 
                         if (upscale_ > 1) {
-                             // Upscale path (dense for now)
+                             // Upscale path (dense)
                              for(size_t c=0; c<C; ++c) {
                                 T val = 0;
                                 for(int ky=-k_rad; ky<=k_rad; ++ky) {
@@ -266,22 +273,14 @@ public:
 
                             // Block-sparse iteration
                             size_t c = 0;
-                            // Process blocks of 8
                             if (pixel_mask) {
                                 for(size_t b=0; b < mask_blocks_stride; ++b) {
-                                    // Check if block is pruned (mask == 0)
-                                    // Gate returns x * mask. If mask=0, x=0.
-                                    // We check mask value.
                                     if (pixel_mask[b] == 0.0f) {
-                                        // Pruned: Skip Eyes
-                                        // Set 8 channels to 0
                                         std::memset(eyes_store_ptr + b*8, 0, 8 * sizeof(T));
                                         std::memset(buf_in.data() + b*8, 0, 8 * sizeof(T));
                                         c += 8;
                                         continue;
                                     }
-
-                                    // Active: Compute Eyes for 8 channels
                                     for(size_t k=0; k<8; ++k, ++c) {
                                         T val = 0;
                                         for(int ky=-k_rad; ky<=k_rad; ++ky) {
@@ -301,7 +300,6 @@ public:
                                 }
                             }
 
-                            // Tail or non-masked dense fallback
                             for(; c<C; ++c) {
                                 T val = 0;
                                 for(int ky=-k_rad; ky<=k_rad; ++ky) {
@@ -320,7 +318,9 @@ public:
                             }
                         }
 
+                        // WHT + Scale (Unitary)
                         algo::WHT::fwht_1d(buf_in.data(), in_channels_);
+                        for(size_t i=0; i<in_channels_; ++i) buf_in[i] *= inv_sqrt_in;
 
                         if (use_sequency_) {
                             if constexpr (std::is_same_v<T, float>) {
@@ -427,6 +427,7 @@ public:
 
                         if (use_ifwht_) {
                             algo::WHT::fwht_1d(buf_out.data(), out_channels_);
+                            for(size_t i=0; i<out_channels_; ++i) buf_out[i] *= inv_sqrt_out;
                         }
 
                         size_t out_idx = ((n*H_out + h_out)*W_out + w_out)*out_channels_;
@@ -492,56 +493,22 @@ public:
         const T* srig_b_ptr = use_slm_ ? srig_bias_.data() : nullptr;
 
         T dropout_scale = (training_ && spectral_dropout_rate_ > 0.0f) ? (1.0f / (1.0f - spectral_dropout_rate_)) : 1.0f;
+        T inv_sqrt_in = 1.0f / std::sqrt((T)in_channels_);
+        T inv_sqrt_out = 1.0f / std::sqrt((T)out_channels_);
 
         Tensor<T> d_mixer_out({N, H_out, W_out, out_channels_});
 
-        {
-             Tensor<T> gn_in({N, H_out, W_out, out_channels_});
-             #pragma omp parallel
-             {
-                std::vector<T, core::AlignedAllocator<T>> buf_in(in_channels_), buf_out(out_channels_);
-                #pragma omp for collapse(3)
-                for(size_t n=0; n<N; ++n) {
-                    for(size_t h=0; h<H_out; ++h) {
-                        for(size_t w=0; w<W_out; ++w) {
-                             size_t idx = ((n*H_out + h)*W_out + w)*in_channels_;
-                             for(size_t c=0; c<in_channels_; ++c) buf_in[c] = eyes_ptr[idx+c];
-
-                             algo::WHT::fwht_1d(buf_in.data(), in_channels_);
-                             if (training_ && spectral_dropout_rate_ > 0.0f) {
-                                 for(size_t c=0; c<in_channels_; ++c) buf_in[c] *= (dropout_mask_[c] * dropout_scale);
-                             }
-                             for(size_t c=0; c<in_channels_; ++c) buf_in[c] *= scale_ptr[c];
-
-                             if (in_channels_ == out_channels_) {
-                                for(size_t c=0; c<in_channels_; ++c) {
-                                    T prev = (c == 0) ? 0 : buf_in[c - 1];
-                                    T next = (c == in_channels_ - 1) ? 0 : buf_in[c + 1];
-                                    buf_out[c] = w_L[c] * prev + w_C[c] * buf_in[c] + w_R[c] * next;
-                                }
-                             } else {
-                                  std::fill(buf_out.begin(), buf_out.end(), 0);
-                             }
-                             if (use_ifwht_) {
-                                algo::WHT::fwht_1d(buf_out.data(), out_channels_);
-                             }
-                             size_t out_idx = ((n*H_out + h)*W_out + w)*out_channels_;
-                             for(size_t c=0; c<out_channels_; ++c) gn_in.data()[out_idx+c] = buf_out[c];
-                        }
-                    }
-                }
-             }
-
-             Tensor<T> gn_out = group_norm_->forward(gn_in);
-             Tensor<T> d_gn_out = grad_output;
-             T* d_gn_ptr = d_gn_out.data();
-             const T* gn_out_ptr = gn_out.data();
-
-             for(size_t i=0; i<d_gn_out.size(); ++i) {
-                 if (gn_out_ptr[i] <= 0) d_gn_ptr[i] = 0;
-             }
-             d_mixer_out = group_norm_->backward(d_gn_out);
-        }
+        // Simplified GroupNorm Backward logic (avoiding complex recompute for now)
+        // Correctness assumes GroupNorm cached its input.
+        // But ZenithBlock does not persistently store mixer_out.
+        // We MUST recompute mixer_out or modify GroupNorm to work differently.
+        // Or assume GroupNorm stored it?
+        // GroupNorm.hpp: input_cached_ = input;
+        // So GroupNorm stores input. We just call backward.
+        // We DO NOT need to recompute `gn_in`.
+        // The previous recompute block was buggy anyway (missing SRIG etc).
+        // Let's rely on GroupNorm's cache.
+        d_mixer_out = group_norm_->backward(grad_output);
 
         const T* d_mix_ptr = d_mixer_out.data();
 
@@ -573,16 +540,17 @@ public:
             std::vector<T, core::AlignedAllocator<T>> buf_eyes(in_channels_);
             std::vector<T, core::AlignedAllocator<T>> d_eyes(in_channels_);
 
+            // New buffer to hold Spectrum Seq
+            std::vector<T, core::AlignedAllocator<T>> buf_spectrum;
+            if (use_slm_ || use_sequency_) buf_spectrum.resize(in_channels_);
+
             std::vector<T, core::AlignedAllocator<T>> buf_est;
             std::vector<T, core::AlignedAllocator<T>> buf_gate;
             std::vector<T, core::AlignedAllocator<T>> d_est;
             std::vector<T, core::AlignedAllocator<T>> d_gate;
-
-            // Zenith-SRIG specific
             std::vector<T, core::AlignedAllocator<T>> buf_act;
 
             std::vector<T, core::AlignedAllocator<T>> buf_temp;
-
             if (use_slm_ || use_sequency_) buf_temp.resize(in_channels_);
 
             if (use_slm_) {
@@ -600,15 +568,23 @@ public:
             for(size_t n=0; n<N; ++n) {
                 for(size_t h=0; h<H_out; ++h) {
                     for(size_t w=0; w<W_out; ++w) {
+                        // 1. Load Gradients
                         size_t out_idx = ((n*H_out + h)*W_out + w)*out_channels_;
                         for(size_t c=0; c<out_channels_; ++c) buf_grad[c] = d_mix_ptr[out_idx + c];
 
-                        if(use_ifwht_) algo::WHT::fwht_1d(buf_grad.data(), out_channels_);
+                        if(use_ifwht_) {
+                            algo::WHT::fwht_1d(buf_grad.data(), out_channels_);
+                            for(size_t c=0; c<out_channels_; ++c) buf_grad[c] *= inv_sqrt_out;
+                        }
 
+                        // 2. Recompute Forward State
                         size_t idx = ((n*H_out + h)*W_out + w)*in_channels_;
                         for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] = eyes_ptr[idx+c];
 
                         algo::WHT::fwht_1d(buf_eyes.data(), in_channels_);
+                        for(size_t c=0; c<in_channels_; ++c) buf_eyes[c] *= inv_sqrt_in;
+
+                        // buf_eyes is Spectrum Nat
 
                         if (use_sequency_) {
                             if constexpr (std::is_same_v<T, float>) {
@@ -623,51 +599,14 @@ public:
                             std::memcpy(buf_eyes.data(), buf_temp.data(), in_channels_ * sizeof(T));
                         }
 
-                        // Mixer Backward: buf_grad -> d_eyes
-                        if (in_channels_ == out_channels_) {
-                            const T* w_L = mix_w;
-                            const T* w_C = mix_w + in_channels_;
-                            const T* w_R = mix_w + 2 * in_channels_;
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                T d_out = buf_grad[c];
-                                T val_c = buf_eyes[c];
-                                T val_prev = (c == 0) ? 0 : buf_eyes[c - 1];
-                                T val_next = (c == in_channels_ - 1) ? 0 : buf_eyes[c + 1];
-
-                                local_gw_C[c] += d_out * val_c;
-                                local_gw_L[c] += d_out * val_prev;
-                                local_gw_R[c] += d_out * val_next;
-                            }
-                            // Compute d_eyes (dL/dInput)
-                            std::fill(d_eyes.begin(), d_eyes.end(), 0);
-                            for(size_t c=0; c<in_channels_; ++c) {
-                                T d_out = buf_grad[c];
-                                d_eyes[c] += d_out * w_C[c];
-                                if (c < in_channels_ - 1) d_eyes[c+1] += d_out * w_R[c]; // w_R multiplies next
-                                if (c > 0) d_eyes[c-1] += d_out * w_L[c]; // w_L multiplies prev
-                            }
-                        } else {
-                             std::fill(d_eyes.begin(), d_eyes.end(), 0);
-                             size_t min_c = std::min(in_channels_, out_channels_);
-                             const T* w_L = mix_w;
-                             const T* w_C = mix_w + in_channels_;
-                             const T* w_R = mix_w + 2 * in_channels_;
-                             for(size_t c=0; c<min_c; ++c) {
-                                T d_out = buf_grad[c];
-                                T val_c = buf_eyes[c];
-                                T val_prev = (c == 0) ? 0 : buf_eyes[c - 1];
-                                T val_next = (c == in_channels_ - 1) ? 0 : buf_eyes[c + 1];
-                                local_gw_C[c] += d_out * val_c;
-                                local_gw_L[c] += d_out * val_prev;
-                                local_gw_R[c] += d_out * val_next;
-
-                                d_eyes[c] += d_out * w_C[c];
-                                if (c < in_channels_ - 1) d_eyes[c+1] += d_out * w_R[c];
-                                if (c > 0) d_eyes[c-1] += d_out * w_L[c];
-                             }
+                        // buf_eyes is Spectrum Seq
+                        // Save Spectrum Seq for SRIG Backward
+                        if (use_slm_) {
+                            std::memcpy(buf_spectrum.data(), buf_eyes.data(), in_channels_ * sizeof(T));
                         }
 
                         // SRIG Forward Recompute
+                        const T* final_gate = nullptr;
                         if (use_slm_) {
                             T* est_0 = buf_est.data();
                             for(size_t c=0; c<in_channels_; ++c) est_0[c] = std::abs(buf_eyes[c]);
@@ -701,33 +640,118 @@ public:
                                     T bias = srig_b_ptr[c];
 
                                     T linear = cosine * gain + bias;
-                                    curr_act[c] = linear; // Store linear for backward
+                                    curr_act[c] = linear;
                                     T act = (linear > 0) ? linear : 0.0f;
                                     curr_gate[c] = 1.0f / (1.0f + std::exp(-act));
                                     next_est[c] = est_0[c] * curr_gate[c];
                                 }
                             }
+                            final_gate = buf_gate.data() + (srig_iterations_ - 1) * in_channels_;
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                buf_eyes[c] *= final_gate[c];
+                            }
                         }
 
+                        // buf_eyes is Gated Seq
+
+                        if (use_sequency_) {
+                             if constexpr (std::is_same_v<T, float>) {
+                                #ifdef DREIDEL_ARCH_AVX2
+                                    permute_avx2(buf_temp.data(), buf_eyes.data(), nat_map_ptr, in_channels_);
+                                #else
+                                    for(size_t i=0; i<in_channels_; ++i) buf_temp[i] = buf_eyes[nat_map_ptr[i]];
+                                #endif
+                            } else {
+                                for(size_t i=0; i<in_channels_; ++i) buf_temp[i] = buf_eyes[nat_map_ptr[i]];
+                            }
+                            std::memcpy(buf_eyes.data(), buf_temp.data(), in_channels_ * sizeof(T));
+                        }
+
+                        // buf_eyes is Gated Natural (Input to Scale/Dropout)
+
+                        // 3. Backward Pass
+
+                        // Mixer Backward: buf_grad -> d_eyes
+                        // Needs Scaled Natural for Weight Grads
+                        if (in_channels_ == out_channels_) {
+                            const T* w_L = mix_w;
+                            const T* w_C = mix_w + in_channels_;
+                            const T* w_R = mix_w + 2 * in_channels_;
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T d_out = buf_grad[c];
+                                // Compute Scaled Value for Weight Grad
+                                T val_c = buf_eyes[c];
+                                if (training_ && spectral_dropout_rate_ > 0.0f) val_c *= (dropout_mask_[c] * dropout_scale);
+                                val_c *= scale_ptr[c];
+
+                                T val_prev = (c == 0) ? 0 : buf_eyes[c - 1];
+                                if (c>0 && training_ && spectral_dropout_rate_ > 0.0f) val_prev *= (dropout_mask_[c-1] * dropout_scale);
+                                if (c>0) val_prev *= scale_ptr[c-1];
+
+                                T val_next = (c == in_channels_ - 1) ? 0 : buf_eyes[c + 1];
+                                if (c < in_channels_ - 1 && training_ && spectral_dropout_rate_ > 0.0f) val_next *= (dropout_mask_[c+1] * dropout_scale);
+                                if (c < in_channels_ - 1) val_next *= scale_ptr[c+1];
+
+                                local_gw_C[c] += d_out * val_c;
+                                local_gw_L[c] += d_out * val_prev;
+                                local_gw_R[c] += d_out * val_next;
+                            }
+                            // Compute d_eyes (dL/dInput of Mixer)
+                            std::fill(d_eyes.begin(), d_eyes.end(), 0);
+                            for(size_t c=0; c<in_channels_; ++c) {
+                                T d_out = buf_grad[c];
+                                d_eyes[c] += d_out * w_C[c];
+                                if (c < in_channels_ - 1) d_eyes[c+1] += d_out * w_R[c];
+                                if (c > 0) d_eyes[c-1] += d_out * w_L[c];
+                            }
+                        } else {
+                             std::fill(d_eyes.begin(), d_eyes.end(), 0);
+                             size_t min_c = std::min(in_channels_, out_channels_);
+                             const T* w_L = mix_w;
+                             const T* w_C = mix_w + in_channels_;
+                             const T* w_R = mix_w + 2 * in_channels_;
+                             for(size_t c=0; c<min_c; ++c) {
+                                T d_out = buf_grad[c];
+                                T val_c = buf_eyes[c];
+                                if (training_ && spectral_dropout_rate_ > 0.0f) val_c *= (dropout_mask_[c] * dropout_scale);
+                                val_c *= scale_ptr[c];
+
+                                T val_prev = (c == 0) ? 0 : buf_eyes[c - 1];
+                                if (c>0 && training_ && spectral_dropout_rate_ > 0.0f) val_prev *= (dropout_mask_[c-1] * dropout_scale);
+                                if (c>0) val_prev *= scale_ptr[c-1];
+
+                                T val_next = (c == in_channels_ - 1) ? 0 : buf_eyes[c + 1];
+                                if (c < in_channels_ - 1 && training_ && spectral_dropout_rate_ > 0.0f) val_next *= (dropout_mask_[c+1] * dropout_scale);
+                                if (c < in_channels_ - 1) val_next *= scale_ptr[c+1];
+
+                                local_gw_C[c] += d_out * val_c;
+                                local_gw_L[c] += d_out * val_prev;
+                                local_gw_R[c] += d_out * val_next;
+
+                                d_eyes[c] += d_out * w_C[c];
+                                if (c < in_channels_ - 1) d_eyes[c+1] += d_out * w_R[c];
+                                if (c > 0) d_eyes[c-1] += d_out * w_L[c];
+                             }
+                        }
+
+                        // d_eyes is dL/d(Scaled Nat)
+
                         // Scale Backward
-                        const T* final_gate = use_slm_ ? (buf_gate.data() + (srig_iterations_ - 1) * in_channels_) : nullptr;
-
                         for(size_t c=0; c<in_channels_; ++c) {
-                            T u = buf_eyes[c];
-                            T g = use_slm_ ? final_gate[c] : 1.0f;
-                            T val = u * g;
-
+                            T u = buf_eyes[c]; // Gated Nat
                             if (training_ && spectral_dropout_rate_ > 0.0f) {
-                                val *= (dropout_mask_[c] * dropout_scale);
+                                u *= (dropout_mask_[c] * dropout_scale);
                             }
 
-                            local_g_scale[c] += d_eyes[c] * val;
+                            local_g_scale[c] += d_eyes[c] * u;
                             d_eyes[c] *= scale_ptr[c];
 
                             if (training_ && spectral_dropout_rate_ > 0.0f) {
                                 d_eyes[c] *= (dropout_mask_[c] * dropout_scale);
                             }
                         }
+
+                        // d_eyes is dL/d(Gated Nat)
 
                         // Permute d_eyes Nat -> Seq (for SRIG Bwd)
                         if (use_sequency_) {
@@ -743,72 +767,15 @@ public:
                             std::memcpy(d_eyes.data(), buf_temp.data(), in_channels_ * sizeof(T));
                         }
 
+                        // d_eyes is dL/d(Gated Seq)
+
                         // SRIG Backward
                         if (use_slm_) {
                             std::fill(d_est.begin(), d_est.end(), 0.0f);
 
                             for(size_t c=0; c<in_channels_; ++c) {
                                 T g = final_gate[c];
-                                T u = buf_eyes[c]; // buf_eyes is Natural here if use_sequency=false.
-                                // Wait, if use_sequency_, buf_eyes was permuted to Natural before Mixer!
-                                // But SRIG ran in Sequency domain (if enabled).
-                                // So we need u in Sequency domain?
-                                // Let's check Forward.
-                                // Eyes -> WHT -> Permute(Nat->Seq) -> SRIG -> Permute(Seq->Nat) -> Scale.
-                                // In Backward:
-                                // buf_eyes loaded. WHT.
-                                // Permute(Nat->Seq).
-                                // SRIG Forward Recompute (Sequency Domain).
-                                // buf_eyes IS in Sequency Domain (because we did not reverse permute).
-
-                                // WAIT! In forward:
-                                // Permute(Nat->Seq). SRIG. Permute(Seq->Nat). Scale.
-                                // Scale input is Nat.
-                                // buf_eyes (in backward so far) was WHT'd.
-                                // Then we check Permute(Nat->Seq) BEFORE SRIG Recompute.
-                                // So buf_eyes is in Seq domain here.
-
-                                // BUT! We used buf_eyes for Mixer Backward!
-                                // Mixer works in Natural domain (usually).
-                                // In Forward: Scale -> Mixer.
-                                // Scale input was Natural.
-                                // So buf_eyes MUST be Natural for Mixer Backward and Scale Backward.
-
-                                // In Backward recompute:
-                                // Eyes -> WHT -> Permute(Nat->Seq) -> SRIG -> Permute(Seq->Nat).
-                                // We missed the re-permutation to Natural before Mixer Bwd!
-                                // In my previous code:
-                                // ... WHT(buf_eyes) ...
-                                // Permute(Nat->Seq).
-                                // Mixer Bwd using buf_eyes.
-                                // Scale Bwd using buf_eyes.
-
-                                // THIS IS WRONG if use_sequency_ is true.
-                                // Mixer and Scale operate on Natural domain.
-                                // But buf_eyes is Seq.
-
-                                // FIX:
-                                // 1. WHT(buf_eyes).
-                                // 2. If use_sequency_: Permute(Nat->Seq).
-                                // 3. SRIG Forward (Seq domain).
-                                // 4. If use_sequency_: Permute(Seq->Nat).
-                                // 5. Mixer Backward (Nat).
-                                // 6. Scale Backward (Nat).
-                                // 7. If use_sequency_: Permute d_eyes (Nat->Seq).
-                                // 8. SRIG Backward (Seq).
-                                // 9. If use_sequency_: Permute d_eyes (Seq->Nat).
-
-                                // My current implementation of Backward Recompute:
-                                // 1. WHT(buf_eyes).
-                                // 2. If use_sequency_: Permute(Nat->Seq).
-                                // 3. Mixer Bwd (using buf_eyes). <-- WRONG if Seq.
-                                // 4. SRIG Fwd.
-
-                                // Also, SRIG Fwd modifies buf_eyes.
-                                // But in Bwd, we are recomputing.
-
-                                // Let's correct this flow.
-                                // Also d_gate needs `u` which is input to Gate (Seq domain).
+                                T u = buf_spectrum[c]; // Spectrum Seq (Saved)
 
                                 d_gate[c] = d_eyes[c] * u;
                                 d_eyes[c] = d_eyes[c] * g;
@@ -830,8 +797,7 @@ public:
                                 T* d_curr_est = d_est.data() + k * in_channels_;
 
                                 for(size_t c=0; c<in_channels_; ++c) {
-                                    // Recompute forward stats (local)
-                                    // Use curr_est
+                                    // Recompute gradients for w, b, est
                                     T sum_sq = 0;
                                     if (c>=2) sum_sq += curr_est[c-2]*curr_est[c-2];
                                     if (c>=1) sum_sq += curr_est[c-1]*curr_est[c-1];
@@ -911,7 +877,7 @@ public:
                             }
 
                             for(size_t c=0; c<in_channels_; ++c) {
-                                T u = buf_eyes[c];
+                                T u = buf_spectrum[c];
                                 T sgn = (u > 0) ? 1.0f : ((u < 0) ? -1.0f : 0.0f);
                                 d_eyes[c] += d_est_0[c] * sgn;
                             }
@@ -930,7 +896,12 @@ public:
                             std::memcpy(d_eyes.data(), buf_temp.data(), in_channels_ * sizeof(T));
                         }
 
+                        // d_eyes is dL/d(Spectrum Nat)
+
                         algo::WHT::fwht_1d(d_eyes.data(), in_channels_);
+                        for(size_t c=0; c<in_channels_; ++c) d_eyes[c] *= inv_sqrt_in;
+
+                        // d_eyes is dL/d(Eyes)
 
                         int k_rad = kernel_size_ / 2;
                         T* g_pack = grad_packed_weights_.data();
