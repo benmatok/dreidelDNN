@@ -6,9 +6,9 @@ This document summarizes the performance and accuracy of the new "Zenith-Prune" 
 
 | Model | Forward (s) | Backward (s) | Total (s) | Speedup (vs Conv) |
 |---|---|---|---|---|
-| **ConvBaselineAE** | 0.9866 | 4.4191 | 5.4057 | 1.0x |
-| **ZenithHierarchicalAE** | 0.0092 | 0.0559 | 0.0651 | 83.0x |
-| **Zenith-SLM (Prune)** | 0.0127 | 0.0638 | 0.0765 | 70.6x |
+| **ConvBaselineAE** | 0.9582 | 4.3957 | 5.3539 | 1.0x |
+| **ZenithHierarchicalAE** | 0.0153 | 0.0645 | 0.0798 | 67.1x |
+| **Zenith-SLM (Prune)** | 0.0128 | 0.0644 | 0.0773 | 69.3x |
 
 *Note: The "Zenith-SLM" in this benchmark represents the full "Zenith-Prune" architecture running in inference mode. The overhead compared to the standard Zenith model (~0.01s total) accounts for the gating logic and mask management. The massive speedup over Conv2D (70x) is preserved and enhanced by the sparse execution kernel which skips `Eyes` computation for pruned blocks.*
 
@@ -22,7 +22,20 @@ Results from `benchmark_zenith_restoration.cpp` (Denoising):
 | Shot Noise (5%) | ~0.08 | ~0.03 | ~2.6x | PASS |
 | Box Blur (3x3) | ~0.01 | ~0.005 | ~2.0x | PASS |
 
-## 3. Analysis
+## 3. Convergence Comparison (Time-Normalized)
+
+We compared the convergence of `ZenithHierarchicalAE` (Pruned) against `ConvBaselineAE` given equal wall-clock time. Zenith runs approximately 30 steps for every 1 step of Conv2D.
+
+| Time Unit | Z-Steps | Z-Loss | Z-Time(s) | C-Steps | C-Loss | C-Time(s) |
+|---|---|---|---|---|---|---|
+| 5 | 150 | 3.24 | 2.71 | 5 | 0.32 | 2.33 |
+| 10 | 300 | 3.43 | 2.73 | 10 | 0.88 | 2.33 |
+| 20 | 600 | 4.13 | 2.72 | 20 | 0.28 | 2.32 |
+
+**Analysis:**
+While Zenith is significantly faster (executing 600 steps in the time Conv2D executes 20), the current pruned architecture with the simplified training schedule in `compare_zenith_conv_accuracy.cpp` shows higher loss (~3.2-4.1 vs 0.3). This suggests that while the throughput is massive, the training dynamics of the pruned spectral model require further hyperparameter tuning (e.g., lower learning rates, longer warmup) to match the convergence stability of dense Conv2D networks on this specific wavelet task. The "Restored MSE" results in Section 2, however, demonstrate that the model *can* achieve good reconstruction (~0.02 MSE) when trained specifically for denoising with appropriate schedules.
+
+## 4. Analysis
 
 The integration of `ZenithAVXGate` provides a mechanism for dynamic spectral token pruning. While the raw throughput for dense inputs shows a slight overhead due to gating logic, the architecture enables:
 1.  **Hard Sparsity:** Pruned blocks (mask=0) now completely skip the expensive `Eyes` (Depthwise Convolution) step in `ZenithBlock`, validating the "Sparse Execution Kernel".

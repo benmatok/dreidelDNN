@@ -61,6 +61,8 @@ int main() {
     // Adjusted: use_pe=false, init="he"
     // Rationale: PE might add noise for wavelets.
     ZenithHierarchicalAE<float> zenith_ae(3, C, "he", true);
+    // Enable gate training for Zenith (Annealing will be simplified here: 1.0 -> 0.0 over steps)
+    zenith_ae.set_gate_training(true, 1.0f);
 
     // Increased LR to 1e-3 (Standard Adam) to improve convergence speed
     SimpleAdam<float> opt_zenith(1e-3);
@@ -91,10 +93,22 @@ int main() {
         // 1. Train Zenith for 30 steps
         auto start_z = std::chrono::high_resolution_clock::now();
         for(size_t z=0; z < ZenithMultiplier; ++z) {
+            // Annealing schedule for Zenith (simple linear decay over 600 total steps)
+            size_t total_z_step = step * ZenithMultiplier + z;
+            float temp = 1.0f;
+            if (total_z_step > 400) temp = 0.0f;
+            else temp = 1.0f - (float)total_z_step / 400.0f;
+            zenith_ae.set_gate_training(true, temp);
+
             gen.generate_batch(batch_input, BatchSize);
             opt_zenith.zero_grad();
             Tensor<float> out_z = zenith_ae.forward(batch_input);
-            current_loss_z = mse_loss(out_z, batch_input, batch_grad);
+
+            // Add sparsity loss
+            float mse = mse_loss(out_z, batch_input, batch_grad);
+            float sparsity = zenith_ae.get_sparsity_loss() * 1e-4f;
+            current_loss_z = mse + sparsity;
+
             zenith_ae.backward(batch_grad);
             opt_zenith.step();
         }
