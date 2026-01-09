@@ -60,7 +60,7 @@ int main() {
     std::cout << "\n[ZenithHierarchicalAE] Initializing (Base C=" << C << ")..." << std::endl;
     // Adjusted: use_pe=false, init="he"
     // Rationale: PE might add noise for wavelets.
-    ZenithHierarchicalAE<float> zenith_ae(3, C, false, "he", true);
+    ZenithHierarchicalAE<float> zenith_ae(3, C, "he", true);
 
     // Increased LR to 1e-3 (Standard Adam) to improve convergence speed
     SimpleAdam<float> opt_zenith(1e-3);

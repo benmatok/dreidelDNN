@@ -33,7 +33,7 @@ double train_run(const std::vector<Tensor<T>>& dataset, int steps, bool use_slm,
     // Instantiate a fresh model
     // base_channels=8 for speed (vs 32 default)
     // 8 -> 128 -> 2048 channels.
-    models::ZenithHierarchicalAE<T> model(3, base_channels, true, "he", use_slm);
+    models::ZenithHierarchicalAE<T> model(3, base_channels, "he", use_slm);
 
     optim::SimpleAdam<T> optimizer(0.0001); // Stable LR
     optimizer.add_parameters(model.parameters(), model.gradients());
@@ -42,13 +42,44 @@ double train_run(const std::vector<Tensor<T>>& dataset, int steps, bool use_slm,
     double final_loss = 0;
 
     for(int step=0; step<steps; ++step) {
+        // Annealing Schedule
+        // Epoch 0-5 (assume epoch ~ dataset_size steps? or just steps)
+        // Spec says: Epoch 0-5 Warmup (Temp 1.0), Epoch 6-30 Squeeze (Decay to 0), Epoch 31+ Lock (Temp 0).
+        // Let's assume 1 epoch = dataset_size (200) steps? Or just map steps to schedule.
+        // Let's assume total steps=800 corresponds to "full training".
+        // 800 steps / 50 epochs = 16 steps/epoch?
+        // Let's map steps directly:
+        // 0-100: Temp 1.0
+        // 100-600: Decay
+        // 600+: Temp 0.0
+        float temp = 1.0f;
+        if (step > 600) temp = 0.0f;
+        else if (step > 100) {
+            float progress = (float)(step - 100) / 500.0f;
+            temp = 1.0f - progress;
+        }
+
+        if (use_slm) {
+            model.set_gate_training(true, temp);
+        } else {
+            // Ensure baseline uses hard pass-through (inference mode)
+            model.set_gate_training(false);
+        }
+
         const Tensor<T>& input = dataset[step % dataset_size];
 
         optimizer.zero_grad();
         Tensor<T> output = model.forward(input);
 
         T mse = compute_mse(input, output);
-        final_loss = static_cast<double>(mse);
+
+        // Sparsity Loss (Lambda = 1e-4)
+        T sparsity_loss = 0;
+        if (use_slm) {
+            sparsity_loss = model.get_sparsity_loss() * 1e-4f;
+        }
+
+        final_loss = static_cast<double>(mse + sparsity_loss);
 
         // Backward
         Tensor<T> grad_output(output.shape());

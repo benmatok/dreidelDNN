@@ -112,6 +112,17 @@ void train_denoising(models::ZenithHierarchicalAE<float>& model,
     std::cout << "Training Denoising AE (" << epochs << " steps)..." << std::endl;
 
     for(int step=0; step<epochs; ++step) {
+        // Annealing Schedule
+        // Since epochs is steps here (200), we just map 0-200.
+        // Let's say 0-50 warmup, 50-150 decay, 150+ lock.
+        float temp = 1.0f;
+        if (step > 150) temp = 0.0f;
+        else if (step > 50) {
+            float progress = (float)(step - 50) / 100.0f;
+            temp = 1.0f - progress;
+        }
+        model.set_gate_training(true, temp);
+
         // Sample batch
         Tensor<float> target = clean_data[step % N]; // Copy
         Tensor<float> input = target; // Copy
@@ -127,6 +138,9 @@ void train_denoising(models::ZenithHierarchicalAE<float>& model,
 
         // MSE Loss against CLEAN target
         float mse = compute_mse(target, output);
+
+        // Sparsity Loss (Lambda = 1e-4)
+        float sparsity_loss = model.get_sparsity_loss() * 1e-4f;
 
         // Backward
         Tensor<float> grad_output = output;
@@ -175,7 +189,7 @@ int main() {
     gen.generate_batch(clean_test, batch_size);
 
     // 2. Model Setup (Zenith-SRIG)
-    models::ZenithHierarchicalAE<float> model(C, base_channels, true, "he", true); // use_slm=true
+    models::ZenithHierarchicalAE<float> model(C, base_channels, "he", true); // use_slm=true
 
     // 3. Train
     auto start_train = std::chrono::high_resolution_clock::now();
