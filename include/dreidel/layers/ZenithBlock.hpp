@@ -29,9 +29,10 @@ public:
 
     ZenithBlock(size_t in_channels, size_t out_channels, size_t kernel_size, size_t spectral_dim,
                 bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, size_t stride = 1, size_t upscale = 1,
-                const std::string& init_scheme = "he", bool use_slm = false, bool use_sequency = false)
+                const std::string& init_scheme = "he", bool use_slm = false, bool use_sequency = false, float norm_eps = 1e-5)
         : in_channels_(in_channels), out_channels_(out_channels), kernel_size_(kernel_size), spectral_dim_(spectral_dim),
           use_ifwht_(use_ifwht), use_gating_(use_gating), stride_(stride), upscale_(upscale), use_slm_(use_slm), use_sequency_(use_sequency),
+          norm_eps_(norm_eps),
           packed_weights_({in_channels, 1, kernel_size, kernel_size}),
           spectral_scales_({1, in_channels}),
           mixing_weights_({3, in_channels}),
@@ -76,7 +77,7 @@ public:
         // 2. GroupNorm (Hardcoded Standard)
         size_t groups = 32;
         if (out_channels_ % groups != 0) groups = 1;
-        group_norm_ = std::make_unique<GroupNorm<T>>(groups, out_channels_);
+        group_norm_ = std::make_unique<GroupNorm<T>>(groups, out_channels_, norm_eps_);
 
         // Sequency Map
         if (use_sequency_) {
@@ -89,8 +90,8 @@ public:
     }
 
     ZenithBlock(size_t channels, size_t kernel_size, size_t spectral_dim,
-                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, bool use_slm = false, bool use_sequency = false)
-        : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1, "he", use_slm, use_sequency) {}
+                bool use_ifwht = true, bool use_dilated = false, bool use_gating = false, bool use_slm = false, bool use_sequency = false, float norm_eps = 1e-5)
+        : ZenithBlock(channels, channels, kernel_size, spectral_dim, use_ifwht, use_dilated, use_gating, 1, 1, "he", use_slm, use_sequency, norm_eps) {}
 
     void initialize(const std::string& scheme) {
         packed_weights_.fill(0);
@@ -939,8 +940,15 @@ public:
                         for(size_t c=0; c<in_channels_; ++c) {
                             T dy = d_eyes[c];
                             if (dy == 0) continue;
-                            int ih_center = (up_shift > 0) ? ((int)h >> up_shift) : ((int)h / (int)upscale_);
-                            int iw_center = (up_shift > 0) ? ((int)w >> up_shift) : ((int)w / (int)upscale_);
+                            int ih_center;
+                            int iw_center;
+                            if (upscale_ > 1) {
+                                ih_center = (up_shift > 0) ? ((int)h >> up_shift) : ((int)h / (int)upscale_);
+                                iw_center = (up_shift > 0) ? ((int)w >> up_shift) : ((int)w / (int)upscale_);
+                            } else {
+                                ih_center = h * stride_;
+                                iw_center = w * stride_;
+                            }
 
                             for(int ky=-k_rad; ky<=k_rad; ++ky) {
                                 int ih = ih_center + ky;
@@ -1016,6 +1024,7 @@ private:
     bool use_sequency_ = false;
     float spectral_dropout_rate_ = 0.1f;
     bool training_ = true;
+    float norm_eps_;
 
     std::vector<int32_t, core::AlignedAllocator<int32_t>> sequency_map_;
     std::vector<int32_t, core::AlignedAllocator<int32_t>> natural_map_;
