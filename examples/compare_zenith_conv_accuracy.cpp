@@ -47,8 +47,8 @@ int main() {
     const size_t W = 128;
     const size_t C = 16;
     const size_t BatchSize = 2;
-    const size_t ConvSteps = 20;     // Total "Time Units"
-    const size_t ZenithMultiplier = 30; // 30 Zenith steps per 1 Conv step
+    const size_t ConvSteps = 20;
+    const size_t ZenithMultiplier = 30;
 
     // Generator
     WaveletGenerator2D<float> gen(H, W);
@@ -58,8 +58,12 @@ int main() {
 
     // --- Zenith Setup ---
     std::cout << "\n[ZenithHierarchicalAE] Initializing (Base C=" << C << ")..." << std::endl;
-    ZenithHierarchicalAE<float> zenith_ae(3, C, true, "he", true);
-    SimpleAdam<float> opt_zenith(2e-4);
+    // Adjusted: use_pe=false, init="he"
+    // Rationale: PE might add noise for wavelets.
+    ZenithHierarchicalAE<float> zenith_ae(3, C, false, "he", true);
+
+    // Increased LR to 1e-3 (Standard Adam) to improve convergence speed
+    SimpleAdam<float> opt_zenith(1e-3);
     opt_zenith.add_parameters(zenith_ae.parameters(), zenith_ae.gradients());
 
     // --- Conv Setup ---
@@ -87,7 +91,7 @@ int main() {
         // 1. Train Zenith for 30 steps
         auto start_z = std::chrono::high_resolution_clock::now();
         for(size_t z=0; z < ZenithMultiplier; ++z) {
-            gen.generate_batch(batch_input, BatchSize); // New data every step
+            gen.generate_batch(batch_input, BatchSize);
             opt_zenith.zero_grad();
             Tensor<float> out_z = zenith_ae.forward(batch_input);
             current_loss_z = mse_loss(out_z, batch_input, batch_grad);
@@ -99,7 +103,7 @@ int main() {
         total_time_z_accum += time_z_block;
 
         // 2. Train Conv for 1 step
-        gen.generate_batch(batch_input, BatchSize); // Fresh batch for Conv too
+        gen.generate_batch(batch_input, BatchSize);
 
         auto start_c = std::chrono::high_resolution_clock::now();
         opt_conv.zero_grad();
@@ -122,8 +126,6 @@ int main() {
 
     std::cout << "\n=== Final Results ===" << std::endl;
     std::cout << "Zenith Final Loss (after " << ConvSteps * ZenithMultiplier << " steps): " << current_loss_z << std::endl;
-    // Conv loss is captured in the loop variable, need to store or just use last printed.
-    // Ideally we should print it again or store it.
 
     return 0;
 }
