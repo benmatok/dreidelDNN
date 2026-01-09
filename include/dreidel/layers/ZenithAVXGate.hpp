@@ -310,6 +310,10 @@ public:
         return sum;
     }
 
+    const Tensor<T>* get_last_mask() const {
+        return &mask_cached_;
+    }
+
 private:
     size_t channels_;
     size_t blocks_;
