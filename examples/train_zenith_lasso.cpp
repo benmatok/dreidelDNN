@@ -140,6 +140,7 @@ int main() {
 
     // Encoder (64x64x1 -> 1x1x64) in 3 steps
     // args: in, out, k, spec, ifwht, dil, gate, stride, upscale, init, slm, seq, eps
+    // Use eps=1.0f for maximum stability in sparse regime
     model.push_back(new layers::ZenithBlock<float>(1, 128, 3, 128, true, true, false, 4, 1, "he", false, false, 1.0f));
     model.push_back(new layers::ZenithBlock<float>(128, 128, 3, 128, true, true, false, 4, 1, "he", false, false, 1.0f));
     model.push_back(new layers::ZenithBlock<float>(128, 64, 3, 128, true, true, false, 4, 1, "he", false, false, 1.0f));
@@ -151,8 +152,6 @@ int main() {
     model.push_back(new layers::ZenithBlock<float>(128, 128, 3, 128, true, true, false, 1, 1, "he", false, false, 1.0f));
     model.push_back(new Upscale2D<float>(4));
     model.push_back(new layers::ZenithBlock<float>(128, 1, 3, 128, true, true, false, 1, 1, "he", false, false, 1.0f));
-
-    // NOTE: We pass eps=1.0 to ZenithBlock to prevent noise amplification in sparse regime.
 
     // Optimizer
     optim::SimpleAdam<float> optimizer(lr);
