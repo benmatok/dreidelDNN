@@ -1,0 +1,22 @@
+=== Model Loss Comparison Log ===
+
+1. Zenith-Lasso (Current)
+   - Configuration: ZenithBlock (Lasso Regularization), GroupNorm(eps=1.0)
+   - Input Size: 64x64
+   - Final MSE Loss: 0.04879
+   - Status: Stable Convergence (Predicted Mean/Zero)
+
+2. Conv2D Autoencoder (Baseline)
+   - Source: docs/COMPARATIVE_RECONSTRUCTION.md
+   - Input Size: 32x32
+   - Final MSE Loss: 0.02968
+   - Status: Learned Reconstruction
+
+3. Comparison
+   - Delta (Zenith - Conv): +0.01911 (Worse)
+   - Relative Performance: Zenith-Lasso loss is ~1.64x higher than Conv2D baseline.
+
+4. Analysis
+   - The Zenith-Lasso model with high-epsilon GroupNorm stabilization (eps=1.0) converges to the signal energy floor (outputting ~zeros), resulting in a loss of ~0.0488.
+   - The Conv2D baseline (eps=1e-5) successfully learns features, achieving a lower loss of ~0.0297.
+   - While Zenith-Lasso resolved the divergence issue (preventing loss > 1.0), it currently suffers from signal suppression due to the aggressive stabilization required for the sparse spectral architecture.
