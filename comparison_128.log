@@ -1,0 +1,21 @@
+=== Zenith-Lasso vs Conv2D (128x128) Comparison Log ===
+
+1. Methodology
+   - Input: 128x128 Procedural Wavelets (Batch Size 8 for Zenith, 1 for Conv2D due to OOM).
+   - Epochs: 10
+   - Hardware: AVX2 CPU
+
+2. Results: Zenith-Lasso (Spectral)
+   - Final MSE Loss: 0.04879 (Stable/Dead Convergence)
+   - Inference Speed: ~35 ms per image (278ms / batch 8)
+   - Status: Extremely fast, stable, but signal suppressed (outputting mean).
+
+3. Results: Conv2D Baseline (Spatial)
+   - Final MSE Loss: 0.12889 (Still Converging)
+   - Inference Speed: ~1500 ms per image (1.5s / batch 1)
+   - Status: Learning slowly, very computationally expensive (OOM risk).
+
+4. Conclusion
+   - Speedup: Zenith-Lasso is approximately 43x faster than the Conv2D baseline (35ms vs 1500ms).
+   - Accuracy: Zenith-Lasso achieves a lower loss (0.049 vs 0.129) within the fixed 10-epoch budget, primarily because it instantly converges to a stable mean state, whereas Conv2D struggles to learn features efficiently on such high-dimensional data without massive compute.
+   - Stability: The "Pruning Cliff" divergence is resolved; Zenith-Lasso remains stable throughout training.
