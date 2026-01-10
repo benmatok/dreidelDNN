@@ -11,6 +11,18 @@
 
 ---
 
+## 🏆 **SOTA: Zenith-Lasso** (New!)
+
+The **Zenith-Lasso Autoencoder** is our latest breakthrough, offering **43x faster inference** than standard Conv2D models while maintaining stable convergence.
+
+*   **Technology**: Uses Convex Group Lasso Regularization to induce structural sparsity in the spectral domain.
+*   **Performance**: ~35ms / image (128x128) vs ~1500ms for Conv2D on CPU.
+*   **Architecture**: Fully spectral (ZenithBlocks) with stabilized normalization.
+
+👉 **[See the Benchmark Results](docs/COMPARATIVE_RECONSTRUCTION.md)** | **[Read the Tutorial](tutorials/13_zenith_lasso.md)**
+
+---
+
 ## 🚀 Quick Start: The Zenith Way
 
 dreidelDNN is header-only. Just clone and include.
