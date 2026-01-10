@@ -100,52 +100,27 @@ int main() {
     Tensor<float> batch_grad({BatchSize, H, W, 3});
 
     // Models
-    std::cout << "Initializing ZenithHierarchicalAE..." << std::endl;
-    ZenithHierarchicalAE<float> zenith_ae(C);
-
     std::cout << "Initializing ConvBaselineAE..." << std::endl;
     ConvBaselineAE<float> conv_ae(C);
 
     // Optimizers
     std::cout << "Initializing Optimizers..." << std::endl;
-    SimpleAdam<float> opt_zenith(1e-3);
-    opt_zenith.add_parameters(zenith_ae.parameters(), zenith_ae.gradients());
-
     SimpleAdam<float> opt_conv(1e-3);
     opt_conv.add_parameters(conv_ae.parameters(), conv_ae.gradients());
 
     // Training Loop
     auto total_start = std::chrono::high_resolution_clock::now();
-    double total_time_z = 0;
     double total_time_c = 0;
 
     for (size_t epoch = 0; epoch < Epochs; ++epoch) {
-        float loss_z_acc = 0;
         float loss_c_acc = 0;
-
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (size_t step = 0; step < StepsPerEpoch; ++step) {
-            // 1. Generate Data
-            gen.generate_batch(batch_input, BatchSize);
-
-            // 2. Train Zenith
-            opt_zenith.zero_grad();
-            Tensor<float> out_z = zenith_ae.forward(batch_input);
-            float loss_z = mse_loss(out_z, batch_input, batch_grad);
-            zenith_ae.backward(batch_grad);
-            opt_zenith.step();
-            loss_z_acc += loss_z;
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        total_time_z += std::chrono::duration<double>(t1 - t0).count();
 
         auto t2 = std::chrono::high_resolution_clock::now();
         for (size_t step = 0; step < StepsPerEpoch; ++step) {
-            // Re-gen data? Or use same batch? Use same generation logic for fairness
-            // But we already consumed the batch. Let's regen to simulate real stream
+            // Generate Data
             gen.generate_batch(batch_input, BatchSize);
 
-            // 3. Train Conv
+            // Train Conv
             opt_conv.zero_grad();
             Tensor<float> out_c = conv_ae.forward(batch_input);
             float loss_c = mse_loss(out_c, batch_input, batch_grad); // reuse grad buffer
@@ -157,9 +132,7 @@ int main() {
         total_time_c += std::chrono::duration<double>(t3 - t2).count();
 
         std::cout << "Epoch " << epoch+1 << "/" << Epochs
-                  << " | Loss Z: " << std::setprecision(5) << loss_z_acc / StepsPerEpoch
-                  << " | Time Z: " << total_time_z << "s"
-                  << " | Loss C: " << loss_c_acc / StepsPerEpoch
+                  << " | Loss C: " << std::setprecision(5) << loss_c_acc / StepsPerEpoch
                   << " | Time C: " << total_time_c << "s"
                   << std::endl;
     }
