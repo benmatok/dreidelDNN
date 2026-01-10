@@ -132,7 +132,7 @@ int main() {
     // Config
     size_t batch_size = 8;
     size_t H = 128, W = 128; // Updated to 128x128 as requested
-    size_t epochs = 10; // Quick check for log output
+    size_t epochs = 100; // Standard demo length
     float lr = 0.001f; // Standard learning rate
     float max_lambda = 1e-4f; // Tune: Higher = Sparse, Lower = Accurate
 
