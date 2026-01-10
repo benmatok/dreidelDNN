@@ -82,14 +82,14 @@ void save_tensor_as_png(const Tensor<T>& tensor, size_t batch_idx, size_t H, siz
 }
 
 int main() {
-    std::cout << "=== Training Comparative Autoencoders on Wavelets (32x32) ===\n";
+    std::cout << "=== Training Comparative Autoencoders on Wavelets (128x128) ===\n";
 
     // Config - INCREASED for Fused Kernel (base=16 -> max=4096)
-    const size_t H = 32;
-    const size_t W = 32;
-    const size_t C = 16; // Base filters 16 -> Stage 2 is 16*256 = 4096 channels
-    const size_t BatchSize = 2;
-    const size_t Epochs = 2;
+    const size_t H = 128;
+    const size_t W = 128;
+    const size_t C = 4; // Reduced to 4 to avoid OOM (4*256=1024 channels in deep stages)
+    const size_t BatchSize = 1; // Reduce to 1 to avoid OOM
+    const size_t Epochs = 10;
     const size_t StepsPerEpoch = 5;
 
     // Generator
@@ -103,16 +103,16 @@ int main() {
     std::cout << "Initializing ZenithHierarchicalAE..." << std::endl;
     ZenithHierarchicalAE<float> zenith_ae(C);
 
-    std::cout << "Initializing ConvBaselineAE (Skipped)..." << std::endl;
-    // ConvBaselineAE<float> conv_ae(C); // OOM at C=16 (Max C=4096)
+    std::cout << "Initializing ConvBaselineAE..." << std::endl;
+    ConvBaselineAE<float> conv_ae(C);
 
     // Optimizers
     std::cout << "Initializing Optimizers..." << std::endl;
     SimpleAdam<float> opt_zenith(1e-3);
     opt_zenith.add_parameters(zenith_ae.parameters(), zenith_ae.gradients());
 
-    // SimpleAdam<float> opt_conv(1e-3);
-    // opt_conv.add_parameters(conv_ae.parameters(), conv_ae.gradients());
+    SimpleAdam<float> opt_conv(1e-3);
+    opt_conv.add_parameters(conv_ae.parameters(), conv_ae.gradients());
 
     // Training Loop
     auto total_start = std::chrono::high_resolution_clock::now();
@@ -123,6 +123,7 @@ int main() {
         float loss_z_acc = 0;
         float loss_c_acc = 0;
 
+        auto t0 = std::chrono::high_resolution_clock::now();
         for (size_t step = 0; step < StepsPerEpoch; ++step) {
             // 1. Generate Data
             gen.generate_batch(batch_input, BatchSize);
@@ -134,19 +135,32 @@ int main() {
             zenith_ae.backward(batch_grad);
             opt_zenith.step();
             loss_z_acc += loss_z;
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        total_time_z += std::chrono::duration<double>(t1 - t0).count();
+
+        auto t2 = std::chrono::high_resolution_clock::now();
+        for (size_t step = 0; step < StepsPerEpoch; ++step) {
+            // Re-gen data? Or use same batch? Use same generation logic for fairness
+            // But we already consumed the batch. Let's regen to simulate real stream
+            gen.generate_batch(batch_input, BatchSize);
 
             // 3. Train Conv
-            // opt_conv.zero_grad();
-            // Tensor<float> out_c = conv_ae.forward(batch_input);
-            // float loss_c = mse_loss(out_c, batch_input, batch_grad); // reuse grad buffer
-            // conv_ae.backward(batch_grad);
-            // opt_conv.step();
-            // loss_c_acc += loss_c;
+            opt_conv.zero_grad();
+            Tensor<float> out_c = conv_ae.forward(batch_input);
+            float loss_c = mse_loss(out_c, batch_input, batch_grad); // reuse grad buffer
+            conv_ae.backward(batch_grad);
+            opt_conv.step();
+            loss_c_acc += loss_c;
         }
+        auto t3 = std::chrono::high_resolution_clock::now();
+        total_time_c += std::chrono::duration<double>(t3 - t2).count();
 
         std::cout << "Epoch " << epoch+1 << "/" << Epochs
                   << " | Loss Z: " << std::setprecision(5) << loss_z_acc / StepsPerEpoch
                   << " | Time Z: " << total_time_z << "s"
+                  << " | Loss C: " << loss_c_acc / StepsPerEpoch
+                  << " | Time C: " << total_time_c << "s"
                   << std::endl;
     }
 
