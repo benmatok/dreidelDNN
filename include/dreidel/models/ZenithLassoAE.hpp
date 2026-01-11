@@ -3,6 +3,7 @@
 #include "../layers/Layer.hpp"
 #include "../layers/ZenithBlock.hpp"
 #include "../layers/Upscale2D.hpp"
+#include "../layers/Conv2D.hpp"
 #include "../optim/ZenithRegularizer.hpp"
 #include <vector>
 #include <memory>
@@ -42,6 +43,10 @@ public:
         // 6. Upscale 4 -> 128 -> 1
         layers_.push_back(std::make_unique<layers::Upscale2D<T>>(4));
         layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(128, 1, 3, 128, true, true, false, 1, 1, "he", false, false, 1.0f));
+
+        // 7. Fidelity "Glaze" Head (3x3 Conv) to de-block WHT artifacts
+        // Maps 1 channel -> 1 channel, kernel 3, stride 1, padding 1
+        layers_.push_back(std::make_unique<layers::Conv2D<T>>(1, 1, 3, 1, 1));
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
