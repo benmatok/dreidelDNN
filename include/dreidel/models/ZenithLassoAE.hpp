@@ -3,6 +3,7 @@
 #include "../layers/Layer.hpp"
 #include "../layers/ZenithBlock.hpp"
 #include "../layers/Upscale2D.hpp"
+#include "../optim/ZenithRegularizer.hpp"
 #include <vector>
 #include <memory>
 
@@ -36,7 +37,7 @@ public:
 
         // 5. Upscale 4 -> 128 -> 128
         layers_.push_back(std::make_unique<layers::Upscale2D<T>>(4));
-        layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(128, 128, 3, 128, true, true, false, 1, 1, "he", false, false, 1.0f)); // Note: train_zenith_lasso had stride 4 typo in search block, verified stride 1
+        layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(128, 128, 3, 128, true, true, false, 1, 1, "he", false, false, 1.0f));
 
         // 6. Upscale 4 -> 128 -> 1
         layers_.push_back(std::make_unique<layers::Upscale2D<T>>(4));
@@ -75,6 +76,46 @@ public:
             grads.insert(grads.end(), g.begin(), g.end());
         }
         return grads;
+    }
+
+    // Apply Group Lasso to Mixing Weights of all Zenith Blocks
+    void apply_lasso(float lambda, float lr) {
+        if (lambda <= 0.0f) return;
+        for(auto& layer_base : layers_) {
+            auto* layer = dynamic_cast<layers::ZenithBlock<T>*>(layer_base.get());
+            if(layer) {
+                 auto params = layer->parameters();
+                 // mixing_weights_ is params[2] (Left, Center, Right stacked 3xChannels)
+                 // params[2] is Tensor<T>*, we need data pointer.
+                 // Ensure we have enough params (ZenithBlock returns at least 3)
+                 if (params.size() >= 3) {
+                     optim::apply_group_lasso_avx(params[2]->data(), params[2]->size(), lambda, lr);
+                 }
+            }
+        }
+    }
+
+    // Helper to calculate sparsity statistics
+    void get_sparsity_stats(size_t& total_blocks, size_t& zero_blocks) {
+        total_blocks = 0;
+        zero_blocks = 0;
+        for(auto& layer_base : layers_) {
+            auto* layer = dynamic_cast<layers::ZenithBlock<T>*>(layer_base.get());
+            if(layer) {
+                auto params = layer->parameters();
+                if (params.size() >= 3) {
+                    float* w = params[2]->data();
+                    size_t s = params[2]->size();
+                    for(size_t i=0; i<s; i+=8) {
+                        if (i + 8 > s) break;
+                        float energy = 0;
+                        for(int j=0; j<8; j++) energy += std::abs(w[i+j]);
+                        total_blocks++;
+                        if (energy < 1e-9f) zero_blocks++;
+                    }
+                }
+            }
+        }
     }
 
     std::string name() const override { return "ZenithLassoAE"; }
