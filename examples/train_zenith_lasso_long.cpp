@@ -107,7 +107,7 @@ int main() {
     // Config
     size_t batch_size = 8;
     size_t H = 128, W = 128;
-    size_t epochs = 1000;
+    size_t epochs = 5000;
     float lr = 0.005f; // Increased LR slightly to speed up convergence demo
     float max_lambda = 1e-4f;
 
