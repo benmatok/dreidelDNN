@@ -36,6 +36,9 @@ public:
     // Get output gradients for KFAC (optional)
     virtual std::vector<Tensor<T, B>*> grad_outputs() { return {}; }
 
+    // Set training mode (e.g., for Dropout/BatchNorm)
+    virtual void set_training(bool training) { (void)training; }
+
     virtual std::string name() const = 0;
 };
 

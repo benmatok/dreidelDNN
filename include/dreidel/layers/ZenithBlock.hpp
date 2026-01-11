@@ -121,8 +121,9 @@ public:
         spectral_dropout_rate_ = rate;
     }
 
-    void set_training(bool training) {
+    void set_training(bool training) override {
         training_ = training;
+        // GroupNorm might need it if it tracks stats, but currently it doesn't.
     }
 
     void set_sequency_ordering(bool use) {
