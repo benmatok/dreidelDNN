@@ -104,7 +104,7 @@ int main() {
     // Config
     size_t batch_size = 4;
     size_t H = 128, W = 128;
-    size_t epochs = 20; // Short demonstration run
+    size_t epochs = 100; // 100 Epochs as requested
     float lr = 0.001f;
 
     // Model
