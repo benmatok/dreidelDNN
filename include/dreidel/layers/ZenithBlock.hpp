@@ -140,6 +140,13 @@ public:
         pruning_mask_ = mask;
     }
 
+    void set_epsilon(float eps) {
+        norm_eps_ = eps;
+        if (group_norm_) {
+            group_norm_->set_epsilon(static_cast<T>(eps));
+        }
+    }
+
     Tensor<T> forward(const Tensor<T>& input) override {
         input_cached_ = input;
         auto shape = input.shape();

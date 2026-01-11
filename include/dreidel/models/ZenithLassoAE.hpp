@@ -118,6 +118,15 @@ public:
         }
     }
 
+    void set_epsilon(float eps) {
+        for(auto& layer_base : layers_) {
+            auto* layer = dynamic_cast<layers::ZenithBlock<T>*>(layer_base.get());
+            if(layer) {
+                layer->set_epsilon(eps);
+            }
+        }
+    }
+
     std::string name() const override { return "ZenithLassoAE"; }
 
 private:
