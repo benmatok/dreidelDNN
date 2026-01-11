@@ -23,24 +23,24 @@ template <typename T>
 class ZenithLassoAE : public layers::Layer<T> {
 public:
     ZenithLassoAE() {
-        // Encoder
-        // 1. 1 -> 128 (Stride 4)
+        // Encoder (Less aggressive compression: 128x128 -> 32x32 -> 16x16 -> 8x8)
+        // 1. 1 -> 128 (Stride 4) -> 32x32
         layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(1, 128, 3, 128, true, true, false, 4, 1, "he", false, false, 1.0f));
-        // 2. 128 -> 128 (Stride 4)
-        layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(128, 128, 3, 128, true, true, false, 4, 1, "he", false, false, 1.0f));
-        // 3. 128 -> 64 (Stride 4)
-        layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(128, 64, 3, 128, true, true, false, 4, 1, "he", false, false, 1.0f));
+        // 2. 128 -> 128 (Stride 2) -> 16x16
+        layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(128, 128, 3, 128, true, true, false, 2, 1, "he", false, false, 1.0f));
+        // 3. 128 -> 64 (Stride 2) -> 8x8
+        layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(128, 64, 3, 128, true, true, false, 2, 1, "he", false, false, 1.0f));
 
-        // Decoder
-        // 4. Upscale 4 -> 64 -> 128
-        layers_.push_back(std::make_unique<layers::Upscale2D<T>>(4));
+        // Decoder (Mirror: 8x8 -> 16x16 -> 32x32 -> 128x128)
+        // 4. Upscale 2 -> 64 -> 128 (8x8 -> 16x16)
+        layers_.push_back(std::make_unique<layers::Upscale2D<T>>(2));
         layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(64, 128, 3, 128, true, true, false, 1, 1, "he", false, false, 1.0f));
 
-        // 5. Upscale 4 -> 128 -> 128
-        layers_.push_back(std::make_unique<layers::Upscale2D<T>>(4));
+        // 5. Upscale 2 -> 128 -> 128 (16x16 -> 32x32)
+        layers_.push_back(std::make_unique<layers::Upscale2D<T>>(2));
         layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(128, 128, 3, 128, true, true, false, 1, 1, "he", false, false, 1.0f));
 
-        // 6. Upscale 4 -> 128 -> 1
+        // 6. Upscale 4 -> 128 -> 1 (32x32 -> 128x128)
         layers_.push_back(std::make_unique<layers::Upscale2D<T>>(4));
         layers_.push_back(std::make_unique<layers::ZenithBlock<T>>(128, 1, 3, 128, true, true, false, 1, 1, "he", false, false, 1.0f));
 
