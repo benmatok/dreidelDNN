@@ -10,12 +10,55 @@
 // Include stb_image_write
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../include/stb_image_write.h"
+#include <fstream>
+#include <unistd.h>
 
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/models/ZenithLassoAE.hpp"
 #include "../include/dreidel/optim/SimpleAdam.hpp"
 
 using namespace dreidel;
+
+template <typename T>
+void save_checkpoint(models::ZenithLassoAE<T>& model, const std::string& filename, size_t epoch, float eps) {
+    std::ofstream ofs(filename, std::ios::binary);
+    if(!ofs) return;
+
+    // Metadata
+    ofs.write(reinterpret_cast<const char*>(&epoch), sizeof(epoch));
+    ofs.write(reinterpret_cast<const char*>(&eps), sizeof(eps));
+
+    auto params = model.parameters();
+    for(auto* p : params) {
+        size_t s = p->size();
+        ofs.write(reinterpret_cast<const char*>(&s), sizeof(s));
+        ofs.write(reinterpret_cast<const char*>(p->data()), s * sizeof(T));
+    }
+    std::cout << "Saved checkpoint to " << filename << " (Epoch " << epoch << ")" << std::endl;
+}
+
+template <typename T>
+bool load_checkpoint(models::ZenithLassoAE<T>& model, const std::string& filename, size_t& epoch, float& eps) {
+    std::ifstream ifs(filename, std::ios::binary);
+    if(!ifs) return false;
+
+    // Metadata
+    ifs.read(reinterpret_cast<char*>(&epoch), sizeof(epoch));
+    ifs.read(reinterpret_cast<char*>(&eps), sizeof(eps));
+
+    auto params = model.parameters();
+    for(auto* p : params) {
+        size_t s_in_file;
+        ifs.read(reinterpret_cast<char*>(&s_in_file), sizeof(s_in_file));
+        if(s_in_file != p->size()) {
+             std::cerr << "Checkpoint size mismatch!" << std::endl;
+             return false;
+        }
+        ifs.read(reinterpret_cast<char*>(p->data()), s_in_file * sizeof(T));
+    }
+    std::cout << "Loaded checkpoint from " << filename << " (Epoch " << epoch << ", Eps " << eps << ")" << std::endl;
+    return true;
+}
 
 // Helper to save Tensor as PNG
 // Assumes Tensor shape [Batch, H, W, Channels] and saves the first item in batch.
@@ -254,8 +297,17 @@ int main() {
 
     float current_eps = 1.0f; // Start high for stability
     float best_mse = 1e9;
+    size_t start_epoch = 0;
 
-    for(size_t epoch=0; epoch<epochs; ++epoch) {
+    // Check for checkpoint
+    if (access("checkpoint.bin", F_OK) != -1) {
+        if (load_checkpoint(model, "checkpoint.bin", start_epoch, current_eps)) {
+            model.set_epsilon(current_eps);
+            std::cout << "Resuming training from Epoch " << start_epoch << std::endl;
+        }
+    }
+
+    for(size_t epoch=start_epoch; epoch<epochs; ++epoch) {
         // Lambda Schedule
         float current_lambda = 0.0f;
         if (epoch > 100) {
@@ -356,6 +408,11 @@ int main() {
             // Let's just use the standard saver which will handle it as 2x2 image with 64 channels (saving first 3).
             // That's not very useful.
             // Let's save it as a flattened heatmap if possible, but for now just log stats is enough for analysis.
+
+            // Save checkpoint periodically
+            if (epoch % 100 == 0) {
+                save_checkpoint(model, "checkpoint.bin", epoch, current_eps);
+            }
         }
     }
 
