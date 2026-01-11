@@ -1,0 +1,19 @@
+=== Zenith-Lasso Long Training (128x128) ===
+Epoch    0 | Loss (MSE): 0.063725 | MAE: 0.122227 | Lambda: 0 | Sparsity: 66.6667%
+Saving ablation_target_0.png | Range: [5.10909e-12, 1]
+Saving ablation_recon_0.png | Range: [-2.76505e-08, 4.4011e-07]
+Epoch   50 | Loss (MSE): 0.0595289 | MAE: 0.114288 | Lambda: 0 | Sparsity: 66.6667%
+Saving ablation_target_50.png | Range: [3.06212e-18, 0.998583]
+Saving ablation_recon_50.png | Range: [-8.71444e-08, 9.13978e-07]
+Epoch  100 | Loss (MSE): 0.0466608 | MAE: 0.0925381 | Lambda: 0 | Sparsity: 66.6667%
+Saving ablation_target_100.png | Range: [6.85058e-28, 0.999602]
+Saving ablation_recon_100.png | Range: [-1.60659e-08, 1.05393e-07]
+Epoch  150 | Loss (MSE): 0.037439 | MAE: 0.074163 | Lambda: 1.25e-05 | Sparsity: 66.6667%
+Saving ablation_target_150.png | Range: [1.0392e-12, 0.999468]
+Saving ablation_recon_150.png | Range: [-5.18921e-08, 4.31801e-07]
+Epoch  200 | Loss (MSE): 0.0431179 | MAE: 0.0841212 | Lambda: 2.5e-05 | Sparsity: 66.6667%
+Saving ablation_target_200.png | Range: [5.6299e-09, 0.999892]
+Saving ablation_recon_200.png | Range: [-2.39289e-08, 2.1921e-07]
+Epoch  250 | Loss (MSE): 0.0570446 | MAE: 0.112842 | Lambda: 3.75e-05 | Sparsity: 66.6667%
+Saving ablation_target_250.png | Range: [1.58967e-06, 0.99974]
+Saving ablation_recon_250.png | Range: [-1.35018e-07, 7.87304e-07]
