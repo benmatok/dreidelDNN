@@ -69,6 +69,126 @@ void save_tensor_as_png(const Tensor<T>& tensor, const std::string& filename, si
     stbi_write_png(filename.c_str(), (int)W, (int)H, comp, image_data.data(), (int)W * comp);
 }
 
+// Helper to compute Gradient Loss (MSE of Gradients)
+template <typename T>
+Tensor<T> compute_gradient_tensor(const Tensor<T>& img) {
+    auto shape = img.shape();
+    size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
+    Tensor<T> grads({N, H, W, 2 * C}); // Store dx, dy per channel
+    grads.fill(0);
+
+    const T* in = img.data();
+    T* out = grads.data();
+
+    // Compute central differences (ignoring boundaries for simplicity or using forward/backward)
+    // Sobel-like: dx = x[h,w+1] - x[h,w-1], dy = x[h+1,w] - x[h-1,w]
+    // Simple diff: dx = x[h,w+1] - x[h,w]
+    // User requested: |x[w+1] - x[w]| in python code.
+    // Let's implement standard finite difference x[i+1] - x[i].
+
+    #pragma omp parallel for collapse(3)
+    for(size_t n=0; n<N; ++n) {
+        for(size_t h=0; h<H; ++h) {
+            for(size_t w=0; w<W; ++w) {
+                for(size_t c=0; c<C; ++c) {
+                    T val = in[((n*H + h)*W + w)*C + c];
+
+                    // dx
+                    T next_x = (w + 1 < W) ? in[((n*H + h)*W + w + 1)*C + c] : val;
+                    T dx = next_x - val;
+
+                    // dy
+                    T next_y = (h + 1 < H) ? in[((n*H + h + 1)*W + w)*C + c] : val;
+                    T dy = next_y - val;
+
+                    // Store in 2*C layout: [dx_c0, dy_c0, dx_c1, dy_c1...]
+                    size_t out_idx = ((n*H + h)*W + w)*(2*C) + 2*c;
+                    out[out_idx] = dx;
+                    out[out_idx+1] = dy;
+                }
+            }
+        }
+    }
+    return grads;
+}
+
+// Compute Gradient Loss and accumulate gradients into grad_output
+// L_grad = Mean((Grad(Pred) - Grad(Target))^2)
+// dL_grad/dPred needs to be propagated back.
+// d/dx ( (x_{i+1} - x_i)^2 ) = 2(x_{i+1}-x_i) * (-1) [at i] + 2(x_i - x_{i-1}) * (1) [at i]
+// Essentially Laplacian-like operator on the difference.
+template <typename T>
+float accumulate_gradient_loss(Tensor<T>& grad_accum, const Tensor<T>& pred, const Tensor<T>& target, float weight) {
+    Tensor<T> g_pred = compute_gradient_tensor(pred);
+    Tensor<T> g_tgt = compute_gradient_tensor(target);
+
+    auto shape = pred.shape();
+    size_t N = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
+    size_t total = g_pred.size();
+
+    const T* gp = g_pred.data();
+    const T* gt = g_tgt.data();
+    T* ga = grad_accum.data(); // Accumulate into existing MSE grads
+
+    float loss = 0;
+
+    // We need temporary buffer for dL/dGrad
+    Tensor<T> d_grad_diff(g_pred.shape());
+    T* dgd = d_grad_diff.data();
+
+    #pragma omp parallel for reduction(+:loss)
+    for(size_t i=0; i<total; ++i) {
+        T diff = gp[i] - gt[i];
+        loss += diff * diff;
+        dgd[i] = 2.0f * diff / total; // Scale by mean
+    }
+
+    // Propagate dL/dGrad back to dL/dPred
+    // For each pixel (h,w), it contributed to dx at (h,w) and (h,w-1), and dy at (h,w) and (h-1,w)
+    // dx[w] = p[w+1] - p[w].  d(dx[w])/dp[w] = -1. d(dx[w-1])/dp[w] = 1.
+    // dy[h] = p[h+1] - p[h].  d(dy[h])/dp[h] = -1. d(dy[h-1])/dp[h] = 1.
+
+    #pragma omp parallel for collapse(3)
+    for(size_t n=0; n<N; ++n) {
+        for(size_t h=0; h<H; ++h) {
+            for(size_t w=0; w<W; ++w) {
+                for(size_t c=0; c<C; ++c) {
+                    // Index in dgd
+                    // 2*C stride
+
+                    T d_val = 0;
+
+                    // Contribution from dx[w] (where we are the subtractor)
+                    size_t idx_dx_curr = ((n*H + h)*W + w)*(2*C) + 2*c;
+                    d_val += dgd[idx_dx_curr] * (-1.0f);
+
+                    // Contribution from dx[w-1] (where we are the adder)
+                    if (w > 0) {
+                         size_t idx_dx_prev = ((n*H + h)*W + w - 1)*(2*C) + 2*c;
+                         d_val += dgd[idx_dx_prev] * (1.0f);
+                    }
+
+                    // Contribution from dy[h]
+                    size_t idx_dy_curr = ((n*H + h)*W + w)*(2*C) + 2*c + 1;
+                    d_val += dgd[idx_dy_curr] * (-1.0f);
+
+                    // Contribution from dy[h-1]
+                    if (h > 0) {
+                        size_t idx_dy_prev = ((n*H + h - 1)*W + w)*(2*C) + 2*c + 1;
+                        d_val += dgd[idx_dy_prev] * (1.0f);
+                    }
+
+                    // Accumulate with weight
+                    #pragma omp atomic
+                    ga[((n*H + h)*W + w)*C + c] += weight * d_val;
+                }
+            }
+        }
+    }
+
+    return loss * weight;
+}
+
 // Data Gen
 template <typename T>
 void generate_wavelet_batch(Tensor<T>& data, size_t seed_offset) {
@@ -177,6 +297,10 @@ int main() {
         }
         loss /= total_elements;
         mae /= total_elements;
+
+        // Add Gradient Loss (0.1 weight as requested)
+        float grad_loss_val = accumulate_gradient_loss(grad_output, output, target, 0.1f);
+        loss += grad_loss_val;
 
         // Backward
         optimizer.zero_grad();
