@@ -108,7 +108,7 @@ int main() {
     size_t batch_size = 8;
     size_t H = 128, W = 128;
     size_t epochs = 5000;
-    float lr = 0.005f; // Increased LR slightly to speed up convergence demo
+    float lr = 0.001f; // Lowered LR for stability and smoothness
     float max_lambda = 1e-4f;
 
     // Model
@@ -125,7 +125,12 @@ int main() {
     Tensor<float> input({batch_size, H, W, 1});
     Tensor<float> target({batch_size, H, W, 1});
 
+    // Fixed visualization batch
+    Tensor<float> vis_input({batch_size, H, W, 1});
+    generate_wavelet_batch(vis_input, 99999); // Fixed seed for visualization
+
     auto start_time = std::chrono::high_resolution_clock::now();
+    size_t dataset_size = 100; // Simulate 100 fixed batches
 
     for(size_t epoch=0; epoch<epochs; ++epoch) {
         // Lambda Schedule
@@ -136,7 +141,8 @@ int main() {
             current_lambda = max_lambda * progress;
         }
 
-        generate_wavelet_batch(input, epoch * batch_size);
+        // Cycle through a fixed "dataset" of seeds
+        generate_wavelet_batch(input, (epoch % dataset_size) * batch_size);
         target = input;
 
         // Forward
@@ -184,10 +190,11 @@ int main() {
                       << " | Lambda: " << current_lambda
                       << " | Sparsity: " << (sparsity * 100.0f) << "%" << std::endl;
 
-            // Save Ablation Images
+            // Save Ablation Images (Use Fixed Visualization Batch)
+            Tensor<float> vis_output = model.forward(vis_input);
             std::string suffix = std::to_string(epoch);
-            save_tensor_as_png(target, "ablation_target_" + suffix + ".png", 0);
-            save_tensor_as_png(output, "ablation_recon_" + suffix + ".png", 0);
+            save_tensor_as_png(vis_input, "ablation_target_" + suffix + ".png", 0);
+            save_tensor_as_png(vis_output, "ablation_recon_" + suffix + ".png", 0);
         }
     }
 
