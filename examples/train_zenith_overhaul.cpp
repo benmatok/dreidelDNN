@@ -102,9 +102,9 @@ int main() {
     std::cout << "=== Zenith-Overhaul Training (Geometric Ladder) ===" << std::endl;
 
     // Config
-    size_t batch_size = 4; // Smaller batch due to huge model (4096 channels)
+    size_t batch_size = 4;
     size_t H = 128, W = 128;
-    size_t epochs = 100; // Validation run
+    size_t epochs = 20; // Short demonstration run
     float lr = 0.001f;
 
     // Model
@@ -137,8 +137,9 @@ int main() {
         // Forward
         Tensor<float> output = model.forward(input);
 
-        // Loss (MSE)
+        // Loss (MSE) & MAE
         float loss = 0;
+        float mae = 0;
         size_t total_elements = output.size();
         const float* out_ptr = output.data();
         const float* tgt_ptr = target.data();
@@ -146,13 +147,15 @@ int main() {
         Tensor<float> grad_output(output.shape());
         float* go_ptr = grad_output.data();
 
-        #pragma omp parallel for reduction(+:loss)
+        #pragma omp parallel for reduction(+:loss, mae)
         for(size_t i=0; i<total_elements; ++i) {
             float diff = out_ptr[i] - tgt_ptr[i];
             loss += diff * diff;
+            mae += std::abs(diff);
             go_ptr[i] = 2.0f * diff / total_elements;
         }
         loss /= total_elements;
+        mae /= total_elements;
 
         // Backward
         optimizer.zero_grad();
@@ -162,15 +165,24 @@ int main() {
         optimizer.step();
 
         // Monitoring
-        if (epoch % 10 == 0 || epoch == epochs - 1) {
-            std::cout << "Epoch " << std::setw(4) << epoch
-                      << " | Loss (MSE): " << loss << std::endl;
+        if (epoch % 1 == 0) { // Log every epoch for short run
+            // Inference Speed Benchmark
+            auto infer_start = std::chrono::high_resolution_clock::now();
+            Tensor<float> dummy_out = model.forward(input);
+            auto infer_end = std::chrono::high_resolution_clock::now();
+            double infer_ms = std::chrono::duration<double, std::milli>(infer_end - infer_start).count();
 
-            // Save Ablation Images (Use Fixed Visualization Batch)
-            Tensor<float> vis_output = model.forward(vis_input);
-            std::string suffix = std::to_string(epoch);
-            save_tensor_as_png(vis_input, "overhaul_target_" + suffix + ".png", 0);
-            save_tensor_as_png(vis_output, "overhaul_recon_" + suffix + ".png", 0);
+            std::cout << "Epoch " << std::setw(4) << epoch
+                      << " | Loss (MAE): " << mae
+                      << " | Inference Speed: " << infer_ms << " ms" << std::endl;
+
+            if (epoch % 10 == 0 || epoch == epochs - 1) {
+                // Save Ablation Images (Use Fixed Visualization Batch)
+                Tensor<float> vis_output = model.forward(vis_input);
+                std::string suffix = std::to_string(epoch);
+                save_tensor_as_png(vis_input, "overhaul_target_" + suffix + ".png", 0);
+                save_tensor_as_png(vis_output, "overhaul_recon_" + suffix + ".png", 0);
+            }
         }
     }
 
