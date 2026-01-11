@@ -52,6 +52,16 @@ public:
         return x;
     }
 
+    // Expose encoder for latent space analysis
+    Tensor<T> forward_encoder(const Tensor<T>& input) {
+        Tensor<T> x = input;
+        // Run first 3 layers (Indices 0, 1, 2)
+        for(size_t i=0; i<3 && i<layers_.size(); ++i) {
+            x = layers_[i]->forward(x);
+        }
+        return x;
+    }
+
     Tensor<T> backward(const Tensor<T>& grad_output) override {
         Tensor<T> g = grad_output;
         for(auto it = layers_.rbegin(); it != layers_.rend(); ++it) {
