@@ -27,7 +27,7 @@ void save_tensor_as_png(const Tensor<T>& tensor, const std::string& filename, si
     size_t W = shape[2];
     size_t C = shape[3];
 
-    std::vector<unsigned char> image_data(H * W * (C == 1 ? 1 : 3)); // Support grayscale or RGB (naive)
+    std::vector<unsigned char> image_data(H * W * (C == 1 ? 1 : 3));
 
     const T* data = tensor.data() + batch_idx * (H * W * C);
 
@@ -39,21 +39,27 @@ void save_tensor_as_png(const Tensor<T>& tensor, const std::string& filename, si
         if (data[i] > max_val) max_val = data[i];
     }
 
-    // Fallback if range is zero
-    if (std::abs(max_val - min_val) < 1e-6) {
+    std::cout << "Saving " << filename << " | Range: [" << min_val << ", " << max_val << "]" << std::endl;
+
+    // Fallback if range is zero or very small
+    T range = max_val - min_val;
+    if (range < 1e-12f) { // Lowered threshold significantly
         max_val = min_val + 1.0f;
+        range = 1.0f;
     }
 
     for (size_t i = 0; i < H * W; ++i) {
         if (C == 1) {
-            float val = (float)(data[i] - min_val) / (max_val - min_val);
+            float val = (float)(data[i] - min_val) / range;
+            // Clamp
+            if (val < 0) val = 0;
+            if (val > 1) val = 1;
             image_data[i] = (unsigned char)(val * 255.0f);
         } else {
-             // Just take first 3 channels if > 3, or replicate if < 3?
-             // ZenithLassoAE output is C=1 usually.
-             // If C=3, take R,G,B.
              for(size_t c=0; c<3 && c<C; ++c) {
-                 float val = (float)(data[i*C + c] - min_val) / (max_val - min_val);
+                 float val = (float)(data[i*C + c] - min_val) / range;
+                 if (val < 0) val = 0;
+                 if (val > 1) val = 1;
                  image_data[i*3 + c] = (unsigned char)(val * 255.0f);
              }
         }
@@ -63,32 +69,24 @@ void save_tensor_as_png(const Tensor<T>& tensor, const std::string& filename, si
     stbi_write_png(filename.c_str(), (int)W, (int)H, comp, image_data.data(), (int)W * comp);
 }
 
-// Data Gen (Copied from train_zenith_lasso.cpp but updated for consistency)
+// Data Gen
 template <typename T>
 void generate_wavelet_batch(Tensor<T>& data, size_t seed_offset) {
     auto shape = data.shape();
     size_t batch = shape[0]; size_t H = shape[1]; size_t W = shape[2]; size_t C = shape[3];
-    static std::mt19937 gen(12345 + seed_offset);
-    // We want some variety across calls if needed, but 'train_zenith_lasso' used 'n' index for determinism.
-    // To make it vary per epoch if we wanted true training, we should mix in seed_offset.
-    // However, the original code used 'n' inside the loop based on loop index.
-    // Let's stick to the requested "2d wavelets" which seem to be this procedural generation.
-    // To simulate a "long train" on a dataset, we might want the dataset to be static or infinite procedural.
-    // Let's assume infinite procedural but consistent within a batch.
+    // Use consistent seed + offset
+    std::mt19937 gen(12345 + seed_offset);
 
     T* ptr = data.data();
 
     #pragma omp parallel for
     for(size_t n=0; n<batch; ++n) {
-        // Mix seed_offset into generation to create different images over time (infinite dataset)
-        // Or keep it static to overfit/memorize.
-        // "Long train" usually implies learning a distribution.
-        // Let's add seed_offset to 'n' for variety.
         size_t eff_n = n + seed_offset;
 
-        T mu_x = 0.5 * W + 0.2 * W * std::sin(eff_n * 0.1);
-        T mu_y = 0.5 * H + 0.2 * H * std::cos(eff_n * 0.1);
-        T s_x = (W/10.0) * (1.0 + 0.5 * std::sin(eff_n * 0.05));
+        // Ensure visible features
+        T mu_x = 0.5 * W + 0.25 * W * std::sin(eff_n * 0.3);
+        T mu_y = 0.5 * H + 0.25 * H * std::cos(eff_n * 0.2);
+        T s_x = (W/8.0) * (1.0 + 0.3 * std::sin(eff_n * 0.5));
 
         for(size_t c=0; c<C; ++c) {
             for(size_t h=0; h<H; ++h) {
@@ -109,8 +107,8 @@ int main() {
     // Config
     size_t batch_size = 8;
     size_t H = 128, W = 128;
-    size_t epochs = 1000; // Long train
-    float lr = 0.001f;
+    size_t epochs = 1000;
+    float lr = 0.005f; // Increased LR slightly to speed up convergence demo
     float max_lambda = 1e-4f;
 
     // Model
@@ -138,9 +136,8 @@ int main() {
             current_lambda = max_lambda * progress;
         }
 
-        // Generate data (Varying seed to simulate dataset)
         generate_wavelet_batch(input, epoch * batch_size);
-        target = input; // Autoencoder target is input
+        target = input;
 
         // Forward
         Tensor<float> output = model.forward(input);
