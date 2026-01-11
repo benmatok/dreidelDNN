@@ -132,6 +132,9 @@ int main() {
     auto start_time = std::chrono::high_resolution_clock::now();
     size_t dataset_size = 100; // Simulate 100 fixed batches
 
+    float current_eps = 1.0f; // Start high for stability
+    float best_mse = 1e9;
+
     for(size_t epoch=0; epoch<epochs; ++epoch) {
         // Lambda Schedule
         float current_lambda = 0.0f;
@@ -139,6 +142,13 @@ int main() {
             float progress = (float)(epoch - 100) / 400.0f;
             if (progress > 1.0f) progress = 1.0f;
             current_lambda = max_lambda * progress;
+        }
+
+        // Epsilon Annealing
+        // If loss is stagnant or improving, we try to lower eps to allow more signal
+        if (epoch > 50 && epoch % 10 == 0) {
+             current_eps = std::max(1e-5f, current_eps * 0.95f);
+             model.set_epsilon(current_eps);
         }
 
         // Cycle through a fixed "dataset" of seeds
@@ -188,6 +198,7 @@ int main() {
                       << " | Loss (MSE): " << loss
                       << " | MAE: " << mae
                       << " | Lambda: " << current_lambda
+                      << " | Eps: " << current_eps
                       << " | Sparsity: " << (sparsity * 100.0f) << "%" << std::endl;
 
             // Save Ablation Images (Use Fixed Visualization Batch)

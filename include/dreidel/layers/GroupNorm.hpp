@@ -225,6 +225,10 @@ public:
 
     std::string name() const override { return "GroupNorm"; }
 
+    void set_epsilon(T eps) {
+        eps_ = eps;
+    }
+
 private:
     size_t num_groups_;
     size_t num_channels_;
