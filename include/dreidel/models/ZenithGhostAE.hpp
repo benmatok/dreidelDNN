@@ -4,6 +4,7 @@
 #include "../layers/Layer.hpp"
 #include "../layers/Conv2D.hpp"
 #include "../layers/GELU.hpp"
+#include "../layers/ZenithBlock.hpp"
 #include <vector>
 #include <memory>
 #include <tuple>
@@ -16,53 +17,53 @@ class GhostProjection : public layers::Layer<T> {
 public:
     GhostProjection(size_t in_channels, size_t out_channels) {
         // Conv 1x1 -> GELU -> Conv 1x1
-        // Often used to map Decoder feature space (in) to Encoder feature space (out)
-        // In this architecture, they are usually same dimension.
-        conv1_ = std::make_unique<layers::Conv2D<T>>(in_channels, out_channels, 1);
+        // We use ZenithBlock(kernel=1) instead of Conv2D for "Alien Speed" optimization.
+        // args: in, out, k, spec_dim, ifwht, dilated, gating, stride, upscale, init, slm, seq, eps
+        block1_ = std::make_unique<layers::ZenithBlock<T>>(in_channels, out_channels, 1, in_channels, true, false, false, 1, 1, "he", false, false, 1.0f);
         act_ = std::make_unique<layers::GELU<T>>();
-        conv2_ = std::make_unique<layers::Conv2D<T>>(out_channels, out_channels, 1);
+        block2_ = std::make_unique<layers::ZenithBlock<T>>(out_channels, out_channels, 1, out_channels, true, false, false, 1, 1, "he", false, false, 1.0f);
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
-        Tensor<T> x = conv1_->forward(input);
+        Tensor<T> x = block1_->forward(input);
         x = act_->forward(x);
-        x = conv2_->forward(x);
+        x = block2_->forward(x);
         return x;
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override {
-        Tensor<T> g = conv2_->backward(grad_output);
+        Tensor<T> g = block2_->backward(grad_output);
         g = act_->backward(g);
-        g = conv1_->backward(g);
+        g = block1_->backward(g);
         return g;
     }
 
     std::vector<Tensor<T>*> parameters() override {
         std::vector<Tensor<T>*> params;
-        auto p1 = conv1_->parameters(); params.insert(params.end(), p1.begin(), p1.end());
-        auto p2 = conv2_->parameters(); params.insert(params.end(), p2.begin(), p2.end());
+        auto p1 = block1_->parameters(); params.insert(params.end(), p1.begin(), p1.end());
+        auto p2 = block2_->parameters(); params.insert(params.end(), p2.begin(), p2.end());
         return params;
     }
 
     std::vector<Tensor<T>*> gradients() override {
         std::vector<Tensor<T>*> grads;
-        auto g1 = conv1_->gradients(); grads.insert(grads.end(), g1.begin(), g1.end());
-        auto g2 = conv2_->gradients(); grads.insert(grads.end(), g2.begin(), g2.end());
+        auto g1 = block1_->gradients(); grads.insert(grads.end(), g1.begin(), g1.end());
+        auto g2 = block2_->gradients(); grads.insert(grads.end(), g2.begin(), g2.end());
         return grads;
     }
 
     void set_training(bool training) override {
-        conv1_->set_training(training);
+        block1_->set_training(training);
         act_->set_training(training);
-        conv2_->set_training(training);
+        block2_->set_training(training);
     }
 
     std::string name() const override { return "GhostProjection"; }
 
 private:
-    std::unique_ptr<layers::Conv2D<T>> conv1_;
+    std::unique_ptr<layers::ZenithBlock<T>> block1_;
     std::unique_ptr<layers::GELU<T>> act_;
-    std::unique_ptr<layers::Conv2D<T>> conv2_;
+    std::unique_ptr<layers::ZenithBlock<T>> block2_;
 };
 
 template <typename T>
