@@ -142,11 +142,11 @@ void save_png_grid(const std::string& filename, const std::vector<std::vector<fl
 }
 
 template <typename T>
-void train(size_t epochs, size_t batches_per_epoch, size_t batch_size, size_t dim) {
+void train(size_t epochs, size_t batches_per_epoch, size_t batch_size, size_t dim, const std::string& init_scheme) {
     size_t size = static_cast<size_t>(std::sqrt(dim)); // 128
 
-    std::cout << "Initializing ZenithGhostAE. Dim=" << dim << " (" << size << "x" << size << ")" << std::endl;
-    models::ZenithGhostAE<T> model;
+    std::cout << "Initializing ZenithGhostAE. Dim=" << dim << " (" << size << "x" << size << ")" << " Init=" << init_scheme << std::endl;
+    models::ZenithGhostAE<T> model(init_scheme);
 
     // Optimizer
     // ZenithBlock works best with low LR?
@@ -325,10 +325,12 @@ int main(int argc, char** argv) {
     size_t batch_size = 4;
     // Needs 128x128 -> dim = 16384
     size_t dim = 16384;
+    std::string init_scheme = "he";
 
     if(argc > 1) epochs = std::atoi(argv[1]);
     if(argc > 2) batches_per_epoch = std::atoi(argv[2]);
+    if(argc > 3) init_scheme = argv[3];
 
-    train<float>(epochs, batches_per_epoch, batch_size, dim);
+    train<float>(epochs, batches_per_epoch, batch_size, dim, init_scheme);
     return 0;
 }

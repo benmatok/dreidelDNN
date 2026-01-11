@@ -15,13 +15,13 @@ namespace models {
 template <typename T>
 class GhostProjection : public layers::Layer<T> {
 public:
-    GhostProjection(size_t in_channels, size_t out_channels) {
+    GhostProjection(size_t in_channels, size_t out_channels, const std::string& init_scheme = "he") {
         // Conv 1x1 -> GELU -> Conv 1x1
         // We use ZenithBlock(kernel=1) instead of Conv2D for "Alien Speed" optimization.
         // args: in, out, k, spec_dim, ifwht, dilated, gating, stride, upscale, init, slm, seq, eps
-        block1_ = std::make_unique<layers::ZenithBlock<T>>(in_channels, out_channels, 1, in_channels, true, false, false, 1, 1, "he", false, false, 1.0f);
+        block1_ = std::make_unique<layers::ZenithBlock<T>>(in_channels, out_channels, 1, in_channels, true, false, false, 1, 1, init_scheme, false, false, 1.0f);
         act_ = std::make_unique<layers::GELU<T>>();
-        block2_ = std::make_unique<layers::ZenithBlock<T>>(out_channels, out_channels, 1, out_channels, true, false, false, 1, 1, "he", false, false, 1.0f);
+        block2_ = std::make_unique<layers::ZenithBlock<T>>(out_channels, out_channels, 1, out_channels, true, false, false, 1, 1, init_scheme, false, false, 1.0f);
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
@@ -75,41 +75,41 @@ public:
         std::vector<Tensor<T>> encoder_targets; // Real encoder features
     };
 
-    ZenithGhostAE() {
+    ZenithGhostAE(const std::string& init_scheme = "he") {
         // 1. Stem: 3 -> 32
         stem_ = std::make_unique<layers::Conv2D<T>>(3, 32, 3, 1, 1);
 
         // 2. Encoders (7 blocks)
         // Enc1: 32 -> 64
-        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(32));
+        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(32, init_scheme));
         // Enc2: 64 -> 128
-        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(64));
+        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(64, init_scheme));
         // Enc3: 128 -> 256
-        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(128));
+        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(128, init_scheme));
         // Enc4: 256 -> 512
-        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(256));
+        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(256, init_scheme));
         // Enc5: 512 -> 1024
-        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(512));
+        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(512, init_scheme));
         // Enc6: 1024 -> 2048
-        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(1024));
+        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(1024, init_scheme));
         // Enc7: 2048 -> 4096 (Bottleneck)
-        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(2048));
+        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(2048, init_scheme));
 
         // 3. Decoders (7 blocks)
         // Dec7: 4096 -> 2048
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(4096));
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(4096, init_scheme));
         // Dec6: 2048 -> 1024
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(2048));
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(2048, init_scheme));
         // Dec5: 1024 -> 512
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(1024));
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(1024, init_scheme));
         // Dec4: 512 -> 256
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(512));
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(512, init_scheme));
         // Dec3: 256 -> 128
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(256));
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(256, init_scheme));
         // Dec2: 128 -> 64
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(128));
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(128, init_scheme));
         // Dec1: 64 -> 32
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(64));
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(64, init_scheme));
 
         // 4. Head: 32 -> 3
         head_ = std::make_unique<layers::Conv2D<T>>(32, 3, 3, 1, 1);
@@ -117,19 +117,19 @@ public:
         // 5. Ghost Projections
         // Map Decoder Outputs -> Encoder Outputs
         // Dec0 (Dec7) Out (2048) matches Enc5 (Enc6) Out (2048) -> Ghost 0
-        ghosts_.push_back(std::make_unique<GhostProjection<T>>(2048, 2048));
+        ghosts_.push_back(std::make_unique<GhostProjection<T>>(2048, 2048, init_scheme));
         // Dec1 (Dec6) Out (1024) matches Enc4 (Enc5) Out (1024) -> Ghost 1
-        ghosts_.push_back(std::make_unique<GhostProjection<T>>(1024, 1024));
+        ghosts_.push_back(std::make_unique<GhostProjection<T>>(1024, 1024, init_scheme));
         // Dec2 (Dec5) Out (512) matches Enc3 (Enc4) Out (512) -> Ghost 2
-        ghosts_.push_back(std::make_unique<GhostProjection<T>>(512, 512));
+        ghosts_.push_back(std::make_unique<GhostProjection<T>>(512, 512, init_scheme));
         // Dec3 (Dec4) Out (256) matches Enc2 (Enc3) Out (256) -> Ghost 3
-        ghosts_.push_back(std::make_unique<GhostProjection<T>>(256, 256));
+        ghosts_.push_back(std::make_unique<GhostProjection<T>>(256, 256, init_scheme));
         // Dec4 (Dec3) Out (128) matches Enc1 (Enc2) Out (128) -> Ghost 4
-        ghosts_.push_back(std::make_unique<GhostProjection<T>>(128, 128));
+        ghosts_.push_back(std::make_unique<GhostProjection<T>>(128, 128, init_scheme));
         // Dec5 (Dec2) Out (64) matches Enc0 (Enc1) Out (64) -> Ghost 5
-        ghosts_.push_back(std::make_unique<GhostProjection<T>>(64, 64));
+        ghosts_.push_back(std::make_unique<GhostProjection<T>>(64, 64, init_scheme));
         // Dec6 (Dec1) Out (32) matches Stem Out (32) -> Ghost 6
-        ghosts_.push_back(std::make_unique<GhostProjection<T>>(32, 32));
+        ghosts_.push_back(std::make_unique<GhostProjection<T>>(32, 32, init_scheme));
     }
 
     // Standard Inference Forward

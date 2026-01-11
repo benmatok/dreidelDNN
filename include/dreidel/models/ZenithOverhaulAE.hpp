@@ -15,7 +15,7 @@ namespace models {
 template <typename T>
 class ZenithCompressBlock : public layers::Layer<T> {
 public:
-    ZenithCompressBlock(size_t in_channels) {
+    ZenithCompressBlock(size_t in_channels, const std::string& init_scheme = "he") {
         size_t expanded_dim = in_channels * 4;
         size_t out_channels = in_channels * 2;
 
@@ -33,7 +33,7 @@ public:
         // Reuse ZenithBlock but focusing on mixing.
         // We use ZenithBlock(expanded_dim, 1, expanded_dim) -> 1x1 kernel size, so it's just mixing
         // args: in, out, k, spec_dim, ifwht, dilated, gating, stride, upscale, init, slm, seq, eps
-        spectral_mixer_ = std::make_unique<layers::ZenithBlock<T>>(expanded_dim, expanded_dim, 1, expanded_dim, true, false, false, 1, 1, "he", false, false, 1.0f);
+        spectral_mixer_ = std::make_unique<layers::ZenithBlock<T>>(expanded_dim, expanded_dim, 1, expanded_dim, true, false, false, 1, 1, init_scheme, false, false, 1.0f);
 
         // 4. Distillation (Compression)
         // 1x1 Conv to reduce 4C -> 2C
@@ -140,7 +140,7 @@ private:
 template <typename T>
 class ZenithExpandBlock : public layers::Layer<T> {
 public:
-    ZenithExpandBlock(size_t in_channels) {
+    ZenithExpandBlock(size_t in_channels, const std::string& init_scheme = "he") {
         // Reverse of Compress
         // Input: 2C -> Expand to 4C -> Spectral -> PixelMix -> Shuffle to C
         size_t expanded_dim = in_channels * 2; // Input is "2C" relative to original block, output should be "C"
@@ -158,7 +158,7 @@ public:
         expanded_dim = in_channels * 2;
 
         // 2. Global Context
-        spectral_mixer_ = std::make_unique<layers::ZenithBlock<T>>(expanded_dim, expanded_dim, 1, expanded_dim, true, false, false, 1, 1, "he", false, false, 1.0f);
+        spectral_mixer_ = std::make_unique<layers::ZenithBlock<T>>(expanded_dim, expanded_dim, 1, expanded_dim, true, false, false, 1, 1, init_scheme, false, false, 1.0f);
 
         // 3. Local Fidelity
         // groups = out_channels (which is expanded_dim / 4).
@@ -268,41 +268,41 @@ private:
 template <typename T>
 class ZenithOverhaulAE : public layers::Layer<T> {
 public:
-    ZenithOverhaulAE() {
+    ZenithOverhaulAE(const std::string& init_scheme = "he") {
         // Encoder
         // Stem: 3 -> 32
         layers_.push_back(std::make_unique<layers::Conv2D<T>>(3, 32, 3, 1, 1));
 
         // Enc1: 32 -> 64
-        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(32));
+        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(32, init_scheme));
         // Enc2: 64 -> 128
-        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(64));
+        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(64, init_scheme));
         // Enc3: 128 -> 256
-        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(128));
+        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(128, init_scheme));
         // Enc4: 256 -> 512
-        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(256));
+        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(256, init_scheme));
         // Enc5: 512 -> 1024
-        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(512));
+        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(512, init_scheme));
         // Enc6: 1024 -> 2048
-        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(1024));
+        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(1024, init_scheme));
         // Enc7: 2048 -> 4096 (1x1)
-        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(2048));
+        layers_.push_back(std::make_unique<ZenithCompressBlock<T>>(2048, init_scheme));
 
         // Decoder (Inverted)
         // Dec7: 4096 -> 2048
-        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(4096));
+        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(4096, init_scheme));
         // Dec6: 2048 -> 1024
-        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(2048));
+        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(2048, init_scheme));
         // Dec5: 1024 -> 512
-        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(1024));
+        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(1024, init_scheme));
         // Dec4: 512 -> 256
-        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(512));
+        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(512, init_scheme));
         // Dec3: 256 -> 128
-        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(256));
+        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(256, init_scheme));
         // Dec2: 128 -> 64
-        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(128));
+        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(128, init_scheme));
         // Dec1: 64 -> 32
-        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(64));
+        layers_.push_back(std::make_unique<ZenithExpandBlock<T>>(64, init_scheme));
 
         // Head: 32 -> 3
         layers_.push_back(std::make_unique<layers::Conv2D<T>>(32, 3, 3, 1, 1));
