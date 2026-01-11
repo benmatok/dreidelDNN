@@ -122,6 +122,10 @@ public:
         return grads;
     }
 
+    void set_training(bool training) override {
+        spectral_mixer_->set_training(training);
+    }
+
     std::string name() const override { return "ZenithCompressBlock"; }
 
 private:
@@ -246,6 +250,10 @@ public:
         return grads;
     }
 
+    void set_training(bool training) override {
+        spectral_mixer_->set_training(training);
+    }
+
     std::string name() const override { return "ZenithExpandBlock"; }
 
 private:
@@ -332,6 +340,12 @@ public:
             grads.insert(grads.end(), g.begin(), g.end());
         }
         return grads;
+    }
+
+    void set_training(bool training) override {
+        for(auto& layer : layers_) {
+            layer->set_training(training);
+        }
     }
 
     std::string name() const override { return "ZenithOverhaulAE"; }
