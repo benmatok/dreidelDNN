@@ -144,6 +144,7 @@ int main() {
 
         // Loss (MSE)
         float loss = 0;
+        float mae = 0; // MAE accumulator
         size_t total_elements = output.size();
         const float* out_ptr = output.data();
         const float* tgt_ptr = target.data();
@@ -151,13 +152,15 @@ int main() {
         Tensor<float> grad_output(output.shape());
         float* go_ptr = grad_output.data();
 
-        #pragma omp parallel for reduction(+:loss)
+        #pragma omp parallel for reduction(+:loss, mae)
         for(size_t i=0; i<total_elements; ++i) {
             float diff = out_ptr[i] - tgt_ptr[i];
             loss += diff * diff;
+            mae += std::abs(diff); // Compute MAE
             go_ptr[i] = 2.0f * diff / total_elements;
         }
         loss /= total_elements;
+        mae /= total_elements;
 
         // Backward
         optimizer.zero_grad();
@@ -176,7 +179,8 @@ int main() {
             float sparsity = (float)zero_blocks / (total_blocks + 1e-9f);
 
             std::cout << "Epoch " << std::setw(4) << epoch
-                      << " | Loss: " << loss
+                      << " | Loss (MSE): " << loss
+                      << " | MAE: " << mae
                       << " | Lambda: " << current_lambda
                       << " | Sparsity: " << (sparsity * 100.0f) << "%" << std::endl;
 
