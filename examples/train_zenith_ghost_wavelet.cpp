@@ -142,98 +142,143 @@ void save_png_grid(const std::string& filename, const std::vector<std::vector<fl
 }
 
 template <typename T>
-void train(size_t epochs, size_t batch_size, size_t dim) {
+void train(size_t epochs, size_t batches_per_epoch, size_t batch_size, size_t dim) {
     size_t size = static_cast<size_t>(std::sqrt(dim)); // 128
 
     std::cout << "Initializing ZenithGhostAE. Dim=" << dim << " (" << size << "x" << size << ")" << std::endl;
     models::ZenithGhostAE<T> model;
 
+    // Optimizer
+    // ZenithBlock works best with low LR?
+    // Memory says "3.25x training speedup... requires lower learning rates".
+    // "SimpleAdam optimizer supports Coordinate-Wise Clipping".
     optim::SimpleAdam<T> optimizer(0.001f);
     optimizer.add_parameters(model.parameters(), model.gradients());
 
-    std::cout << "Starting Training..." << std::endl;
+    std::cout << "Starting Training (" << epochs << " epochs, " << batches_per_epoch << " batches/epoch)..." << std::endl;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
     for (size_t epoch = 0; epoch < epochs; ++epoch) {
-        // Generate Wavelets (B, H*W)
-        Tensor<T> flat_wavelets({batch_size, dim});
-        WaveletGenerator2D<T>::generate(flat_wavelets, batch_size);
+        T epoch_recon_mae = 0;
+        T epoch_ghost_mae = 0;
 
-        // Convert to (B, H, W, 3)
-        Tensor<T> input({batch_size, size, size, 3});
-        T* in_ptr = input.data();
-        const T* flat_ptr = flat_wavelets.data();
+        for (size_t b = 0; b < batches_per_epoch; ++b) {
+            // Generate Wavelets (B, H*W)
+            Tensor<T> flat_wavelets({batch_size, dim});
+            WaveletGenerator2D<T>::generate(flat_wavelets, batch_size);
 
-        #pragma omp parallel for collapse(2)
-        for(size_t b=0; b<batch_size; ++b) {
-            for(size_t i=0; i<dim; ++i) {
-                T val = flat_ptr[b*dim + i];
-                // Replicate to 3 channels
-                in_ptr[((b*size + i/size)*size + i%size)*3 + 0] = val;
-                in_ptr[((b*size + i/size)*size + i%size)*3 + 1] = val;
-                in_ptr[((b*size + i/size)*size + i%size)*3 + 2] = val;
+            // Convert to (B, H, W, 3)
+            Tensor<T> input({batch_size, size, size, 3});
+            T* in_ptr = input.data();
+            const T* flat_ptr = flat_wavelets.data();
+
+            #pragma omp parallel for collapse(2)
+            for(size_t i=0; i<batch_size; ++i) {
+                for(size_t j=0; j<dim; ++j) {
+                    T val = flat_ptr[i*dim + j];
+                    // Replicate to 3 channels
+                    in_ptr[((i*size + j/size)*size + j%size)*3 + 0] = val;
+                    in_ptr[((i*size + j/size)*size + j%size)*3 + 1] = val;
+                    in_ptr[((i*size + j/size)*size + j%size)*3 + 2] = val;
+                }
             }
-        }
 
-        optimizer.zero_grad();
-        model.set_training(true);
+            optimizer.zero_grad();
+            model.set_training(true);
 
-        auto out = model.forward_train(input);
+            auto out = model.forward_train(input);
 
-        // 1. Reconstruction Loss (MAE)
-        Tensor<T> diff = out.reconstruction - input;
+            // 1. Reconstruction Loss (MAE)
+            Tensor<T> diff = out.reconstruction - input;
 
-        T mae_recon = 0;
-        T* diff_ptr = diff.data();
-        for(size_t k=0; k<diff.size(); ++k) mae_recon += std::abs(diff_ptr[k]);
-        mae_recon /= diff.size();
+            T mae_recon = 0;
+            T* diff_ptr = diff.data();
+            for(size_t k=0; k<diff.size(); ++k) mae_recon += std::abs(diff_ptr[k]);
+            mae_recon /= diff.size();
 
-        // Grad Recon (Sign of diff)
-        Tensor<T> grad_recon = diff;
-        T* gr_ptr = grad_recon.data();
-        for(size_t k=0; k<grad_recon.size(); ++k) {
-             T v = gr_ptr[k];
-             gr_ptr[k] = (v > 0) ? 1.0f : ((v < 0) ? -1.0f : 0.0f);
-             gr_ptr[k] /= diff.size();
-             gr_ptr[k] *= 1000.0f;
-        }
-
-        // 2. Ghost Loss
-        T mae_ghost = 0;
-        std::vector<Tensor<T>> grad_ghosts;
-
-        for(size_t i=0; i<out.ghost_preds.size(); ++i) {
-            Tensor<T> g_diff = out.ghost_preds[i] - out.encoder_targets[i];
-            T g_mae = 0;
-            const T* gd_ptr = g_diff.data();
-            for(size_t k=0; k<g_diff.size(); ++k) g_mae += std::abs(gd_ptr[k]);
-            g_mae /= g_diff.size();
-            mae_ghost += g_mae;
-
-            Tensor<T> g_grad = g_diff;
-            T* gg_ptr = g_grad.data();
-            for(size_t k=0; k<g_grad.size(); ++k) {
-                T v = gg_ptr[k];
-                gg_ptr[k] = (v > 0) ? 1.0f : ((v < 0) ? -1.0f : 0.0f);
-                gg_ptr[k] /= g_diff.size();
-                gg_ptr[k] *= 100.0f; // Weight for ghost loss
+            // Grad Recon (Sign of diff)
+            Tensor<T> grad_recon = diff;
+            T* gr_ptr = grad_recon.data();
+            for(size_t k=0; k<grad_recon.size(); ++k) {
+                T v = gr_ptr[k];
+                gr_ptr[k] = (v > 0) ? 1.0f : ((v < 0) ? -1.0f : 0.0f);
+                gr_ptr[k] /= diff.size();
+                gr_ptr[k] *= 1000.0f;
             }
-            grad_ghosts.push_back(g_grad);
+
+            // 2. Ghost Loss
+            T mae_ghost = 0;
+            std::vector<Tensor<T>> grad_ghosts;
+
+            for(size_t i=0; i<out.ghost_preds.size(); ++i) {
+                Tensor<T> g_diff = out.ghost_preds[i] - out.encoder_targets[i];
+                T g_mae = 0;
+                const T* gd_ptr = g_diff.data();
+                for(size_t k=0; k<g_diff.size(); ++k) g_mae += std::abs(gd_ptr[k]);
+                g_mae /= g_diff.size();
+                mae_ghost += g_mae;
+
+                Tensor<T> g_grad = g_diff;
+                T* gg_ptr = g_grad.data();
+                for(size_t k=0; k<g_grad.size(); ++k) {
+                    T v = gg_ptr[k];
+                    gg_ptr[k] = (v > 0) ? 1.0f : ((v < 0) ? -1.0f : 0.0f);
+                    gg_ptr[k] /= g_diff.size();
+                    gg_ptr[k] *= 100.0f; // Weight for ghost loss
+                }
+                grad_ghosts.push_back(g_grad);
+            }
+
+            model.backward_train(grad_recon, grad_ghosts);
+            optimizer.step();
+
+            epoch_recon_mae += mae_recon;
+            epoch_ghost_mae += mae_ghost;
         }
 
-        model.backward_train(grad_recon, grad_ghosts);
-        optimizer.step();
-
-        if (epoch % 10 == 0) {
-            std::cout << "Epoch " << epoch << ": ReconMAE=" << mae_recon << " GhostMAE=" << mae_ghost << std::endl;
+        if (epoch % 1 == 0) { // Log every epoch
+            std::cout << "Epoch " << epoch
+                      << ": ReconMAE=" << epoch_recon_mae / batches_per_epoch
+                      << " GhostMAE=" << epoch_ghost_mae / batches_per_epoch
+                      << std::endl;
         }
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end_time - start_time;
-    std::cout << "Training Time: " << elapsed.count() << "s for " << epochs << " epochs." << std::endl;
-    std::cout << "Speed: " << (epochs * batch_size) / elapsed.count() << " samples/sec" << std::endl;
+    std::cout << "Training Time: " << elapsed.count() << "s for " << epochs * batches_per_epoch << " batches." << std::endl;
+    std::cout << "Speed: " << (epochs * batches_per_epoch * batch_size) / elapsed.count() << " samples/sec" << std::endl;
+
+    // Benchmarking Inference Speed
+    std::cout << "\nBenchmarking Inference Speed..." << std::endl;
+    model.set_training(false);
+    size_t bench_batches = 10;
+
+    Tensor<T> bench_input({batch_size, size, size, 3});
+    bench_input.fill(0.5f); // Dummy data
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    for(size_t b=0; b<bench_batches; ++b) {
+        // Reuse input
+        Tensor<T> out = model.forward(bench_input); // Inference Forward
+    }
+    auto t2 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> dt = t2 - t1;
+    double fps_infer = (bench_batches * batch_size) / dt.count();
+    std::cout << "Inference Speed: " << fps_infer << " samples/sec" << std::endl;
+
+    // Benchmarking Training Forward Speed (Ghosts included)
+    std::cout << "Benchmarking Training Forward Speed (with Ghosts)..." << std::endl;
+    model.set_training(true);
+    t1 = std::chrono::high_resolution_clock::now();
+    for(size_t b=0; b<bench_batches; ++b) {
+        auto out = model.forward_train(bench_input);
+    }
+    t2 = std::chrono::high_resolution_clock::now();
+    dt = t2 - t1;
+    double fps_train_fwd = (bench_batches * batch_size) / dt.count();
+    std::cout << "Training Forward Speed: " << fps_train_fwd << " samples/sec" << std::endl;
 
     // Visualization
     std::cout << "Generating Visualization..." << std::endl;
@@ -275,13 +320,15 @@ void train(size_t epochs, size_t batch_size, size_t dim) {
 }
 
 int main(int argc, char** argv) {
-    size_t epochs = 50;
+    size_t epochs = 100;
+    size_t batches_per_epoch = 10;
     size_t batch_size = 4;
     // Needs 128x128 -> dim = 16384
     size_t dim = 16384;
 
     if(argc > 1) epochs = std::atoi(argv[1]);
+    if(argc > 2) batches_per_epoch = std::atoi(argv[2]);
 
-    train<float>(epochs, batch_size, dim);
+    train<float>(epochs, batches_per_epoch, batch_size, dim);
     return 0;
 }
