@@ -206,6 +206,32 @@ int main() {
             std::string suffix = std::to_string(epoch);
             save_tensor_as_png(vis_input, "ablation_target_" + suffix + ".png", 0);
             save_tensor_as_png(vis_output, "ablation_recon_" + suffix + ".png", 0);
+
+            // Analyze Latent Space
+            Tensor<float> latent = model.forward_encoder(vis_input);
+            float lat_min = 1e9, lat_max = -1e9, lat_sum = 0, lat_abs_sum = 0;
+            size_t lat_zeros = 0;
+            const float* l_ptr = latent.data();
+            for(size_t i=0; i<latent.size(); ++i) {
+                float v = l_ptr[i];
+                if (v < lat_min) lat_min = v;
+                if (v > lat_max) lat_max = v;
+                lat_sum += v;
+                lat_abs_sum += std::abs(v);
+                if (std::abs(v) < 1e-9f) lat_zeros++;
+            }
+            float lat_mean = lat_sum / latent.size();
+            float lat_sparsity = (float)lat_zeros / latent.size();
+
+            std::cout << "Latent Stats | Range: [" << lat_min << ", " << lat_max
+                      << "] | Mean: " << lat_mean << " | Sparsity: " << (lat_sparsity*100.0f) << "%" << std::endl;
+
+            // Visualize Latent (Reshape 2x2x64 -> 16x16 or similar for visual)
+            // Actually it's [N, 2, 2, 64].
+            // We can just dump it as a 1D strip or small block.
+            // Let's just use the standard saver which will handle it as 2x2 image with 64 channels (saving first 3).
+            // That's not very useful.
+            // Let's save it as a flattened heatmap if possible, but for now just log stats is enough for analysis.
         }
     }
 
