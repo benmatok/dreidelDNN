@@ -141,6 +141,27 @@ void save_png_grid(const std::string& filename, const std::vector<std::vector<fl
     stbi_write_png(filename.c_str(), total_width, total_height, 1, pixels.data(), total_width);
 }
 
+// Helper to compute mean and std dev
+template <typename T>
+std::pair<T, T> compute_stats(const Tensor<T>& tensor) {
+    T sum = 0;
+    const T* data = tensor.data();
+    size_t N = tensor.size();
+    if (N == 0) return {0, 0};
+
+    for(size_t i=0; i<N; ++i) sum += data[i];
+    T mean = sum / N;
+
+    T sum_sq = 0;
+    for(size_t i=0; i<N; ++i) {
+        T diff = data[i] - mean;
+        sum_sq += diff * diff;
+    }
+    T var = sum_sq / N;
+    T std_dev = std::sqrt(var);
+    return {mean, std_dev};
+}
+
 template <typename T>
 void train(size_t epochs, size_t batches_per_epoch, size_t batch_size, size_t dim, const std::string& init_scheme) {
     size_t size = static_cast<size_t>(std::sqrt(dim)); // 128
@@ -149,9 +170,6 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size, size_t di
     models::ZenithGhostAE<T> model(init_scheme);
 
     // Optimizer
-    // ZenithBlock works best with low LR?
-    // Memory says "3.25x training speedup... requires lower learning rates".
-    // "SimpleAdam optimizer supports Coordinate-Wise Clipping".
     optim::SimpleAdam<T> optimizer(0.001f);
     optimizer.add_parameters(model.parameters(), model.gradients());
 
@@ -162,6 +180,7 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size, size_t di
     for (size_t epoch = 0; epoch < epochs; ++epoch) {
         T epoch_recon_mae = 0;
         T epoch_ghost_mae = 0;
+        T epoch_energy_loss = 0;
 
         for (size_t b = 0; b < batches_per_epoch; ++b) {
             // Generate Wavelets (B, H*W)
@@ -189,7 +208,7 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size, size_t di
 
             auto out = model.forward_train(input);
 
-            // 1. Reconstruction Loss (MAE)
+            // --- 1. Main Task (Reconstruction) ---
             Tensor<T> diff = out.reconstruction - input;
 
             T mae_recon = 0;
@@ -197,50 +216,112 @@ void train(size_t epochs, size_t batches_per_epoch, size_t batch_size, size_t di
             for(size_t k=0; k<diff.size(); ++k) mae_recon += std::abs(diff_ptr[k]);
             mae_recon /= diff.size();
 
-            // Grad Recon (Sign of diff)
+            // Grad Recon
             Tensor<T> grad_recon = diff;
             T* gr_ptr = grad_recon.data();
             for(size_t k=0; k<grad_recon.size(); ++k) {
                 T v = gr_ptr[k];
                 gr_ptr[k] = (v > 0) ? 1.0f : ((v < 0) ? -1.0f : 0.0f);
                 gr_ptr[k] /= diff.size();
-                gr_ptr[k] *= 1000.0f;
+                gr_ptr[k] *= 1000.0f; // Scale Main
             }
 
-            // 2. Ghost Loss
+            // --- 2. Ghost Consistency & Energy ---
             T mae_ghost = 0;
+            T loss_energy = 0;
             std::vector<Tensor<T>> grad_ghosts;
+            std::vector<Tensor<T>> grad_targets;
+
+            // Scale factors
+            T scale_consistency = 1000.0f; // User implied 1:1 with Main
+            T scale_energy = 100.0f;       // User implied 0.1 * (Weight of Main/Consistency)
 
             for(size_t i=0; i<out.ghost_preds.size(); ++i) {
-                Tensor<T> g_diff = out.ghost_preds[i] - out.encoder_targets[i];
+                const auto& pZ = out.ghost_preds[i];
+                const auto& pX = out.encoder_targets[i];
+
+                // A. Alignment Loss (MAE)
+                Tensor<T> g_diff = pZ - pX;
                 T g_mae = 0;
                 const T* gd_ptr = g_diff.data();
                 for(size_t k=0; k<g_diff.size(); ++k) g_mae += std::abs(gd_ptr[k]);
                 g_mae /= g_diff.size();
                 mae_ghost += g_mae;
 
-                Tensor<T> g_grad = g_diff;
-                T* gg_ptr = g_grad.data();
-                for(size_t k=0; k<g_grad.size(); ++k) {
-                    T v = gg_ptr[k];
-                    gg_ptr[k] = (v > 0) ? 1.0f : ((v < 0) ? -1.0f : 0.0f);
-                    gg_ptr[k] /= g_diff.size();
-                    gg_ptr[k] *= 100.0f; // Weight for ghost loss
+                // Gradients for Consistency
+                Tensor<T> grad_z_cons({pZ.shape()});
+                Tensor<T> grad_x_cons({pX.shape()});
+                T* gz_ptr = grad_z_cons.data();
+                T* gx_ptr = grad_x_cons.data();
+
+                // d|Z-X|/dZ = sgn(Z-X)
+                // d|Z-X|/dX = sgn(X-Z) = -sgn(Z-X)
+                // Note: g_diff is Z - X
+                for(size_t k=0; k<g_diff.size(); ++k) {
+                    T v = gd_ptr[k];
+                    T sgn = (v > 0) ? 1.0f : ((v < 0) ? -1.0f : 0.0f);
+                    gz_ptr[k] = sgn / g_diff.size() * scale_consistency;
+                    gx_ptr[k] = -sgn / g_diff.size() * scale_consistency;
                 }
-                grad_ghosts.push_back(g_grad);
+
+                // B. Energy Conservation (Anti-Collapse)
+                // L_energy = ReLU(1.0 - Std(Z)) + ReLU(1.0 - Std(X))
+
+                auto stats_z = compute_stats(pZ);
+                auto stats_x = compute_stats(pX);
+                T mean_z = stats_z.first; T std_z = stats_z.second;
+                T mean_x = stats_x.first; T std_x = stats_x.second;
+
+                T l_en_z = std::max((T)0, (T)1.0 - std_z);
+                T l_en_x = std::max((T)0, (T)1.0 - std_x);
+                loss_energy += (l_en_z + l_en_x);
+
+                // Gradients for Energy
+                // d(1-std)/dx = - (x-mu)/(N*std)
+                Tensor<T> grad_z_en = pZ; grad_z_en.fill(0);
+                Tensor<T> grad_x_en = pX; grad_x_en.fill(0);
+
+                if (l_en_z > 0) {
+                    T* ptr = grad_z_en.data();
+                    const T* z_ptr = pZ.data();
+                    size_t N = pZ.size();
+                    T factor = -1.0f / (N * (std_z + 1e-9f));
+                    for(size_t k=0; k<N; ++k) {
+                        ptr[k] = factor * (z_ptr[k] - mean_z) * scale_energy;
+                    }
+                }
+
+                if (l_en_x > 0) {
+                    T* ptr = grad_x_en.data();
+                    const T* x_ptr = pX.data();
+                    size_t N = pX.size();
+                    T factor = -1.0f / (N * (std_x + 1e-9f));
+                    for(size_t k=0; k<N; ++k) {
+                        ptr[k] = factor * (x_ptr[k] - mean_x) * scale_energy;
+                    }
+                }
+
+                // Combine Gradients
+                Tensor<T> total_grad_z = grad_z_cons + grad_z_en;
+                Tensor<T> total_grad_x = grad_x_cons + grad_x_en;
+
+                grad_ghosts.push_back(total_grad_z);
+                grad_targets.push_back(total_grad_x);
             }
 
-            model.backward_train(grad_recon, grad_ghosts);
+            model.backward_train(grad_recon, grad_ghosts, grad_targets);
             optimizer.step();
 
             epoch_recon_mae += mae_recon;
             epoch_ghost_mae += mae_ghost;
+            epoch_energy_loss += loss_energy;
         }
 
         if (epoch % 1 == 0) { // Log every epoch
             std::cout << "Epoch " << epoch
                       << ": ReconMAE=" << epoch_recon_mae / batches_per_epoch
                       << " GhostMAE=" << epoch_ghost_mae / batches_per_epoch
+                      << " EnergyLoss=" << epoch_energy_loss / batches_per_epoch
                       << std::endl;
         }
     }

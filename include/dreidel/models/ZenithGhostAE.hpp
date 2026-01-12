@@ -218,8 +218,8 @@ public:
 
     // Training Backward: Handles Recon Loss + Ghost Loss
     // grad_ghost_preds: Gradients of Loss w.r.t Ghost Predictions
-    // Note: We assume targets are detached (no grad flow to encoder from ghost loss).
-    void backward_train(const Tensor<T>& grad_recon, const std::vector<Tensor<T>>& grad_ghost_preds) {
+    // grad_encoder_targets: Gradients of Loss w.r.t Encoder Targets (Anti-Collapse)
+    void backward_train(const Tensor<T>& grad_recon, const std::vector<Tensor<T>>& grad_ghost_preds, const std::vector<Tensor<T>>& grad_encoder_targets = {}) {
         Tensor<T> g = grad_recon;
         g = head_->backward(g);
 
@@ -246,8 +246,36 @@ public:
         }
 
         // Backprop through Encoders and Stem (Standard)
+        // x_encs order: Stem, Enc0, ..., Enc5.
+        // grad_encoder_targets order: Enc5, Enc4, ..., Stem. (Matches Dec0...Dec6)
+        // But wait, grad_encoder_targets[0] is for Dec0 target -> Enc5Out.
+        // grad_encoder_targets[6] is for Dec6 target -> StemOut.
+
+        size_t enc_idx = 0; // Index into grad_encoder_targets
+        bool use_target_grads = !grad_encoder_targets.empty();
+
         for (auto it = encoders_.rbegin(); it != encoders_.rend(); ++it) {
             g = (*it)->backward(g);
+
+            // Current 'g' is at input of *it.
+            // *it is Enc6 (rbegin). Input is Enc5Out. Corresponds to target 0.
+            // *it is Enc5. Input is Enc4Out. Corresponds to target 1.
+            // ...
+            // *it is Enc0. Input is StemOut. Corresponds to target 6.
+
+            if (use_target_grads && enc_idx < grad_encoder_targets.size()) {
+                 const Tensor<T>& g_tgt = grad_encoder_targets[enc_idx];
+                 if (g_tgt.size() != g.size()) {
+                     // Mismatch might occur if architecture changed? Should assert.
+                     // But assuming correct alignment.
+                 } else {
+                     T* g_ptr = g.data();
+                     const T* gt_ptr = g_tgt.data();
+                     #pragma omp parallel for
+                     for(size_t k=0; k<g.size(); ++k) g_ptr[k] += gt_ptr[k];
+                 }
+                 enc_idx++;
+            }
         }
         g = stem_->backward(g);
     }
