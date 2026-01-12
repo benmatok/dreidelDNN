@@ -88,22 +88,22 @@ public:
         encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(128, init_scheme));
         // Enc4: 256 -> 512
         encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(256, init_scheme));
-        // Enc5: 512 -> 1024
-        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(512, init_scheme));
-        // Enc6: 1024 -> 2048
-        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(1024, init_scheme));
-        // Enc7: 2048 -> 4096 (Bottleneck)
-        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(2048, init_scheme));
+        // Enc5: 512 -> 512 (Capped)
+        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(512, 512, init_scheme));
+        // Enc6: 512 -> 512 (Capped)
+        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(512, 512, init_scheme));
+        // Enc7: 512 -> 512 (Bottleneck, Capped)
+        encoders_.push_back(std::make_unique<ZenithCompressBlock<T>>(512, 512, init_scheme));
 
         // 3. Decoders (7 blocks)
-        // Dec7: 4096 -> 2048
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(4096, init_scheme));
-        // Dec6: 2048 -> 1024
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(2048, init_scheme));
-        // Dec5: 1024 -> 512
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(1024, init_scheme));
-        // Dec4: 512 -> 256
-        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(512, init_scheme));
+        // Dec7: 512 -> 512
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(512, 512, init_scheme));
+        // Dec6: 512 -> 512
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(512, 512, init_scheme));
+        // Dec5: 512 -> 512
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(512, 512, init_scheme));
+        // Dec4: 512 -> 256 (Start scaling down)
+        decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(512, 256, init_scheme));
         // Dec3: 256 -> 128
         decoders_.push_back(std::make_unique<ZenithExpandBlock<T>>(256, init_scheme));
         // Dec2: 128 -> 64
@@ -116,10 +116,10 @@ public:
 
         // 5. Ghost Projections
         // Map Decoder Outputs -> Encoder Outputs
-        // Dec0 (Dec7) Out (2048) matches Enc5 (Enc6) Out (2048) -> Ghost 0
-        ghosts_.push_back(std::make_unique<GhostProjection<T>>(2048, 2048, init_scheme));
-        // Dec1 (Dec6) Out (1024) matches Enc4 (Enc5) Out (1024) -> Ghost 1
-        ghosts_.push_back(std::make_unique<GhostProjection<T>>(1024, 1024, init_scheme));
+        // Dec0 (Dec7) Out (512) matches Enc5 (Enc6) Out (512) -> Ghost 0
+        ghosts_.push_back(std::make_unique<GhostProjection<T>>(512, 512, init_scheme));
+        // Dec1 (Dec6) Out (512) matches Enc4 (Enc5) Out (512) -> Ghost 1
+        ghosts_.push_back(std::make_unique<GhostProjection<T>>(512, 512, init_scheme));
         // Dec2 (Dec5) Out (512) matches Enc3 (Enc4) Out (512) -> Ghost 2
         ghosts_.push_back(std::make_unique<GhostProjection<T>>(512, 512, init_scheme));
         // Dec3 (Dec4) Out (256) matches Enc2 (Enc3) Out (256) -> Ghost 3
