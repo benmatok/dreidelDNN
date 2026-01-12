@@ -1,0 +1,68 @@
+==1660== Cachegrind, a high-precision tracing profiler
+==1660== Copyright (C) 2002-2017, and GNU GPL'd, by Nicholas Nethercote et al.
+==1660== Using Valgrind-3.22.0 and LibVEX; rerun with -h for copyright info
+==1660== Command: ./benchmark_zenith_autoencoder
+==1660==
+--1660-- warning: L3 cache found, using its data for the LL simulation.
+--1660-- warning: specified LL cache: line_size 64  assoc 20  total_size 47,185,920
+--1660-- warning: simulated LL cache: line_size 64  assoc 23  total_size 48,234,496
+=== Autoencoder Benchmark: Zenith vs Conv2D ===
+
+--------------------------------------------------
+Benchmarking Autoencoder with Base Channel C=8
+Architecture: 64x64x1 -> 16x16x8 -> 4x4x8 -> 1x1x4 -> 4x4x8 -> 16x16x8 -> 64x64x1
+Zenith AE Time:     2.23306 s
+Conv2D AE Time:     1.04847 s
+Speedup: 0.469524x
+
+--------------------------------------------------
+Benchmarking Autoencoder with Base Channel C=16
+Architecture: 64x64x1 -> 16x16x16 -> 4x4x16 -> 1x1x8 -> 4x4x16 -> 16x16x16 -> 64x64x1
+Zenith AE Time:     2.8885 s
+Conv2D AE Time:     1.62353 s
+Speedup: 0.562069x
+
+--------------------------------------------------
+Benchmarking Autoencoder with Base Channel C=32
+Architecture: 64x64x1 -> 16x16x32 -> 4x4x32 -> 1x1x16 -> 4x4x32 -> 16x16x32 -> 64x64x1
+==1660== brk segment overflow in thread #1: can't grow to 0x487a000
+==1660== (see section Limitations in user manual)
+==1660== NOTE: further instances of this message will not be shown
+Zenith AE Time:     5.2651 s
+Conv2D AE Time:     3.40018 s
+Speedup: 0.645795x
+
+--------------------------------------------------
+Benchmarking Autoencoder with Base Channel C=64
+Architecture: 64x64x1 -> 16x16x64 -> 4x4x64 -> 1x1x32 -> 4x4x64 -> 16x16x64 -> 64x64x1
+Zenith AE Time:     9.8644 s
+Conv2D AE Time:     9.04655 s
+Speedup: 0.917091x
+
+--------------------------------------------------
+Benchmarking Autoencoder with Base Channel C=128
+Architecture: 64x64x1 -> 16x16x128 -> 4x4x128 -> 1x1x64 -> 4x4x128 -> 16x16x128 -> 64x64x1
+Zenith AE Time:     18.6985 s
+Conv2D AE Time:     28.9451 s
+Speedup: 1.54799x
+Graph saved to benchmark_graph.svg
+==1660==
+==1660== I refs:        16,944,528,008
+==1660== I1  misses:            13,014
+==1660== LLi misses:             4,084
+==1660== I1  miss rate:           0.00%
+==1660== LLi miss rate:           0.00%
+==1660==
+==1660== D refs:         4,801,205,208  (4,271,499,415 rd   + 529,705,793 wr)
+==1660== D1  misses:       102,211,174  (   91,792,874 rd   +  10,418,300 wr)
+==1660== LLd misses:           964,062  (        8,598 rd   +     955,464 wr)
+==1660== D1  miss rate:            2.1% (          2.1%     +         2.0%  )
+==1660== LLd miss rate:            0.0% (          0.0%     +         0.2%  )
+==1660==
+==1660== LL refs:          102,224,188  (   91,805,888 rd   +  10,418,300 wr)
+==1660== LL misses:            968,146  (       12,682 rd   +     955,464 wr)
+==1660== LL miss rate:             0.0% (          0.0%     +         0.2%  )
+==1660==
+==1660== Branches:       1,689,567,393  (1,688,608,977 cond +     958,416 ind)
+==1660== Mispredicts:       54,768,482  (   54,757,046 cond +      11,436 ind)
+==1660== Mispred rate:             3.2% (          3.2%     +         1.2%   )
