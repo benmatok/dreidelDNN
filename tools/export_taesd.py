@@ -37,38 +37,48 @@ def export_layer(f, layer, name=""):
             f.write(struct.pack(f'{len(b)}f', *b))
             # print(f"  Exported ZERO bias for {name}: {len(b)} floats")
 
-def main():
-    encoder_path = None
-    decoder_path = None
-
-    # Simple argument parsing
-    if len(sys.argv) > 1:
-        decoder_path = sys.argv[1]
-
-    print(f"Loading TAESD Decoder (weights: {decoder_path if decoder_path else 'Random Initialization'})...")
-
-    # Initialize model. If paths are None, it initializes with random weights (standard PyTorch behavior)
-    # We pass None for paths to skip loading if arguments are missing.
-    model = TAESD(encoder_path=None, decoder_path=decoder_path).decoder
-    model.eval()
-
-    output_filename = "taesd_decoder.bin"
+def export_model(model, output_filename):
     print(f"Exporting to {output_filename}...")
-
+    count = 0
     with open(output_filename, "wb") as f:
         # Iterate recursively to find all Conv2d layers in order
-        # TAESD Decoder structure is sequential, so named_modules() recursion depth-first yields correct execution order.
-        # But named_modules() returns (name, module). It includes container modules.
-        # We only want to export leaf Conv2d layers.
-
-        count = 0
         for name, module in model.named_modules():
             if isinstance(module, torch.nn.Conv2d):
-                # print(f"Exporting Conv2d: {name} | Shape: {module.weight.shape}")
                 export_layer(f, module, name)
                 count += 1
+    print(f"Exported {count} Conv2d layers to {output_filename}.")
 
-        print(f"Exported {count} Conv2d layers.")
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Export TAESD weights to binary format")
+    parser.add_argument("--encoder", type=str, default="taesd_encoder.pth", help="Path to encoder pth")
+    parser.add_argument("--decoder", type=str, default="taesd_decoder.pth", help="Path to decoder pth")
+    parser.add_argument("--out-encoder", type=str, default="taesd_encoder.bin", help="Output encoder bin")
+    parser.add_argument("--out-decoder", type=str, default="taesd_decoder.bin", help="Output decoder bin")
+
+    args = parser.parse_args()
+
+    # Load TAESD
+    print(f"Loading TAESD from {args.encoder} and {args.decoder}...")
+
+    # We load the full TAESD wrapper but we can also just instantiate Encoder/Decoder separately if we wanted.
+    # The TAESD class handles loading state dicts.
+
+    # Check if files exist
+    enc_path = args.encoder if os.path.exists(args.encoder) else None
+    dec_path = args.decoder if os.path.exists(args.decoder) else None
+
+    if not enc_path and not dec_path:
+        print("Warning: Neither encoder nor decoder pth found. Initializing with random weights.")
+
+    taesd = TAESD(encoder_path=enc_path, decoder_path=dec_path)
+    taesd.eval()
+
+    if enc_path or (not enc_path and not dec_path):
+        export_model(taesd.encoder, args.out_encoder)
+
+    if dec_path or (not enc_path and not dec_path):
+        export_model(taesd.decoder, args.out_decoder)
 
 if __name__ == "__main__":
     main()

@@ -25,7 +25,6 @@ struct Tensor {
     float* ptr() { return data.data(); }
     const float* ptr() const { return data.data(); }
 
-    // Helper to zero out data
     void zero() {
         std::fill(data.begin(), data.end(), 0.0f);
     }
@@ -37,18 +36,19 @@ struct ConvWeights {
     int in_c, out_c, k;
 };
 
+// --- AVX2 Kernels ---
+
 // Optimized 3x3 Conv with Padding=1, Stride=1
-// Weights are expected to be in [In, K, K, Out] format (or [IC, KH, KW, OC])
 inline void conv2d_3x3_avx2(const Tensor& input, Tensor& output, const ConvWeights& weights) {
     int H = input.h;
     int W = input.w;
     int IC = weights.in_c;
     int OC = weights.out_c;
 
-    // Check dimensions
     if (input.c != IC) throw std::runtime_error("Input channels mismatch weights");
     if (output.c != OC) throw std::runtime_error("Output channels mismatch weights");
-    if (output.h != H || output.w != W) throw std::runtime_error("Output resolution mismatch (only stride 1 supported)");
+    // Verify output spatial dims
+    if (output.h != H || output.w != W) throw std::runtime_error("Output resolution mismatch (expected stride 1)");
 
     #pragma omp parallel for
     for (int y = 0; y < H; ++y) {
@@ -60,19 +60,14 @@ inline void conv2d_3x3_avx2(const Tensor& input, Tensor& output, const ConvWeigh
                 if (o + 7 < OC) {
                      _mm256_storeu_ps(&out_ptr[o], _mm256_loadu_ps(&weights.b[o]));
                 } else {
-                    // Handle edge case if OC is not multiple of 8 (though TAESD usually uses 64/3 which is tricky for 3)
-                    // For OC=3 (final layer), we can't use AVX store of 8 floats.
-                    // Fallback for remainder
-                    for (int rem = o; rem < OC; ++rem) {
-                        out_ptr[rem] = weights.b[rem];
-                    }
+                    for (int rem = o; rem < OC; ++rem) out_ptr[rem] = weights.b[rem];
                 }
             }
 
             // 2. Convolution Accumulation
             for (int ky = -1; ky <= 1; ++ky) {
                 int in_y = y + ky;
-                if (in_y < 0 || in_y >= H) continue; // Zero padding check
+                if (in_y < 0 || in_y >= H) continue;
 
                 for (int kx = -1; kx <= 1; ++kx) {
                     int in_x = x + kx;
@@ -80,16 +75,11 @@ inline void conv2d_3x3_avx2(const Tensor& input, Tensor& output, const ConvWeigh
 
                     const float* in_ptr = &input.data[(in_y * W + in_x) * IC];
 
-                    // Inner Loop: Input Channels -> Output Channels
                     for (int ic = 0; ic < IC; ++ic) {
                         float pixel_val = in_ptr[ic];
                         __m256 v_pixel = _mm256_set1_ps(pixel_val);
 
-                        // Weight Index: [IC, KH, KW, OC] flattened
-                        // KH=3, KW=3.
-                        // ky is -1..1, mapped to 0..2 -> ky+1
-                        // kx is -1..1, mapped to 0..2 -> kx+1
-                        // Index = ic * (3*3*OC) + (ky+1) * (3*OC) + (kx+1) * OC
+                        // Weight Index: [IC, KH, KW, OC]
                         int w_idx_base = (ic * 9 + (ky + 1) * 3 + (kx + 1)) * OC;
 
                         for (int o = 0; o < OC; o += 8) {
@@ -98,7 +88,6 @@ inline void conv2d_3x3_avx2(const Tensor& input, Tensor& output, const ConvWeigh
                                 __m256 v_acc = _mm256_loadu_ps(&out_ptr[o]);
                                 _mm256_storeu_ps(&out_ptr[o], _mm256_fmadd_ps(v_pixel, v_w, v_acc));
                             } else {
-                                // Scalar fallback
                                 for (int rem = o; rem < OC; ++rem) {
                                     out_ptr[rem] += pixel_val * weights.w[w_idx_base + rem];
                                 }
@@ -110,6 +99,79 @@ inline void conv2d_3x3_avx2(const Tensor& input, Tensor& output, const ConvWeigh
         }
     }
 }
+
+// Optimized 3x3 Conv with Padding=1, Stride=2
+inline void conv2d_3x3_s2_avx2(const Tensor& input, Tensor& output, const ConvWeights& weights) {
+    int H_in = input.h;
+    int W_in = input.w;
+    int H_out = output.h;
+    int W_out = output.w;
+    int IC = weights.in_c;
+    int OC = weights.out_c;
+
+    // Check basic dimensions
+    if (input.c != IC) throw std::runtime_error("Input channels mismatch weights");
+    if (output.c != OC) throw std::runtime_error("Output channels mismatch weights");
+    // Verify spatial: Output = floor((Input + 2*Pad - K) / Stride) + 1
+    // Pad=1, K=3, Stride=2 => floor((Input + 2 - 3)/2) + 1 = floor((Input-1)/2) + 1
+    // e.g., 64 -> floor(63/2)+1 = 31+1 = 32. Correct.
+    int expected_h = (H_in - 1) / 2 + 1;
+    int expected_w = (W_in - 1) / 2 + 1;
+    if (H_out != expected_h || W_out != expected_w) throw std::runtime_error("Output resolution mismatch (expected stride 2)");
+
+    #pragma omp parallel for
+    for (int y_out = 0; y_out < H_out; ++y_out) {
+        int y_in_center = y_out * 2; // Stride 2
+        for (int x_out = 0; x_out < W_out; ++x_out) {
+            int x_in_center = x_out * 2; // Stride 2
+
+            float* out_ptr = &output.data[(y_out * W_out + x_out) * OC];
+
+            // 1. Initialize with Bias
+            for (int o = 0; o < OC; o += 8) {
+                if (o + 7 < OC) {
+                     _mm256_storeu_ps(&out_ptr[o], _mm256_loadu_ps(&weights.b[o]));
+                } else {
+                    for (int rem = o; rem < OC; ++rem) out_ptr[rem] = weights.b[rem];
+                }
+            }
+
+            // 2. Convolution Accumulation
+            for (int ky = -1; ky <= 1; ++ky) {
+                int in_y = y_in_center + ky;
+                if (in_y < 0 || in_y >= H_in) continue;
+
+                for (int kx = -1; kx <= 1; ++kx) {
+                    int in_x = x_in_center + kx;
+                    if (in_x < 0 || in_x >= W_in) continue;
+
+                    const float* in_ptr = &input.data[(in_y * W_in + in_x) * IC];
+
+                    for (int ic = 0; ic < IC; ++ic) {
+                        float pixel_val = in_ptr[ic];
+                        __m256 v_pixel = _mm256_set1_ps(pixel_val);
+
+                        // Weight Index: [IC, KH, KW, OC]
+                        int w_idx_base = (ic * 9 + (ky + 1) * 3 + (kx + 1)) * OC;
+
+                        for (int o = 0; o < OC; o += 8) {
+                            if (o + 7 < OC) {
+                                __m256 v_w = _mm256_loadu_ps(&weights.w[w_idx_base + o]);
+                                __m256 v_acc = _mm256_loadu_ps(&out_ptr[o]);
+                                _mm256_storeu_ps(&out_ptr[o], _mm256_fmadd_ps(v_pixel, v_w, v_acc));
+                            } else {
+                                for (int rem = o; rem < OC; ++rem) {
+                                    out_ptr[rem] += pixel_val * weights.w[w_idx_base + rem];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 inline void relu(Tensor& t) {
     int size = t.h * t.w * t.c;
@@ -166,70 +228,26 @@ inline void upsample_nearest(const Tensor& in, Tensor& out) {
     }
 }
 
-class Decoder {
+// Common base for handling layers
+class ModelBase {
+protected:
     std::vector<ConvWeights> layers;
 
 public:
-    void load_from_file(const char* filename) {
-        std::ifstream f(filename, std::ios::binary);
+    void load_layers(const char* filename, const std::vector<std::pair<int, int>>& defs) {
+         std::ifstream f(filename, std::ios::binary);
         if (!f.is_open()) {
             throw std::runtime_error("Could not open model file");
         }
 
-        // Define architecture to know what to read
-        // TAESD Decoder standard (4 -> 3)
-        // 1. Conv(4->64)
-        // 2. Block(64): Conv(64->64), Conv(64->64), Conv(64->64)
-        // ...
-
-        // Sequence of channels for all Conv2d layers in order
-        struct LayerDef { int in, out; };
-        std::vector<LayerDef> defs;
-
-        // 1. Start: conv(4, 64)
-        defs.push_back({4, 64});
-
-        // 2. 3x Block(64)
-        for(int i=0; i<3; ++i) { // 3 Blocks
-            defs.push_back({64, 64}); // conv1
-            defs.push_back({64, 64}); // conv2
-            defs.push_back({64, 64}); // conv3
-        }
-
-        // 3. Up(2), Conv(64, 64)
-        defs.push_back({64, 64});
-
-        // 4. 3x Block(64)
-        for(int i=0; i<3; ++i) {
-            defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64});
-        }
-
-        // 5. Up(2), Conv(64, 64)
-        defs.push_back({64, 64});
-
-        // 6. 3x Block(64)
-        for(int i=0; i<3; ++i) {
-            defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64});
-        }
-
-        // 7. Up(2), Conv(64, 64)
-        defs.push_back({64, 64});
-
-        // 8. 1x Block(64)
-        defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64});
-
-        // 9. Final Conv(64, 3)
-        defs.push_back({64, 3});
-
-        // Read layers
         for (const auto& d : defs) {
             ConvWeights cw;
-            cw.in_c = d.in;
-            cw.out_c = d.out;
+            cw.in_c = d.first;
+            cw.out_c = d.second;
             cw.k = 3;
 
             // Weights: In * Out * K * K floats
-            int w_count = cw.in_c * cw.out_c * 9;
+            size_t w_count = cw.in_c * cw.out_c * 9;
             cw.w.resize(w_count);
             f.read(reinterpret_cast<char*>(cw.w.data()), w_count * sizeof(float));
 
@@ -243,9 +261,7 @@ public:
         if (f.fail()) {
              throw std::runtime_error("Error reading model file (file too short?)");
         }
-
-        // Check if extra data exists? Optional.
-        std::cout << "Loaded TAESD Decoder with " << layers.size() << " layers." << std::endl;
+        std::cout << "Loaded " << layers.size() << " layers from " << filename << std::endl;
     }
 
     // Helper to run a Block
@@ -271,7 +287,6 @@ public:
         relu(t2);
 
         // Conv 3
-        // We can write back to x if dimensions match (they do 64->64)
         conv2d_3x3_avx2(t2, x, layers[start_layer_idx + 2]);
 
         // Skip
@@ -282,12 +297,38 @@ public:
 
         return start_layer_idx + 3;
     }
+};
+
+class Decoder : public ModelBase {
+public:
+    void load_from_file(const char* filename) {
+        // Decoder (4 -> 3)
+        // 1. Conv(4->64)
+        // 2. 3x Block(64)
+        // 3. Up(2), Conv(64, 64)
+        // 4. 3x Block(64)
+        // 5. Up(2), Conv(64, 64)
+        // 6. 3x Block(64)
+        // 7. Up(2), Conv(64, 64)
+        // 8. 1x Block(64)
+        // 9. Conv(64, 3)
+
+        std::vector<std::pair<int, int>> defs;
+        defs.push_back({4, 64});
+        for(int i=0; i<3; ++i) { defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64}); }
+        defs.push_back({64, 64}); // Up
+        for(int i=0; i<3; ++i) { defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64}); }
+        defs.push_back({64, 64}); // Up
+        for(int i=0; i<3; ++i) { defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64}); }
+        defs.push_back({64, 64}); // Up
+        defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64}); // 1x Block
+        defs.push_back({64, 3});
+
+        load_layers(filename, defs);
+    }
 
     void forward(Tensor& latent, Tensor& image) {
-        // Latent input: usually 64x64x4 (for 512x512 image) or similar
-        // TAESD usually takes small latent.
-
-        // 0. Clamp (Optional but in TAESD)
+        // 0. Clamp
         clamp_tanh_3(latent);
 
         int l_idx = 0;
@@ -305,13 +346,6 @@ public:
         upsample_nearest(f1, f2);
         Tensor f2_conv(f2.h, f2.w, 64);
         conv2d_3x3_avx2(f2, f2_conv, layers[l_idx++]);
-        // Note: TAESD structure: Upsample -> Conv(bias=False) -> (Blocks starts with Conv)
-        // The conv after upsample is just a conv. It doesn't have ReLU after it in Decoder definition?
-        // Decoder def: ... nn.Upsample(), conv(64, 64), Block ...
-        // `conv` helper has padding=1.
-        // `conv` is just Conv2d. No ReLU in `conv` helper?
-        // Helper: def conv(...): return nn.Conv2d(...)
-        // So NO ReLU after the Upsample Conv.
 
         // 4. 3x Blocks
         for(int i=0; i<3; ++i) l_idx = run_block(f2_conv, l_idx);
@@ -335,13 +369,84 @@ public:
         l_idx = run_block(f4_conv, l_idx);
 
         // 9. Final Conv (64 -> 3)
-        // Ensure image tensor is correct size
         if (image.h != f4_conv.h || image.w != f4_conv.w || image.c != 3) {
-             // Resize or throw? Assuming caller allocated correctly or we resize
              image = Tensor(f4_conv.h, f4_conv.w, 3);
         }
         conv2d_3x3_avx2(f4_conv, image, layers[l_idx++]);
-        // No activation at end
+    }
+};
+
+class Encoder : public ModelBase {
+public:
+    void load_from_file(const char* filename) {
+        // Encoder (3 -> 4)
+        // 1. Conv(3, 64)
+        // 2. Block(64)
+        // 3. Conv(64, 64, stride=2, bias=False)
+        // 4. 3x Block(64)
+        // 5. Conv(64, 64, stride=2, bias=False)
+        // 6. 3x Block(64)
+        // 7. Conv(64, 64, stride=2, bias=False)
+        // 8. 3x Block(64)
+        // 9. Conv(64, 4)
+
+        std::vector<std::pair<int, int>> defs;
+        defs.push_back({3, 64});
+        defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64}); // 1x Block
+        defs.push_back({64, 64}); // Down
+        for(int i=0; i<3; ++i) { defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64}); }
+        defs.push_back({64, 64}); // Down
+        for(int i=0; i<3; ++i) { defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64}); }
+        defs.push_back({64, 64}); // Down
+        for(int i=0; i<3; ++i) { defs.push_back({64, 64}); defs.push_back({64, 64}); defs.push_back({64, 64}); }
+        defs.push_back({64, 4});
+
+        load_layers(filename, defs);
+    }
+
+    void forward(Tensor& image, Tensor& latent) {
+        int l_idx = 0;
+
+        // 1. Initial Conv
+        Tensor f1(image.h, image.w, 64);
+        conv2d_3x3_avx2(image, f1, layers[l_idx++]);
+        // Note: Python Encoder code says: conv(3, 64), Block(64, 64).
+        // Does initial conv have ReLU?
+        // tools/taesd.py: `conv(3, 64)` -> nn.Conv2d(..., padding=1). No ReLU.
+        // Block has internal ReLU.
+        // So f1 is output of Conv.
+
+        // 2. 1x Block
+        l_idx = run_block(f1, l_idx);
+
+        // 3. Down (Stride 2)
+        Tensor f2((f1.h-1)/2+1, (f1.w-1)/2+1, 64);
+        conv2d_3x3_s2_avx2(f1, f2, layers[l_idx++]);
+        // Python: conv(64, 64, stride=2, bias=False). No ReLU in conv wrapper.
+
+        // 4. 3x Blocks
+        for(int i=0; i<3; ++i) l_idx = run_block(f2, l_idx);
+
+        // 5. Down (Stride 2)
+        Tensor f3((f2.h-1)/2+1, (f2.w-1)/2+1, 64);
+        conv2d_3x3_s2_avx2(f2, f3, layers[l_idx++]);
+
+        // 6. 3x Blocks
+        for(int i=0; i<3; ++i) l_idx = run_block(f3, l_idx);
+
+        // 7. Down (Stride 2)
+        Tensor f4((f3.h-1)/2+1, (f3.w-1)/2+1, 64);
+        conv2d_3x3_s2_avx2(f3, f4, layers[l_idx++]);
+
+        // 8. 3x Blocks
+        for(int i=0; i<3; ++i) l_idx = run_block(f4, l_idx);
+
+        // 9. Final Conv (64 -> 4)
+        if (latent.h != f4.h || latent.w != f4.w || latent.c != 4) {
+            latent = Tensor(f4.h, f4.w, 4);
+        }
+        conv2d_3x3_avx2(f4, latent, layers[l_idx++]);
+        // Python: conv(64, latent_channels). No ReLU.
     }
 };
 

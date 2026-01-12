@@ -2,82 +2,77 @@
 #include <iostream>
 #include <vector>
 #include <chrono>
+#include <string>
 
 using namespace dreidel::taesd;
 
 int main(int argc, char** argv) {
-    std::string filename;
-    if (argc > 1) {
-        filename = argv[1];
-    }
+    std::string encoder_path = "taesd_encoder.bin";
+    std::string decoder_path = "taesd_decoder.bin";
 
-    if (filename == "dummy") {
-         std::cout << "Creating dummy model file..." << std::endl;
-         // We need to calculate exact size.
-         // See Decoder::load_from_file logic.
-         // 1 (4->64) + 9 (64->64) + 1 + 9 + 1 + 9 + 1 + 3 + 1 (64->3) = 35 layers
-         // Conv 4->64: 4*64*9 w + 64 b = 2304 + 64 = 2368 floats
-         // Conv 64->64: 64*64*9 w + 64 b = 36864 + 64 = 36928 floats
-         // Conv 64->3: 64*3*9 w + 3 b = 1728 + 3 = 1731 floats
+    if (argc > 1) encoder_path = argv[1];
+    if (argc > 2) decoder_path = argv[2];
 
-         // Count:
-         // 1x Start: 2368
-         // 33x Middle (64->64): 33 * 36928 = 1218624
-         // 1x End: 1731
-
-         std::ofstream f("dummy_taesd.bin", std::ios::binary);
-
-         // Start
-         std::vector<float> buf(2368, 0.01f);
-         f.write((char*)buf.data(), buf.size()*4);
-
-         // Middle
-         std::vector<float> mid(36928, 0.001f);
-         for(int i=0; i<33; ++i) f.write((char*)mid.data(), mid.size()*4);
-
-         // End
-         std::vector<float> end(1731, 0.01f);
-         f.write((char*)end.data(), end.size()*4);
-
-         f.close();
-         std::cout << "Created dummy_taesd.bin" << std::endl;
-         filename = "dummy_taesd.bin";
-    }
-
-    if (filename.empty()) {
-        std::cout << "Usage: " << argv[0] << " <taesd_decoder.bin> or dummy" << std::endl;
-        return 1;
-    }
-
-    std::cout << "Initializing Decoder..." << std::endl;
-    Decoder decoder;
-
+    std::cout << "Loading Encoder from " << encoder_path << "..." << std::endl;
+    Encoder encoder;
     try {
-        decoder.load_from_file(filename.c_str());
+        encoder.load_from_file(encoder_path.c_str());
     } catch (const std::exception& e) {
-        std::cerr << "Error loading model: " << e.what() << std::endl;
+        std::cerr << "Failed to load encoder: " << e.what() << std::endl;
         return 1;
     }
 
-    // Input Latent: 1x4x64x64 (H=64, W=64, C=4)
-    Tensor latent(64, 64, 4);
+    std::cout << "Loading Decoder from " << decoder_path << "..." << std::endl;
+    Decoder decoder;
+    try {
+        decoder.load_from_file(decoder_path.c_str());
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to load decoder: " << e.what() << std::endl;
+        return 1;
+    }
 
-    // Fill with some data
-    for(size_t i=0; i<latent.data.size(); ++i) latent.data[i] = (float)i / latent.data.size();
-
-    // Output Image: 512x512x3
+    // Test Image: 512x512x3
     Tensor image(512, 512, 3);
+    // Fill with gradient
+    for(int y=0; y<512; ++y) {
+        for(int x=0; x<512; ++x) {
+            float* p = &image.data[(y*512+x)*3];
+            p[0] = (float)x / 512.0f;
+            p[1] = (float)y / 512.0f;
+            p[2] = 0.5f;
+        }
+    }
 
-    std::cout << "Running Forward Pass..." << std::endl;
+    Tensor latent(64, 64, 4);
+    Tensor recon(512, 512, 3);
+
+    std::cout << "Running Encoding..." << std::endl;
     auto start = std::chrono::high_resolution_clock::now();
 
-    decoder.forward(latent, image);
+    encoder.forward(image, latent);
+
+    auto mid = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> enc_time = mid - start;
+    std::cout << "Encoding time: " << enc_time.count() << " s" << std::endl;
+
+    std::cout << "Running Decoding..." << std::endl;
+    decoder.forward(latent, recon);
 
     auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> diff = end - start;
+    std::chrono::duration<double> dec_time = end - mid;
+    std::cout << "Decoding time: " << dec_time.count() << " s" << std::endl;
 
-    std::cout << "Forward pass completed in " << diff.count() << " s" << std::endl;
-    std::cout << "First pixel: " << image.data[0] << ", " << image.data[1] << ", " << image.data[2] << std::endl;
+    std::cout << "Total time: " << (end - start).count() << " s" << std::endl;
+
+    // Check reconstruction (basic sanity check)
+    // It won't be perfect, but shouldn't be garbage (NaN or Inf)
+    float sample = recon.data[0];
+    std::cout << "Reconstruction sample (0,0): R=" << sample << std::endl;
+
+    if (std::isnan(sample) || std::isinf(sample)) {
+        std::cerr << "Error: Output contains NaN or Inf" << std::endl;
+        return 1;
+    }
 
     return 0;
 }
