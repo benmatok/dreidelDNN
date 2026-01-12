@@ -47,13 +47,10 @@ struct ConvWeights {
     int in_c, out_c, k;
 };
 
-// --- AVX2 Kernels (Optimized with Register Accumulation) ---
-// ... (Including conv2d_3x3_avx2 and conv2d_3x3_s2_avx2 from before) ...
-// I will just declare them inline here to save space in this response,
-// assuming previous implementation is good.
-// But I need to write the file, so I must include them.
+// --- AVX2 Kernels ---
 
 // Optimized 3x3 Conv with Padding=1, Stride=1
+// Uses 4-pixel blocking to reduce weight bandwidth
 inline void conv2d_3x3_avx2(const Tensor& input, Tensor& output, const ConvWeights& weights) {
     int H = input.h;
     int W = input.w;
