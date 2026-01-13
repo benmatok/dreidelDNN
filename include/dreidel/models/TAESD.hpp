@@ -85,14 +85,18 @@ inline void conv2d_3x3_avx2(const Tensor& input, Tensor& output, const ConvWeigh
                             int w_idx = (ic * 9 + (ky + 1) * 3 + (kx + 1)) * OC + oc;
                             __m256 w0, w1;
                             if (oc_rem >= 8) w0 = _mm256_loadu_ps(&w_base[w_idx]);
+                            else { float tmp[8]={0}; for(int k=0;k<oc_rem;++k) tmp[k]=w_base[w_idx+k]; w0 = _mm256_loadu_ps(tmp); } // Fixed: Handle tail weights
+
                             if (oc_rem > 8)  w1 = _mm256_loadu_ps(&w_base[w_idx+8]);
+
                             for (int p = 0; p < valid_pixels; ++p) {
                                 if (!y_valid) continue;
                                 int in_x = x + p + kx;
                                 if (in_x < 0 || in_x >= W) continue;
                                 float val = in_base[(in_y * W + in_x) * IC + ic];
                                 __m256 v_val = _mm256_set1_ps(val);
-                                if (oc_rem >= 8) acc[p][0] = _mm256_fmadd_ps(v_val, w0, acc[p][0]);
+                                // Fixed: Handle tail accumulation unconditionally if oc_rem < 8
+                                if (oc_rem > 0) acc[p][0] = _mm256_fmadd_ps(v_val, w0, acc[p][0]);
                                 if (oc_rem > 8)  acc[p][1] = _mm256_fmadd_ps(v_val, w1, acc[p][1]);
                             }
                         }
@@ -149,6 +153,8 @@ inline void conv2d_3x3_s2_avx2(const Tensor& input, Tensor& output, const ConvWe
                             int w_idx = (ic * 9 + (ky + 1) * 3 + (kx + 1)) * OC + oc;
                             __m256 w0, w1;
                             if (oc_rem >= 8) w0 = _mm256_loadu_ps(&w_base[w_idx]);
+                            else { float tmp[8]={0}; for(int k=0;k<oc_rem;++k) tmp[k]=w_base[w_idx+k]; w0 = _mm256_loadu_ps(tmp); } // Fixed: Tail weights
+
                             if (oc_rem > 8)  w1 = _mm256_loadu_ps(&w_base[w_idx+8]);
                             for (int p = 0; p < valid_pixels; ++p) {
                                 if (!y_valid) continue;
@@ -156,7 +162,8 @@ inline void conv2d_3x3_s2_avx2(const Tensor& input, Tensor& output, const ConvWe
                                 if (in_x < 0 || in_x >= W_in) continue;
                                 float val = in_base[(in_y * W_in + in_x) * IC + ic];
                                 __m256 v_val = _mm256_set1_ps(val);
-                                if (oc_rem >= 8) acc[p][0] = _mm256_fmadd_ps(v_val, w0, acc[p][0]);
+                                // Fixed: Tail accumulation
+                                if (oc_rem > 0) acc[p][0] = _mm256_fmadd_ps(v_val, w0, acc[p][0]);
                                 if (oc_rem > 8)  acc[p][1] = _mm256_fmadd_ps(v_val, w1, acc[p][1]);
                             }
                          }
