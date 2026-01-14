@@ -5,6 +5,8 @@
 #include <cmath>
 #include <random>
 #include <stdexcept>
+#include <chrono>
+#include <iostream>
 
 namespace dreidel {
 namespace layers {
@@ -12,6 +14,12 @@ namespace layers {
 template <typename T>
 class Conv2D : public Layer<T> {
 public:
+    static inline double time_conv_forward = 0;
+    static void reset_timers() { time_conv_forward = 0; }
+    static void print_timers() {
+         std::cout << "Conv2D Timer (ms): " << time_conv_forward * 1000.0 << std::endl;
+    }
+
     Conv2D(size_t in_channels, size_t out_channels, size_t kernel_size, size_t stride = 1, size_t padding = 0, size_t groups = 1)
         : in_channels_(in_channels), out_channels_(out_channels),
           kernel_size_(kernel_size), stride_(stride), padding_(padding), groups_(groups),
@@ -34,6 +42,7 @@ public:
     }
 
     Tensor<T> forward(const Tensor<T>& input) override {
+        auto t0 = std::chrono::high_resolution_clock::now();
         // Assume NHWC input
         input_ = input;
         auto shape = input.shape();
@@ -100,6 +109,8 @@ public:
                 }
             }
         }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        time_conv_forward += std::chrono::duration<double>(t1 - t0).count();
         return output;
     }
 
