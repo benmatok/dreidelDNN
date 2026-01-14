@@ -7,6 +7,8 @@
 #include <vector>
 #include <memory>
 #include <cstring>
+#include <chrono>
+#include <iostream>
 
 namespace dreidel {
 namespace layers {
@@ -21,6 +23,42 @@ namespace layers {
 template <typename T>
 class ZenithLiteBlock : public Layer<T> {
 public:
+    // Timers
+    static inline double time_compress = 0;
+    static inline double time_row_mix = 0;
+    static inline double time_col_transpose = 0;
+    static inline double time_col_mix = 0;
+    static inline double time_col_transpose_back = 0;
+    static inline double time_expand = 0;
+    static inline double time_residual = 0;
+    static inline long long count_ops = 0;
+
+    static void reset_timers() {
+        time_compress = 0;
+        time_row_mix = 0;
+        time_col_transpose = 0;
+        time_col_mix = 0;
+        time_col_transpose_back = 0;
+        time_expand = 0;
+        time_residual = 0;
+        count_ops = 0;
+    }
+
+    static void print_timers() {
+        std::cout << "ZenithLiteBlock Timers (ms):" << std::endl;
+        std::cout << "  Compress:    " << time_compress * 1000.0 << std::endl;
+        std::cout << "  Row Mix:     " << time_row_mix * 1000.0 << std::endl;
+        std::cout << "  Col Transp:  " << time_col_transpose * 1000.0 << std::endl;
+        std::cout << "  Col Mix:     " << time_col_mix * 1000.0 << std::endl;
+        std::cout << "  Col TrBack:  " << time_col_transpose_back * 1000.0 << std::endl;
+        std::cout << "  Expand:      " << time_expand * 1000.0 << std::endl;
+        std::cout << "  Residual:    " << time_residual * 1000.0 << std::endl;
+        double total = time_compress + time_row_mix + time_col_transpose + time_col_mix + time_col_transpose_back + time_expand + time_residual;
+        std::cout << "  TOTAL:       " << total * 1000.0 << std::endl;
+        std::cout << "  Data Flow (Transp/Res): " << (time_col_transpose + time_col_transpose_back + time_residual) * 1000.0 << " (" << (time_col_transpose + time_col_transpose_back + time_residual)/total*100.0 << "%)" << std::endl;
+        std::cout << "  Compute (Conv/Mix):     " << (time_compress + time_row_mix + time_col_mix + time_expand) * 1000.0 << " (" << (time_compress + time_row_mix + time_col_mix + time_expand)/total*100.0 << "%)" << std::endl;
+    }
+
     ZenithLiteBlock(size_t channels, size_t height, size_t width,
                     size_t compress_factor = 4, bool use_residual = true)
         : channels_(channels), height_(height), width_(width),
@@ -48,17 +86,6 @@ public:
         expand_bias_ = Tensor<T>({channels_});
 
         // Gates: [Height] and [Width]
-        // Row Mixer (Along Width): Gate H? Wait.
-        // Spec: "Row Spectral Mixer: FWHT (1D, Horizontal) -> Mul (Gate H) -> IFWHT"
-        // Horizontal is Width. So Gate should correspond to Width frequencies?
-        // Prompt says "Mul (Gate H)". Usually H stands for Height?
-        // Let's assume Gate H is for Horizontal (Width) dimension, size W.
-        // And Gate V (Col) is for Vertical (Height) dimension, size H.
-        // Re-reading spec:
-        // "Row Spectral Mixer: FWHT (1D, Horizontal) ... Mul (Gate H)" -> Gate Horizontal? Size W?
-        // "Col Spectral Mixer: FWHT (1D, Vertical) ... Mul (Gate V)" -> Gate Vertical? Size H?
-        // I will name them gate_h_ (size Width) and gate_v_ (size Height).
-
         gate_h_ = Tensor<T>({width_});
         gate_v_ = Tensor<T>({height_});
 
@@ -85,32 +112,24 @@ public:
         if (input.shape()[3] != channels_) throw std::runtime_error("Channel mismatch");
         size_t N = input.shape()[0];
 
-        // Scratchpad allocation (per thread if parallel, or just use vector)
-        // We need buffers for Compressed [N, H, W, InnerC]
-        // Ideally we reuse memory.
-
-        Tensor<T> output({N, height_, width_, channels_});
-
-        // Temporary buffer for Compressed State
-        // Size: N * H * W * InnerC
-        // If N is large, this is big. But ZenithLite is for low memory.
-        // Can we process pixel by pixel?
-        // Conv 1x1 is pixel-wise.
-        // Row Mixer needs full Row. Col Mixer needs full Col.
-        // So we need at least H*W*InnerC buffer per image.
-
         // Phase 1: Compress
         // Input -> Compressed
         // We can write directly to a scratch buffer.
+        Tensor<T> output({N, height_, width_, channels_});
         size_t num_pixels = N * height_ * width_;
-        std::vector<T, core::AlignedAllocator<T>> compressed_buf(num_pixels * inner_channels_);
+
+        // Lazy Resize
+        size_t required_size = num_pixels * inner_channels_;
+        if (compressed_buf_.size() < required_size) {
+            compressed_buf_.resize(required_size);
+        }
+
+        auto t0 = std::chrono::high_resolution_clock::now();
 
         // Call Optimized Group Conv
-        // Compress Weights: [Groups, Cout/G, Cin/G]
-        // compress_weights_ shape is {Groups, c_mid_g, c_in_g}. Matches expected layout for helper.
         hal::x86::group_conv_1x1_avx2(
             input.data(),
-            compressed_buf.data(),
+            compressed_buf_.data(),
             compress_weights_.data(),
             compress_bias_.data(),
             num_pixels,
@@ -118,6 +137,8 @@ public:
             inner_channels_,
             groups_
         );
+        auto t1 = std::chrono::high_resolution_clock::now();
+        time_compress += std::chrono::duration<double>(t1 - t0).count();
 
         // Phase 2: Row Spectral Mixer (Horizontal)
         // Operate on W dimension.
@@ -144,7 +165,7 @@ public:
         #pragma omp parallel for collapse(2)
         for(size_t n=0; n<N; ++n) {
             for(size_t h=0; h<height_; ++h) {
-                T* row_ptr = compressed_buf.data() + ((n*height_ + h)*width_) * inner_channels_;
+                T* row_ptr = compressed_buf_.data() + ((n*height_ + h)*width_) * inner_channels_;
 
                 // FWHT
                 hal::x86::fwht_1d_vectorized_avx2(row_ptr, width_, inner_channels_);
@@ -156,46 +177,38 @@ public:
                 hal::x86::fwht_1d_vectorized_avx2(row_ptr, width_, inner_channels_);
             }
         }
+        auto t2 = std::chrono::high_resolution_clock::now();
+        time_row_mix += std::chrono::duration<double>(t2 - t1).count();
 
         // Phase 3: Col Spectral Mixer (Vertical)
-        // Operate on H dimension.
-        // This is tricky for NHWC layout because H is strided by W*C.
-        // Stride = W * InnerC.
-        // Our fwht_1d_vectorized_avx2 assumes contiguous spatial dimension (Stride C).
-        // Here "Spatial" is H, but elements are separated.
-        // We must Transpose!
-        // Transpose H and W?
-        // Block Transpose?
-        // Or implement Strided FWHT?
-        // Transposing the whole [H, W, C] to [W, H, C] allows using the same kernel.
-        // Transpose cost vs Strided access cost?
-        // Strided access with stride W*C (where W=128, C=32 -> 4096 floats) is cache killer.
-        // Transpose is better.
+        // Lazy Resize Transpose Buffer
+        if (transposed_buf_.size() < required_size) {
+            transposed_buf_.resize(required_size);
+        }
 
-        // Transpose compressed_buf [N, H, W, C] -> [N, W, H, C]
-        // This puts H in the contiguous-like dimension (stride C).
-        // Then we apply FWHT on H.
-
-        // Allocate transpose buffer? Or in-place transpose if H==W?
-        // If H!=W, need buffer.
-        // Even if H==W, in-place transpose of blocks of C?
-        // Let's allocate a buffer. It's ZenithLite, we want low memory, but transpose needs auxiliary.
-        // Or we can process by blocks (Tile) to stay in L1.
-
-        std::vector<T, core::AlignedAllocator<T>> transposed_buf(num_pixels * inner_channels_);
-
-        // Parallel Transpose
+        // Parallel Transpose (Blocked)
+        // Block size for L1 cache (e.g. 32x32 tiles of vectors? or just spatial tiles)
+        const size_t TILE = 32;
         #pragma omp parallel for collapse(2)
         for(size_t n=0; n<N; ++n) {
-            for(size_t h=0; h<height_; ++h) {
-                for(size_t w=0; w<width_; ++w) {
-                    // Src: n, h, w. Dest: n, w, h
-                    const T* src = compressed_buf.data() + ((n*height_ + h)*width_ + w)*inner_channels_;
-                    T* dst = transposed_buf.data() + ((n*width_ + w)*height_ + h)*inner_channels_;
-                    std::memcpy(dst, src, inner_channels_ * sizeof(T));
+            for(size_t h0=0; h0<height_; h0+=TILE) {
+                for(size_t w0=0; w0<width_; w0+=TILE) {
+                    size_t h_end = std::min(h0 + TILE, height_);
+                    size_t w_end = std::min(w0 + TILE, width_);
+
+                    for(size_t h=h0; h<h_end; ++h) {
+                        for(size_t w=w0; w<w_end; ++w) {
+                            const T* src = compressed_buf_.data() + ((n*height_ + h)*width_ + w)*inner_channels_;
+                            T* dst = transposed_buf_.data() + ((n*width_ + w)*height_ + h)*inner_channels_;
+                            // Small memcpy is okay if in L1. inner_channels_ is likely 16-128 floats (64-512 bytes).
+                            std::memcpy(dst, src, inner_channels_ * sizeof(T));
+                        }
+                    }
                 }
             }
         }
+        auto t3 = std::chrono::high_resolution_clock::now();
+        time_col_transpose += std::chrono::duration<double>(t3 - t2).count();
 
         // Now apply Col Mixer (on H dimension, which is now dense-spatial)
         std::vector<T> scaled_gate_v(height_);
@@ -205,41 +218,40 @@ public:
         #pragma omp parallel for collapse(2)
         for(size_t n=0; n<N; ++n) {
             for(size_t w=0; w<width_; ++w) {
-                 T* col_ptr = transposed_buf.data() + ((n*width_ + w)*height_) * inner_channels_;
+                 T* col_ptr = transposed_buf_.data() + ((n*width_ + w)*height_) * inner_channels_;
 
                  hal::x86::fwht_1d_vectorized_avx2(col_ptr, height_, inner_channels_);
                  hal::x86::spectral_gate_separable_avx2(col_ptr, scaled_gate_v.data(), height_, inner_channels_);
                  hal::x86::fwht_1d_vectorized_avx2(col_ptr, height_, inner_channels_);
             }
         }
+        auto t4 = std::chrono::high_resolution_clock::now();
+        time_col_mix += std::chrono::duration<double>(t4 - t3).count();
 
         // Transpose back: [N, W, H, C] -> [N, H, W, C]
-        // We can write directly to compressed_buf again.
         #pragma omp parallel for collapse(2)
         for(size_t n=0; n<N; ++n) {
-            for(size_t w=0; w<width_; ++w) {
-                for(size_t h=0; h<height_; ++h) {
-                    const T* src = transposed_buf.data() + ((n*width_ + w)*height_ + h)*inner_channels_;
-                    T* dst = compressed_buf.data() + ((n*height_ + h)*width_ + w)*inner_channels_;
-                    std::memcpy(dst, src, inner_channels_ * sizeof(T));
+            for(size_t w0=0; w0<width_; w0+=TILE) {
+                for(size_t h0=0; h0<height_; h0+=TILE) {
+                    size_t w_end = std::min(w0 + TILE, width_);
+                    size_t h_end = std::min(h0 + TILE, height_);
+
+                    for(size_t w=w0; w<w_end; ++w) {
+                        for(size_t h=h0; h<h_end; ++h) {
+                            const T* src = transposed_buf_.data() + ((n*width_ + w)*height_ + h)*inner_channels_;
+                            T* dst = compressed_buf_.data() + ((n*height_ + h)*width_ + w)*inner_channels_;
+                            std::memcpy(dst, src, inner_channels_ * sizeof(T));
+                        }
+                    }
                 }
             }
         }
+        auto t5 = std::chrono::high_resolution_clock::now();
+        time_col_transpose_back += std::chrono::duration<double>(t5 - t4).count();
 
         // Phase 4: Channel Expand
-        // Compressed -> Output
-        // Expand Weights: [Groups, Cout/G, Cin/G]
-        // Note: For expand, Cin is InnerC, Cout is Channels.
-        // expand_weights_ is {Groups, c_in_g, c_mid_g}.
-        // Wait, helper expects [Groups, Cout/G, Cin/G].
-        // Cout/G = Channels/4. Cin/G = InnerC/4.
-        // My definition: expand_weights_ = {groups_, c_in_g, c_mid_g}.
-        // c_in_g = channels_/groups = Cout/G.
-        // c_mid_g = inner_channels_/groups = Cin/G.
-        // So dimensions match.
-
         hal::x86::group_conv_1x1_avx2(
-            compressed_buf.data(),
+            compressed_buf_.data(),
             output.data(),
             expand_weights_.data(),
             expand_bias_.data(),
@@ -248,6 +260,8 @@ public:
             channels_,
             groups_
         );
+        auto t6 = std::chrono::high_resolution_clock::now();
+        time_expand += std::chrono::duration<double>(t6 - t5).count();
 
         // Phase 5: Residual Add
         if (use_residual_) {
@@ -262,6 +276,8 @@ public:
                  out_d[i] += in_d[i];
              }
         }
+        auto t7 = std::chrono::high_resolution_clock::now();
+        time_residual += std::chrono::duration<double>(t7 - t6).count();
 
         return output;
     }
@@ -308,6 +324,10 @@ private:
 
     Tensor<T> gate_h_; // [Width]
     Tensor<T> gate_v_; // [Height]
+
+    // Persistent Scratchpads (avoid re-alloc)
+    std::vector<T, core::AlignedAllocator<T>> compressed_buf_;
+    std::vector<T, core::AlignedAllocator<T>> transposed_buf_;
 };
 
 } // namespace layers
