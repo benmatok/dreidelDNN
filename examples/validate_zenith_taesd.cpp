@@ -10,6 +10,7 @@
 #include "dreidel/layers/OptimizedConv2D.hpp"
 #include "dreidel/layers/Upscale2D.hpp"
 #include "dreidel/layers/ZenithLiteBlock.hpp"
+#include "dreidel/models/ZenithTAESD_Lite.hpp"
 
 using namespace dreidel;
 
@@ -166,6 +167,7 @@ int main() {
     size_t W = 512;
     size_t C = 3;
     models::ZenithTAESD<float> model_zenith(C, 4, 64, H, W);
+    models::ZenithTAESD_Lite<float> model_lite(C, 4, 64, H, W);
     StandardTAESD<float> model_baseline(C, 4, 64, H, W);
 
     std::cout << "Models instantiated." << std::endl;
@@ -192,6 +194,22 @@ int main() {
     std::cout << "Zenith Conv2D Total: ";
     layers::OptimizedConv2D<float>::print_timers();
 
+    // --- Zenith Lite Benchmark ---
+    std::cout << "\nBenchmarking Zenith-TAESD-Lite (512x512, " << iterations << " iters)..." << std::endl;
+    layers::ZenithLiteBlock<float>::reset_timers();
+    layers::OptimizedConv2D<float>::reset_timers();
+
+    auto start_l = std::chrono::high_resolution_clock::now();
+    for(int i=0; i<iterations; ++i) {
+        model_lite.forward(input);
+    }
+    auto end_l = std::chrono::high_resolution_clock::now();
+    double elapsed_l = std::chrono::duration<double, std::milli>(end_l - start_l).count() / iterations;
+
+    std::cout << "Zenith-Lite Avg Latency: " << elapsed_l << " ms" << std::endl;
+    std::cout << "Zenith-Lite Conv2D Total: ";
+    layers::OptimizedConv2D<float>::print_timers();
+
     // --- Baseline Benchmark ---
     std::cout << "\nBenchmarking Standard-TAESD (512x512, " << iterations << " iters)..." << std::endl;
     layers::OptimizedConv2D<float>::reset_timers();
@@ -209,6 +227,8 @@ int main() {
 
     std::cout << "\n=== Comparison ===" << std::endl;
     std::cout << "Speedup (Zenith vs Baseline): " << elapsed_b / elapsed_z << "x" << std::endl;
+    std::cout << "Speedup (Zenith-Lite vs Baseline): " << elapsed_b / elapsed_l << "x" << std::endl;
+    std::cout << "Speedup (Zenith-Lite vs Zenith): " << elapsed_z / elapsed_l << "x" << std::endl;
 
     // FLOPs Estimation
     // Zenith: ZenithLite blocks (minimal) + Conv2D layers.
@@ -255,10 +275,49 @@ int main() {
     add_zenith(128, 128, 128); // Block2 dec
     add_zenith(256, 256, 64); // Block3 dec
 
+    // Lite FLOPs
+    // Replace 3x3 with 1x1.
+    // 3x3 = 9 params. 1x1 = 1 param.
+    // Roughly 9x less FLOPs for convolutions.
+    // ZenithLite blocks remain same.
+
+    // Recompute Lite FLOPs
+    double flops_lite = 0;
+    // Convs (1x1)
+    auto add_conv1x1 = [&](double h, double w, double cin, double cout) {
+        flops_lite += h * w * cin * cout * 1 * 1 * 2.0;
+    };
+    // Stem
+    add_conv1x1(512, 512, 3, 64);
+    // Down1 (Unshuffle -> 256ch, 256x256 -> 128ch)
+    add_conv1x1(256, 256, 256, 128);
+    // Down2 (Unshuffle -> 512ch, 128x128 -> 256ch)
+    add_conv1x1(128, 128, 512, 256);
+    // Out (Unshuffle -> 1024ch, 64x64 -> 4ch)
+    add_conv1x1(64, 64, 1024, 4);
+    // Dec In
+    add_conv1x1(64, 64, 4, 1024);
+    // Dec Up1
+    add_conv1x1(128, 128, 256, 512); // In 256, Out 512 (for shuffle to 128)
+    // Dec Up2
+    add_conv1x1(256, 256, 128, 256);
+    // Dec Out
+    add_conv1x1(512, 512, 64, 3);
+
+    // Add ZenithLite
+    add_zenith(512, 512, 64);
+    add_zenith(256, 256, 128);
+    add_zenith(128, 128, 256);
+    add_zenith(64, 64, 256);
+    add_zenith(128, 128, 128);
+    add_zenith(256, 256, 64);
+
     std::cout << "\n=== Theoretical Analysis ===" << std::endl;
-    std::cout << "Estimated FLOPs per Image: " << flops / 1e9 << " GFLOPs" << std::endl;
+    std::cout << "Estimated FLOPs per Image (Zenith): " << flops / 1e9 << " GFLOPs" << std::endl;
+    std::cout << "Estimated FLOPs per Image (Zenith-Lite): " << flops_lite / 1e9 << " GFLOPs" << std::endl;
     std::cout << "Zenith Actual Performance: " << (flops / 1e9) / (elapsed_z / 1000.0) << " GFLOPs/s" << std::endl;
-    std::cout << "Baseline Actual Performance: " << (flops / 1e9) / (elapsed_b / 1000.0) << " GFLOPs/s" << std::endl; // Baseline has similar FLOPs (ResNet vs Zenith) roughly
+    std::cout << "Zenith-Lite Actual Performance: " << (flops_lite / 1e9) / (elapsed_l / 1000.0) << " GFLOPs/s" << std::endl;
+    std::cout << "Baseline Actual Performance: " << (flops / 1e9) / (elapsed_b / 1000.0) << " GFLOPs/s" << std::endl;
     std::cout << "Target Performance (CPU AVX2): >50 GFLOPs/s" << std::endl;
 
     return 0;
