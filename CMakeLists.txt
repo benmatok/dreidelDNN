@@ -26,6 +26,7 @@ add_dreidel_example(test_zenith_reconstruction_512 examples/test_zenith_reconstr
 add_dreidel_example(train_wavelet_autoencoder examples/train_wavelet_autoencoder.cpp)
 add_dreidel_example(train_zenith_autoencoder examples/train_zenith_autoencoder.cpp)
 add_dreidel_example(train_comparative_ae examples/train_comparative_ae.cpp)
+add_dreidel_example(validate_zenith_taesd examples/validate_zenith_taesd.cpp)
 
 # Tests (Optional, can be added similarly)
 file(GLOB TEST_SOURCES "tests/*.cpp")

@@ -130,10 +130,6 @@ inline void fwht8_avx2(__m256& r) {
 #ifdef DREIDEL_ARCH_AVX2
     // Stage 1 (Stride 1): Pairs (0,1), (2,3)...
     {
-        __m256 swapped = _mm256_permute_ps(r, 0xB1); // 10110001
-        __m256 sum = _mm256_add_ps(r, swapped);
-        __m256 diff = _mm256_sub_ps(r, swapped);
-
         __m256 u = _mm256_permute_ps(r, 0xA0); // 10100000 -> 0,0,2,2
         __m256 v = _mm256_permute_ps(r, 0xF5); // 11110101 -> 1,1,3,3
 
@@ -321,6 +317,173 @@ inline void fwht128_avx2(float* data) {
     _mm256_storeu_ps(data + 104, r13);
     _mm256_storeu_ps(data + 112, r14);
     _mm256_storeu_ps(data + 120, r15);
+#endif
+}
+
+// --- ZenithLite Kernels (AVX2 Optimized) ---
+
+// Vectorized FWHT for NHWC layout.
+// Performs 1D FWHT along the spatial dimension (of size N), treating the
+// channel dimension (of size C) as vector elements.
+// data: Pointer to the start of the row/column buffer [N * C]
+// n: Transform length (spatial dimension). Must be a power of 2.
+// c: Number of channels.
+inline void fwht_1d_vectorized_avx2(float* data, size_t n, size_t c) {
+#ifdef DREIDEL_ARCH_AVX2
+    for (size_t len = 1; len < n; len *= 2) {
+        for (size_t i = 0; i < n; i += 2 * len) {
+            for (size_t j = 0; j < len; j++) {
+                float* p_u = data + (i + j) * c;
+                float* p_v = data + (i + len + j) * c;
+
+                size_t k = 0;
+                // Process 8 channels at a time
+                for (; k + 8 <= c; k += 8) {
+                    __m256 u_vec = _mm256_loadu_ps(p_u + k);
+                    __m256 v_vec = _mm256_loadu_ps(p_v + k);
+
+                    __m256 sum = _mm256_add_ps(u_vec, v_vec);
+                    __m256 diff = _mm256_sub_ps(u_vec, v_vec);
+
+                    _mm256_storeu_ps(p_u + k, sum);
+                    _mm256_storeu_ps(p_v + k, diff);
+                }
+                // Scalar fallback for remaining channels
+                for (; k < c; ++k) {
+                    float u_val = p_u[k];
+                    float v_val = p_v[k];
+                    p_u[k] = u_val + v_val;
+                    p_v[k] = u_val - v_val;
+                }
+            }
+        }
+    }
+#else
+    // Generic fallback if AVX2 not available (should be guarded by caller ideally)
+     for (size_t len = 1; len < n; len *= 2) {
+        for (size_t i = 0; i < n; i += 2 * len) {
+            for (size_t j = 0; j < len; j++) {
+                float* p_u = data + (i + j) * c;
+                float* p_v = data + (i + len + j) * c;
+                for (size_t k = 0; k < c; ++k) {
+                     float u_val = p_u[k];
+                     float v_val = p_v[k];
+                     p_u[k] = u_val + v_val;
+                     p_v[k] = u_val - v_val;
+                }
+            }
+        }
+    }
+#endif
+}
+
+// Separable Spectral Gating with Broadcast.
+// Multiplies each spatial position's channel vector by a scalar gate value.
+// data: [N * C]
+// gate: [N]
+// n: Spatial size
+// c: Channel size
+inline void spectral_gate_separable_avx2(float* data, const float* gate, size_t n, size_t c) {
+#ifdef DREIDEL_ARCH_AVX2
+    for (size_t i = 0; i < n; ++i) {
+        float g_val = gate[i];
+        __m256 g_vec = _mm256_set1_ps(g_val);
+        float* row = data + i * c;
+
+        size_t k = 0;
+        for (; k + 8 <= c; k += 8) {
+            __m256 x = _mm256_loadu_ps(row + k);
+            x = _mm256_mul_ps(x, g_vec);
+            _mm256_storeu_ps(row + k, x);
+        }
+        for (; k < c; ++k) {
+            row[k] *= g_val;
+        }
+    }
+#else
+    for (size_t i = 0; i < n; ++i) {
+        float g_val = gate[i];
+        float* row = data + i * c;
+        for(size_t k=0; k<c; ++k) row[k] *= g_val;
+    }
+#endif
+}
+
+// 1x1 Group Convolution Helper
+// Performs: Y = W * X + Bias (optional)
+// Optimized for NHWC layout where we process pixels independently (or blocked).
+// input: [NumPixels * Cin]
+// output: [NumPixels * Cout]
+// weights: [Groups, Cout/G, Cin/G] (Flattended)
+// groups: G
+// num_pixels: N*H*W
+// cin: Cin
+// cout: Cout
+inline void group_conv_1x1_avx2(const float* input, float* output, const float* weights, const float* bias,
+                                size_t num_pixels, size_t cin, size_t cout, size_t groups) {
+    size_t cin_g = cin / groups;
+    size_t cout_g = cout / groups;
+    // We assume weights are packed as [Groups, Cout_g, Cin_g]
+
+#ifdef DREIDEL_ARCH_AVX2
+    // Process pixels
+    // Block blocking could be added for cache, but simple pixel loop first.
+    #pragma omp parallel for
+    for (size_t i = 0; i < num_pixels; ++i) {
+        const float* p_in = input + i * cin;
+        float* p_out = output + i * cout;
+
+        for (size_t g = 0; g < groups; ++g) {
+            const float* w_g = weights + g * cout_g * cin_g;
+            const float* in_g = p_in + g * cin_g;
+            float* out_g = p_out + g * cout_g;
+            const float* b_g = bias ? (bias + g * cout_g) : nullptr;
+
+            for (size_t co = 0; co < cout_g; ++co) {
+                __m256 sum_vec = _mm256_setzero_ps();
+                size_t ci = 0;
+                // Dot product
+                for (; ci + 8 <= cin_g; ci += 8) {
+                    __m256 v_in = _mm256_loadu_ps(in_g + ci);
+                    __m256 v_w = _mm256_loadu_ps(w_g + co * cin_g + ci); // Weight layout [Cout_g, Cin_g]
+                    sum_vec = _mm256_fmadd_ps(v_in, v_w, sum_vec);
+                }
+                // Horizontal sum
+                float sum_arr[8];
+                _mm256_storeu_ps(sum_arr, sum_vec);
+                float val = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3] +
+                            sum_arr[4] + sum_arr[5] + sum_arr[6] + sum_arr[7];
+
+                for (; ci < cin_g; ++ci) {
+                    val += in_g[ci] * w_g[co * cin_g + ci];
+                }
+
+                if (b_g) val += b_g[co];
+                out_g[co] = val;
+            }
+        }
+    }
+#else
+    // Fallback
+     #pragma omp parallel for
+    for (size_t i = 0; i < num_pixels; ++i) {
+        const float* p_in = input + i * cin;
+        float* p_out = output + i * cout;
+        for (size_t g = 0; g < groups; ++g) {
+            const float* w_g = weights + g * cout_g * cin_g;
+            const float* in_g = p_in + g * cin_g;
+            float* out_g = p_out + g * cout_g;
+            const float* b_g = bias ? (bias + g * cout_g) : nullptr;
+            for (size_t co = 0; co < cout_g; ++co) {
+                float val = 0;
+                for (size_t ci = 0; ci < cin_g; ++ci) {
+                    val += in_g[ci] * w_g[co * cin_g + ci];
+                }
+                if (b_g) val += b_g[co];
+                out_g[co] = val;
+            }
+        }
+    }
 #endif
 }
 
