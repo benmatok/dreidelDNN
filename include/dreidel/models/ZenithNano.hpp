@@ -21,7 +21,14 @@ public:
     // S4: Conv1x1 64->192.
     // S5: DepthToSpace(8) -> 512x512x3.
 
-    ZenithNano() {
+    ZenithNano() :
+        s1_out_({1, 64, 64, 192}),
+        s2_out_({1, 64, 64, 64}),
+        b1_out_({1, 64, 64, 64}),
+        b2_out_({1, 64, 64, 64}),
+        b3_out_({1, 64, 64, 64}),
+        s4_out_({1, 64, 64, 192})
+    {
         // S2
         compress_ = std::make_unique<layers::OptimizedConv2D<float>>(192, 64, 1, 1, 0);
 
@@ -42,23 +49,23 @@ public:
         int C = 3;
         int block = 8;
 
-        Tensor<float> s1_out({1, (size_t)H/block, (size_t)W/block, (size_t)C*block*block}); // 64x64x192
-        kernels::SpaceToDepth_Shuffle(input.data(), s1_out.data(), H, W, C, block);
+        // Use persistent buffer s1_out_
+        kernels::SpaceToDepth_Shuffle(input.data(), s1_out_.data(), H, W, C, block);
 
         // S2: Compress
-        Tensor<float> s2_out = compress_->forward(s1_out);
+        compress_->forward(s1_out_, s2_out_);
 
         // S3: Zenith Blocks
-        Tensor<float> x = block1_->forward(s2_out);
-        x = block2_->forward(x);
-        x = block3_->forward(x);
+        block1_->forward(s2_out_, b1_out_);
+        block2_->forward(b1_out_, b2_out_);
+        block3_->forward(b2_out_, b3_out_);
 
         // S4: Expand
-        Tensor<float> s4_out = expand_->forward(x);
+        expand_->forward(b3_out_, s4_out_);
 
         // S5: DepthToSpace
         Tensor<float> output({1, (size_t)H, (size_t)W, (size_t)C});
-        kernels::DepthToSpace_Shuffle(s4_out.data(), output.data(), H/block, W/block, C, block); // C here is target output channels (3)
+        kernels::DepthToSpace_Shuffle(s4_out_.data(), output.data(), H/block, W/block, C, block); // C here is target output channels (3)
 
         return output;
     }
@@ -85,6 +92,14 @@ private:
     std::unique_ptr<layers::ZenithNanoBlock> block2_;
     std::unique_ptr<layers::ZenithNanoBlock> block3_;
     std::unique_ptr<layers::OptimizedConv2D<float>> expand_;
+
+    // Persistent buffers
+    Tensor<float> s1_out_;
+    Tensor<float> s2_out_;
+    Tensor<float> b1_out_;
+    Tensor<float> b2_out_;
+    Tensor<float> b3_out_;
+    Tensor<float> s4_out_;
 };
 
 } // namespace models

@@ -74,12 +74,24 @@ public:
         size_t N = shape[0];
         size_t H = shape[1];
         size_t W = shape[2];
-        // size_t C_in = shape[3]; // Assumed equal to in_channels_
 
         size_t H_out = (H + 2 * padding_ - kernel_size_) / stride_ + 1;
         size_t W_out = (W + 2 * padding_ - kernel_size_) / stride_ + 1;
 
         Tensor<T> output({N, H_out, W_out, out_channels_});
+        forward(input, output);
+        return output;
+    }
+
+    void forward(const Tensor<T>& input, Tensor<T>& output) override {
+        auto shape = input.shape();
+        size_t N = shape[0];
+        size_t H = shape[1];
+        size_t W = shape[2];
+
+        size_t H_out = (H + 2 * padding_ - kernel_size_) / stride_ + 1;
+        size_t W_out = (W + 2 * padding_ - kernel_size_) / stride_ + 1;
+
         T* out_ptr = output.data();
         const T* in_ptr = input.data();
         const T* w_ptr = packed_weights_.data();
@@ -145,7 +157,7 @@ public:
                     }
                 }
             }
-            return output;
+            return;
         }
 
         // Optimized Loop (Generic)
@@ -205,7 +217,6 @@ public:
                 }
             }
         }
-        return output;
     }
 
     Tensor<T> backward(const Tensor<T>& grad_output) override { return grad_output; } // Stub

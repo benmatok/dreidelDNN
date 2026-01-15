@@ -17,6 +17,13 @@ public:
     // Forward pass: Input -> Output
     virtual Tensor<T, B> forward(const Tensor<T, B>& input) = 0;
 
+    // Forward pass with pre-allocated output (Zero-Copy optimization)
+    virtual void forward(const Tensor<T, B>& input, Tensor<T, B>& output) {
+        // Default implementation relies on value-return forward
+        // Subclasses should override this for performance
+        output = this->forward(input);
+    }
+
     // Backward pass: Gradient of Output -> Gradient of Input
     // Also computes gradients for weights if applicable
     virtual Tensor<T, B> backward(const Tensor<T, B>& grad_output) = 0;
