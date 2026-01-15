@@ -3,6 +3,7 @@
 #include "Layer.hpp"
 #include "../core/Tensor.hpp"
 #include "../kernels/AvxFwht.hpp"
+#include "../kernels/FusedZenith.hpp"
 #include "../layers/OptimizedConv2D.hpp"
 #include <vector>
 #include <memory>
