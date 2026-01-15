@@ -21,14 +21,49 @@ public:
     // S4: Conv1x1 64->192.
     // S5: DepthToSpace(8) -> 512x512x3.
 
-    ZenithNano() :
-        s1_out_({1, 64, 64, 192}),
-        s2_out_({1, 64, 64, 64}),
-        b1_out_({1, 64, 64, 64}),
-        b2_out_({1, 64, 64, 64}),
-        b3_out_({1, 64, 64, 64}),
-        s4_out_({1, 64, 64, 192})
-    {
+    ZenithNano() {
+        // Implement Arena Allocator to avoid 4K Aliasing
+        size_t sz_s1 = 64 * 64 * 192;
+        size_t sz_s2 = 64 * 64 * 64;
+        size_t sz_b = 64 * 64 * 64;
+        size_t sz_s4 = 64 * 64 * 192;
+
+        // Offset 64 floats (256 bytes) to break 4K alignment
+        // If block sizes are multiples of 4K, adding 256 bytes ensures offsets differ.
+        size_t pad = 64;
+
+        size_t off_s1 = 0;
+        size_t off_s2 = off_s1 + sz_s1 + pad;
+        size_t off_b1 = off_s2 + sz_s2 + pad;
+        size_t off_b2 = off_b1 + sz_b + pad;
+        size_t off_b3 = off_b2 + sz_b + pad;
+        size_t off_s4 = off_b3 + sz_b + pad;
+
+        size_t total = off_s4 + sz_s4 + pad;
+
+        arena_.resize(total);
+        float* base = arena_.data();
+
+        // Initialize Views
+        s1_out_ = Tensor<float>({1, 64, 64, 192}, base + off_s1);
+        s2_out_ = Tensor<float>({1, 64, 64, 64}, base + off_s2);
+        b1_out_ = Tensor<float>({1, 64, 64, 64}, base + off_b1);
+        b2_out_ = Tensor<float>({1, 64, 64, 64}, base + off_b2);
+        b3_out_ = Tensor<float>({1, 64, 64, 64}, base + off_b3);
+        s4_out_ = Tensor<float>({1, 64, 64, 192}, base + off_s4);
+
+        // Check 4K Aliasing (Verify fix)
+        auto check = [](const char* name, const Tensor<float>& t) {
+            size_t addr = (size_t)t.data();
+            std::cout << name << ": " << (void*)addr << " (Offset 4K: " << (addr % 4096) << ")" << std::endl;
+        };
+        check("s1_out", s1_out_);
+        check("s2_out", s2_out_);
+        check("b1_out", b1_out_);
+        check("b2_out", b2_out_);
+        check("b3_out", b3_out_);
+        check("s4_out", s4_out_);
+
         // S2
         compress_ = std::make_unique<layers::OptimizedConv2D<float>>(192, 64, 1, 1, 0);
 
@@ -100,6 +135,9 @@ private:
     Tensor<float> b2_out_;
     Tensor<float> b3_out_;
     Tensor<float> s4_out_;
+
+    // Arena
+    std::vector<float, core::AlignedAllocator<float>> arena_;
 };
 
 } // namespace models

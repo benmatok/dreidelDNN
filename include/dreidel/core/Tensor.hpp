@@ -6,6 +6,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <numeric>
 #include <functional>
@@ -31,36 +32,86 @@ public:
     Tensor() = default;
 
     // Constructor with shape
-    Tensor(const std::vector<size_t>& shape) : shape_(shape) {
-        size_t total_size = 1;
-        for (size_t s : shape) total_size *= s;
-        data_.resize(total_size);
+    Tensor(const std::vector<size_t>& shape) : shape_(shape), owns_memory_(true) {
+        size_ = 1;
+        for (size_t s : shape) size_ *= s;
+        if (posix_memalign((void**)&data_ptr_, 32, size_ * sizeof(T)) != 0) throw std::bad_alloc();
+    }
+
+    // Constructor with shape and external memory (Arena View)
+    Tensor(const std::vector<size_t>& shape, T* data_ptr) : shape_(shape), data_ptr_(data_ptr), owns_memory_(false) {
+        size_ = 1;
+        for (size_t s : shape) size_ *= s;
     }
 
     // Constructor with shape and initial data
-    Tensor(const std::vector<size_t>& shape, const std::vector<T>& data) : shape_(shape) {
-        size_t total_size = 1;
-        for (size_t s : shape) total_size *= s;
-        if (data.size() != total_size) {
+    Tensor(const std::vector<size_t>& shape, const std::vector<T>& data) : shape_(shape), owns_memory_(true) {
+        size_ = 1;
+        for (size_t s : shape) size_ *= s;
+        if (data.size() != size_) {
              throw std::invalid_argument("Data size does not match shape dimensions.");
         }
-        data_.assign(data.begin(), data.end());
+        if (posix_memalign((void**)&data_ptr_, 32, size_ * sizeof(T)) != 0) throw std::bad_alloc();
+        std::memcpy(data_ptr_, data.data(), size_ * sizeof(T));
     }
 
-    virtual ~Tensor() = default;
+    // Copy Constructor (Deep Copy)
+    Tensor(const Tensor& other) : shape_(other.shape_), size_(other.size_), owns_memory_(true) {
+         if (posix_memalign((void**)&data_ptr_, 32, size_ * sizeof(T)) != 0) throw std::bad_alloc();
+         std::memcpy(data_ptr_, other.data_ptr_, size_ * sizeof(T));
+    }
+
+    // Move Constructor
+    Tensor(Tensor&& other) noexcept : shape_(std::move(other.shape_)), data_ptr_(other.data_ptr_), size_(other.size_), owns_memory_(other.owns_memory_) {
+        other.data_ptr_ = nullptr;
+        other.size_ = 0;
+        other.owns_memory_ = false;
+    }
+
+    // Assignment Operator (Copy)
+    Tensor& operator=(const Tensor& other) {
+        if (this != &other) {
+            if (owns_memory_ && data_ptr_) free(data_ptr_);
+            shape_ = other.shape_;
+            size_ = other.size_;
+            owns_memory_ = true;
+            if (posix_memalign((void**)&data_ptr_, 32, size_ * sizeof(T)) != 0) throw std::bad_alloc();
+            std::memcpy(data_ptr_, other.data_ptr_, size_ * sizeof(T));
+        }
+        return *this;
+    }
+
+    // Move Assignment
+    Tensor& operator=(Tensor&& other) noexcept {
+        if (this != &other) {
+            if (owns_memory_ && data_ptr_) free(data_ptr_);
+            shape_ = std::move(other.shape_);
+            data_ptr_ = other.data_ptr_;
+            size_ = other.size_;
+            owns_memory_ = other.owns_memory_;
+            other.data_ptr_ = nullptr;
+            other.size_ = 0;
+            other.owns_memory_ = false;
+        }
+        return *this;
+    }
+
+    virtual ~Tensor() {
+        if (owns_memory_ && data_ptr_) free(data_ptr_);
+    }
 
     // Accessors
     const std::vector<size_t>& shape() const { return shape_; }
-    size_t size() const { return data_.size(); }
-    T* data() { return data_.data(); }
-    const T* data() const { return data_.data(); }
+    size_t size() const { return size_; }
+    T* data() { return data_ptr_; }
+    const T* data() const { return data_ptr_; }
 
     // Element access (simple flat index for now)
-    T& operator[](size_t index) { return data_[index]; }
-    const T& operator[](size_t index) const { return data_[index]; }
+    T& operator[](size_t index) { return data_ptr_[index]; }
+    const T& operator[](size_t index) const { return data_ptr_[index]; }
 
     void fill(T value) {
-        std::fill(data_.begin(), data_.end(), value);
+        if (data_ptr_) std::fill(data_ptr_, data_ptr_ + size_, value);
     }
 
     // Helper for NHWC layout interpretation
@@ -80,7 +131,7 @@ public:
         // static std::mt19937 gen(rd());
         static std::mt19937 gen(42); // Fixed seed to avoid random_device issues and ensure reproducibility
         std::normal_distribution<T> d(mean, stddev);
-        for (auto& v : data_) v = d(gen);
+        for(size_t i=0; i<size_; ++i) data_ptr_[i] = d(gen);
     }
 
     // Element-wise operations
@@ -88,10 +139,10 @@ public:
         // Case 1: Shapes match exactly
         if (this->shape_ == other.shape_) {
             Tensor<T, B> result(this->shape_);
-            size_t n = this->data_.size();
+            size_t n = this->size_;
             DREIDEL_SIMD_LOOP
             for (size_t i = 0; i < n; ++i) {
-                result.data_[i] = this->data_[i] + other.data_[i];
+                result[i] = this->data_ptr_[i] + other.data_ptr_[i];
             }
             return result;
         }
@@ -101,14 +152,14 @@ public:
         if (this->shape_.size() == 2) {
             size_t M = this->shape_[0];
             size_t N = this->shape_[1];
-            size_t other_sz = other.data_.size();
+            size_t other_sz = other.size_;
 
             if (other_sz == N) {
                 Tensor<T, B> result(this->shape_);
                 for (size_t i = 0; i < M; ++i) {
                     DREIDEL_SIMD_LOOP
                     for (size_t j = 0; j < N; ++j) {
-                        result.data_[i * N + j] = this->data_[i * N + j] + other.data_[j];
+                        result[i * N + j] = this->data_ptr_[i * N + j] + other.data_ptr_[j];
                     }
                 }
                 return result;
@@ -118,12 +169,12 @@ public:
         // Case 3: Generalized Broadcasting (Last dimension match)
         if (!this->shape_.empty() && !other.shape_.empty()) {
             size_t last_dim = this->shape_.back();
-            size_t other_sz = other.data_.size();
+            size_t other_sz = other.size_;
 
             // Check if other is broadcastable (size equals last_dim)
             if (other_sz == last_dim) {
                  Tensor<T, B> result(this->shape_);
-                 size_t total_elements = this->data_.size();
+                 size_t total_elements = this->size_;
                  size_t outer_dims = total_elements / last_dim;
 
                  // Parallelize over outer dimensions
@@ -132,7 +183,7 @@ public:
                      size_t offset = i * last_dim;
                      DREIDEL_SIMD_LOOP
                      for (size_t j = 0; j < last_dim; ++j) {
-                         result.data_[offset + j] = this->data_[offset + j] + other.data_[j];
+                         result[offset + j] = this->data_ptr_[offset + j] + other.data_ptr_[j];
                      }
                  }
                  return result;
@@ -146,11 +197,11 @@ public:
         // Bias (1D) + Input (ND).
         if (!this->shape_.empty() && !other.shape_.empty()) {
             size_t last_dim = other.shape_.back();
-            size_t this_sz = this->data_.size();
+            size_t this_sz = this->size_;
 
             if (this_sz == last_dim) {
                  Tensor<T, B> result(other.shape_);
-                 size_t total_elements = other.data_.size();
+                 size_t total_elements = other.size_;
                  size_t outer_dims = total_elements / last_dim;
 
                  DREIDEL_PARALLEL_LOOP
@@ -158,7 +209,7 @@ public:
                      size_t offset = i * last_dim;
                      DREIDEL_SIMD_LOOP
                      for (size_t j = 0; j < last_dim; ++j) {
-                         result.data_[offset + j] = this->data_[j] + other.data_[offset + j];
+                         result[offset + j] = this->data_ptr_[j] + other.data_ptr_[offset + j];
                      }
                  }
                  return result;
@@ -173,11 +224,11 @@ public:
              throw std::invalid_argument("Shapes must match for subtraction.");
         }
         Tensor<T, B> result(this->shape_);
-        size_t n = this->data_.size();
+        size_t n = this->size_;
 
         DREIDEL_SIMD_LOOP
         for (size_t i = 0; i < n; ++i) {
-            result.data_[i] = this->data_[i] - other.data_[i];
+            result[i] = this->data_ptr_[i] - other.data_ptr_[i];
         }
         return result;
     }
@@ -186,10 +237,10 @@ public:
         // Case 1: Shapes match exactly
         if (this->shape_ == other.shape_) {
             Tensor<T, B> result(this->shape_);
-            size_t n = this->data_.size();
+            size_t n = this->size_;
             DREIDEL_SIMD_LOOP
             for (size_t i = 0; i < n; ++i) {
-                result.data_[i] = this->data_[i] * other.data_[i];
+                result[i] = this->data_ptr_[i] * other.data_ptr_[i];
             }
             return result;
         }
@@ -198,12 +249,12 @@ public:
         // If 'other' matches the last dimension of 'this', and 'other' is effectively 1D (or 1xN)
         if (!this->shape_.empty() && !other.shape_.empty()) {
             size_t last_dim = this->shape_.back();
-            size_t other_sz = other.data_.size();
+            size_t other_sz = other.size_;
 
             // Check if other is broadcastable (size equals last_dim)
             if (other_sz == last_dim) {
                  Tensor<T, B> result(this->shape_);
-                 size_t total_elements = this->data_.size();
+                 size_t total_elements = this->size_;
                  size_t outer_dims = total_elements / last_dim;
 
                  // Parallelize over outer dimensions
@@ -212,7 +263,7 @@ public:
                      size_t offset = i * last_dim;
                      DREIDEL_SIMD_LOOP
                      for (size_t j = 0; j < last_dim; ++j) {
-                         result.data_[offset + j] = this->data_[offset + j] * other.data_[j];
+                         result[offset + j] = this->data_ptr_[offset + j] * other.data_ptr_[j];
                      }
                  }
                  return result;
@@ -223,11 +274,11 @@ public:
         // If 'this' is 1D and matches last dim of 'other'
         if (!this->shape_.empty() && !other.shape_.empty()) {
             size_t last_dim = other.shape_.back();
-            size_t this_sz = this->data_.size();
+            size_t this_sz = this->size_;
 
             if (this_sz == last_dim) {
                  Tensor<T, B> result(other.shape_);
-                 size_t total_elements = other.data_.size();
+                 size_t total_elements = other.size_;
                  size_t outer_dims = total_elements / last_dim;
 
                  DREIDEL_PARALLEL_LOOP
@@ -235,7 +286,7 @@ public:
                      size_t offset = i * last_dim;
                      DREIDEL_SIMD_LOOP
                      for (size_t j = 0; j < last_dim; ++j) {
-                         result.data_[offset + j] = other.data_[offset + j] * this->data_[j];
+                         result[offset + j] = other.data_ptr_[offset + j] * this->data_ptr_[j];
                      }
                  }
                  return result;
@@ -248,10 +299,10 @@ public:
     // Scalar Multiplication
     Tensor<T, B> operator*(T scalar) const {
         Tensor<T, B> result(this->shape_);
-        size_t n = this->data_.size();
+        size_t n = this->size_;
         DREIDEL_SIMD_LOOP
         for(size_t i=0; i<n; ++i) {
-            result.data_[i] = this->data_[i] * scalar;
+            result[i] = this->data_ptr_[i] * scalar;
         }
         return result;
     }
@@ -278,13 +329,13 @@ public:
         // and autovectorization hints
         for (size_t i = 0; i < M; ++i) {
             for (size_t k = 0; k < K; ++k) {
-                T a_val = this->data_[i * K + k];
+                T a_val = this->data_ptr_[i * K + k];
 
                 // Hint to compiler that these pointers are restrict-like (no aliasing) ideally,
                 // but just SIMD pragma helps.
                 DREIDEL_SIMD_LOOP
                 for (size_t j = 0; j < N; ++j) {
-                    result.data_[i * N + j] += a_val * other.data_[k * N + j];
+                    result[i * N + j] += a_val * other.data_ptr_[k * N + j];
                 }
             }
         }
@@ -301,7 +352,7 @@ public:
 
         for (size_t i = 0; i < R; ++i) {
             for (size_t j = 0; j < C; ++j) {
-                result.data_[j * R + i] = this->data_[i * C + j];
+                result[j * R + i] = this->data_ptr_[i * C + j];
             }
         }
         return result;
@@ -319,7 +370,7 @@ public:
              result.fill(0);
              for(size_t i=0; i<R; ++i) {
                  for(size_t j=0; j<C; ++j) {
-                     result.data_[j] += this->data_[i*C + j];
+                     result[j] += this->data_ptr_[i*C + j];
                  }
              }
              return result;
@@ -329,7 +380,7 @@ public:
              result.fill(0);
              for(size_t i=0; i<R; ++i) {
                  for(size_t j=0; j<C; ++j) {
-                     result.data_[i * 1 + 0] += this->data_[i*C + j];
+                     result[i * 1 + 0] += this->data_ptr_[i*C + j];
                  }
              }
              return result;
@@ -340,9 +391,9 @@ public:
     template <typename Func>
     Tensor<T, B> apply(Func func) const {
         Tensor<T, B> result(this->shape_);
-        size_t n = this->data_.size();
+        size_t n = this->size_;
         for (size_t i = 0; i < n; ++i) {
-            result.data_[i] = func(this->data_[i]);
+            result[i] = func(this->data_ptr_[i]);
         }
         return result;
     }
@@ -359,7 +410,7 @@ public:
         Tensor<T, B> result(new_shape);
         result.fill(0); // Initialize with zeros
 
-        size_t total_elements = this->data_.size();
+        size_t total_elements = this->size_;
         size_t outer_dims = total_elements / last_dim;
 
         DREIDEL_PARALLEL_LOOP
@@ -367,7 +418,7 @@ public:
             size_t src_offset = i * last_dim;
             size_t dst_offset = i * new_dim;
             for (size_t j = 0; j < last_dim; ++j) {
-                result.data_[dst_offset + j] = this->data_[src_offset + j];
+                result[dst_offset + j] = this->data_ptr_[src_offset + j];
             }
         }
         return result;
@@ -392,7 +443,7 @@ public:
             size_t src_offset = i * last_dim;
             size_t dst_offset = i * new_dim;
             for (size_t j = 0; j < new_dim; ++j) {
-                result.data_[dst_offset + j] = this->data_[src_offset + j];
+                result[dst_offset + j] = this->data_ptr_[src_offset + j];
             }
         }
         return result;
@@ -400,7 +451,9 @@ public:
 
 private:
     std::vector<size_t> shape_;
-    std::vector<T, core::AlignedAllocator<T>> data_;
+    T* data_ptr_ = nullptr;
+    size_t size_ = 0;
+    bool owns_memory_ = true;
 };
 
 } // namespace dreidel
