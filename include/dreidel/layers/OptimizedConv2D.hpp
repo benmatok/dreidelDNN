@@ -223,6 +223,10 @@ public:
     std::vector<Tensor<T>*> parameters() override { return {&packed_weights_, &bias_}; }
     std::string name() const override { return "OptimizedConv2D"; }
 
+    // Accessors for Fused Kernels
+    const Tensor<T>& get_packed_weights() const { return packed_weights_; }
+    const Tensor<T>& get_bias() const { return bias_; }
+
 private:
     size_t in_channels_;
     size_t out_channels_;

@@ -4,11 +4,16 @@
 #include <memory>
 #include "dreidel/models/ZenithNano.hpp"
 #include "dreidel/core/Tensor.hpp"
+#include <immintrin.h>
 
 // Benchmark for Full ZenithNano Model
 // Target: < 3ms per image (512x512 input)
 
 int main() {
+    // Flush Denormals (Hardware Trick)
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+
     std::cout << "Benchmarking Full ZenithNano Model..." << std::endl;
 
     // Initialize Model
