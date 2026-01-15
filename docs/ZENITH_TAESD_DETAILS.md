@@ -34,6 +34,11 @@ We introduce two variants:
 *   **Upsampling**: `OptimizedConv2D` (1x1) $\to$ `PixelShuffle` (Depth-to-Space).
 *   **Advantage**: Eliminates all 3x3 convolutions. Extremely low FLOPs. Shifts bottleneck entirely to memory bandwidth (perfect for ZenithLite optimizations).
 
+### 4. Zenith-TAESD-Spectral (Experimental)
+*   **Structure**: Replaces 1x1 Convolutions with `DeepSpectralLinear` (Permute $\to$ Scale $\to$ FWHT).
+*   **Concept**: Pure spectral processing ($O(C \log C)$) for channel mixing.
+*   **Result**: Slower than 1x1 Conv. The memory overhead of permutations and padding outperforms the asymptotic gain for channel counts $C \le 1024$.
+
 ---
 
 ## Benchmarks (CPU - AVX2)
@@ -43,15 +48,17 @@ We introduce two variants:
 
 | Model | Latency (ms) | Speedup vs Baseline | Est. GFLOPs | Actual GFLOPs/s |
 | :--- | :--- | :--- | :--- | :--- |
-| **Vanilla TAESD** | ~5422 ms | 1.0x | ~48.6 | ~9.0 |
-| **Zenith-TAESD** | ~2051 ms | **2.6x** | ~48.6* | ~23.7 |
-| **Zenith-TAESD-Lite** | **~1293 ms** | **4.2x** | **~17.4** | ~13.5 |
+| **Vanilla TAESD** | ~5644 ms | 1.0x | ~48.6 | ~8.6 |
+| **Zenith-TAESD** | ~2220 ms | **2.5x** | ~48.6* | ~21.9 |
+| **Zenith-TAESD-Lite** | **~1455 ms** | **3.9x** | **~17.4** | ~12.0 |
+| **Zenith-Spectral** | ~11785 ms | 0.5x | - | ~1.5 |
 
 *\*Zenith-TAESD FLOPs are lower in practice due to spectral sparsity, but theoretical max is similar due to 3x3 downsamplers. Lite FLOPs are massively reduced.*
 
 ### Key Observations
-1.  **Massive Speedup**: The `Lite` variant is **4.2x faster** than the baseline. Even the standard `Zenith` variant is **2.6x faster**.
-2.  **Efficiency**: `Zenith-TAESD` achieves higher GFLOPs/s (~23.7) because `OptimizedConv2D` (3x3) is more compute-bound and cache-friendly than the memory-bound 1x1 convs in the Lite model.
+1.  **Massive Speedup**: The `Lite` variant is **~4x faster** than the baseline. Even the standard `Zenith` variant is **2.5x faster**.
+2.  **Efficiency**: `Zenith-TAESD` achieves higher GFLOPs/s (~22) because `OptimizedConv2D` (3x3) is more compute-bound and cache-friendly than the memory-bound 1x1 convs in the Lite model.
+3.  **Spectral Trade-off**: The pure spectral variant (`Zenith-Spectral`) is significantly slower. While asymptotically superior ($C \log C$), the overhead of non-contiguous memory access (Permutations) dominates for $C \in [64, 1024]$, making optimized dense matrix multiplication (1x1 Conv) the better choice for this scale.
 3.  **Data Flow**: In `ZenithLiteBlock`, the computation is split:
     *   **Compute (Conv/Mix)**: ~76% of time.
     *   **Data Flow (Transpose)**: ~24% of time.
