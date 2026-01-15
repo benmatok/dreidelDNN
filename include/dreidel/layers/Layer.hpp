@@ -44,9 +44,12 @@ public:
     virtual std::vector<Tensor<T, B>*> grad_outputs() { return {}; }
 
     // Set training mode (e.g., for Dropout/BatchNorm)
-    virtual void set_training(bool training) { (void)training; }
+    virtual void set_training(bool training) { training_ = training; }
 
     virtual std::string name() const = 0;
+
+protected:
+    bool training_ = true;
 };
 
 } // namespace layers

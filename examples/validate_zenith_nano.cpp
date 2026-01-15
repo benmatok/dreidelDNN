@@ -20,6 +20,9 @@ int main() {
     Tensor<float> input({1, 512, 512, 3});
     input.fill(1.0f);
 
+    // Set inference mode
+    model.set_training(false);
+
     // Warmup
     for(int i=0; i<5; ++i) model.forward(input);
 
@@ -48,10 +51,11 @@ int main() {
 
     std::cout << "Avg Inference: " << elapsed << " ms" << std::endl;
 
-    if (elapsed < 20.0) {
-        std::cout << "Target (<20ms): PASS" << std::endl;
+    double target = 7.0; // 7ms hard limit
+    if (elapsed < target) {
+        std::cout << "Target (<" << target << "ms): PASS" << std::endl;
     } else {
-        std::cout << "Target (<20ms): FAIL" << std::endl;
+        std::cout << "Target (<" << target << "ms): FAIL" << std::endl;
     }
 
     return 0;

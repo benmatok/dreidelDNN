@@ -95,7 +95,9 @@ public:
         // However, standard backprop keeps reference.
         // Let's assume input lifetime is managed by caller or we copy.
         // For simple training loop, copy is safer.
-        saved_input_ = input; // Deep copy
+        if (this->training_) {
+            saved_input_ = input; // Deep copy
+        }
 
         auto shape = input.shape();
         size_t N = shape[0];
@@ -113,63 +115,155 @@ public:
         // Optimized 1x1 Path
         if (kernel_size_ == 1 && stride_ == 1 && padding_ == 0 && groups_ == 1) {
             size_t total_pixels = N * H * W;
-            const size_t BLOCK = 32;
 
+#ifdef __AVX2__
+            // Block 4 pixels, 16 output channels
+            const size_t PIXEL_BLOCK = 4;
+            const size_t OUT_BLOCK = 16;
+
+            // Loop over pixels in chunks of 4
+            #pragma omp parallel for
+            for(size_t p_idx = 0; p_idx < total_pixels; p_idx += PIXEL_BLOCK) {
+                // Determine number of pixels in this chunk (normally 4, except last)
+                size_t num_pixels = std::min(PIXEL_BLOCK, total_pixels - p_idx);
+
+                if (num_pixels == 4) {
+                    // Optimized Path for full block of 4 pixels
+                    T* out_p0 = out_ptr + (p_idx + 0) * out_channels_;
+                    T* out_p1 = out_ptr + (p_idx + 1) * out_channels_;
+                    T* out_p2 = out_ptr + (p_idx + 2) * out_channels_;
+                    T* out_p3 = out_ptr + (p_idx + 3) * out_channels_;
+
+                    const T* in_p0 = in_ptr + (p_idx + 0) * in_channels_;
+                    const T* in_p1 = in_ptr + (p_idx + 1) * in_channels_;
+                    const T* in_p2 = in_ptr + (p_idx + 2) * in_channels_;
+                    const T* in_p3 = in_ptr + (p_idx + 3) * in_channels_;
+
+                    // Loop over Output Channels in blocks of 16
+                    for(size_t ob = 0; ob < out_channels_; ob += OUT_BLOCK) {
+                        // Check if we have full 16 channels (most likely yes for 64/192)
+                        if (ob + OUT_BLOCK <= out_channels_) {
+                            // 16 channels = 2 AVX registers per pixel.
+                            // 4 pixels * 2 regs = 8 registers.
+
+                            // Initialize with Bias
+                            __m256 b0 = _mm256_loadu_ps(b_ptr + ob + 0);
+                            __m256 b1 = _mm256_loadu_ps(b_ptr + ob + 8);
+
+                            // Accs
+                            __m256 acc00 = b0; __m256 acc01 = b1; // P0
+                            __m256 acc10 = b0; __m256 acc11 = b1; // P1
+                            __m256 acc20 = b0; __m256 acc21 = b1; // P2
+                            __m256 acc30 = b0; __m256 acc31 = b1; // P3
+
+                            const T* w_base_ob = w_ptr + ob; // Start of weights for this OB block
+
+                            // Loop Input Channels
+                            for(size_t i = 0; i < in_channels_; ++i) {
+                                // Load Inputs (Broadcast)
+                                __m256 vin0 = _mm256_set1_ps(in_p0[i]);
+                                __m256 vin1 = _mm256_set1_ps(in_p1[i]);
+                                __m256 vin2 = _mm256_set1_ps(in_p2[i]);
+                                __m256 vin3 = _mm256_set1_ps(in_p3[i]);
+
+                                // Load Weights
+                                // Layout: [Cin, Cout]. Stride is Cout.
+                                // w_ptr + i*out_channels + ob.
+                                const T* w_curr = w_base_ob + i * out_channels_;
+                                __m256 w0 = _mm256_loadu_ps(w_curr + 0);
+                                __m256 w1 = _mm256_loadu_ps(w_curr + 8);
+
+                                // FMA
+                                acc00 = _mm256_fmadd_ps(vin0, w0, acc00);
+                                acc01 = _mm256_fmadd_ps(vin0, w1, acc01);
+
+                                acc10 = _mm256_fmadd_ps(vin1, w0, acc10);
+                                acc11 = _mm256_fmadd_ps(vin1, w1, acc11);
+
+                                acc20 = _mm256_fmadd_ps(vin2, w0, acc20);
+                                acc21 = _mm256_fmadd_ps(vin2, w1, acc21);
+
+                                acc30 = _mm256_fmadd_ps(vin3, w0, acc30);
+                                acc31 = _mm256_fmadd_ps(vin3, w1, acc31);
+                            }
+
+                            // Store
+                            _mm256_storeu_ps(out_p0 + ob + 0, acc00);
+                            _mm256_storeu_ps(out_p0 + ob + 8, acc01);
+
+                            _mm256_storeu_ps(out_p1 + ob + 0, acc10);
+                            _mm256_storeu_ps(out_p1 + ob + 8, acc11);
+
+                            _mm256_storeu_ps(out_p2 + ob + 0, acc20);
+                            _mm256_storeu_ps(out_p2 + ob + 8, acc21);
+
+                            _mm256_storeu_ps(out_p3 + ob + 0, acc30);
+                            _mm256_storeu_ps(out_p3 + ob + 8, acc31);
+                        } else {
+                            // Tail Output Channels (Generic scalar fallback for remainder)
+                            for(size_t k=ob; k<out_channels_; ++k) {
+                                float val0 = b_ptr[k];
+                                float val1 = b_ptr[k];
+                                float val2 = b_ptr[k];
+                                float val3 = b_ptr[k];
+                                for(size_t i=0; i<in_channels_; ++i) {
+                                    float w = w_ptr[i * out_channels_ + k];
+                                    val0 += in_p0[i] * w;
+                                    val1 += in_p1[i] * w;
+                                    val2 += in_p2[i] * w;
+                                    val3 += in_p3[i] * w;
+                                }
+                                out_p0[k] = val0;
+                                out_p1[k] = val1;
+                                out_p2[k] = val2;
+                                out_p3[k] = val3;
+                            }
+                        }
+                    }
+                } else {
+                    // Tail Pixels (1, 2, or 3)
+                    for(size_t p=0; p<num_pixels; ++p) {
+                         T* pixel_out = out_ptr + (p_idx + p) * out_channels_;
+                         const T* pixel_in = in_ptr + (p_idx + p) * in_channels_;
+
+                         // Standard AVX Loop (Single Pixel)
+                         for(size_t ob=0; ob<out_channels_; ob+=8) {
+                             if (ob+8 <= out_channels_) {
+                                 __m256 acc = _mm256_loadu_ps(b_ptr + ob);
+                                 for(size_t i=0; i<in_channels_; ++i) {
+                                     __m256 v_val = _mm256_set1_ps(pixel_in[i]);
+                                     __m256 v_w = _mm256_loadu_ps(w_ptr + i*out_channels_ + ob);
+                                     acc = _mm256_fmadd_ps(v_val, v_w, acc);
+                                 }
+                                 _mm256_storeu_ps(pixel_out + ob, acc);
+                             } else {
+                                 for(size_t k=ob; k<out_channels_; ++k) {
+                                     pixel_out[k] = b_ptr[k];
+                                     for(size_t i=0; i<in_channels_; ++i) {
+                                         pixel_out[k] += pixel_in[i] * w_ptr[i*out_channels_ + k];
+                                     }
+                                 }
+                             }
+                         }
+                    }
+                }
+            }
+#else
+            // Fallback Generic
             #pragma omp parallel for
             for(size_t idx = 0; idx < total_pixels; ++idx) {
                 T* pixel_out = out_ptr + idx * out_channels_;
                 const T* pixel_in = in_ptr + idx * in_channels_;
-                const T* w_base = w_ptr;
 
-                size_t ob = 0;
-
-                // Main Block Loop (32 channels at a time)
-                for(; ob + BLOCK <= out_channels_; ob += BLOCK) {
-#ifdef __AVX2__
-                    // Init with Bias
-                    __m256 acc0 = _mm256_loadu_ps(b_ptr + ob + 0);
-                    __m256 acc1 = _mm256_loadu_ps(b_ptr + ob + 8);
-                    __m256 acc2 = _mm256_loadu_ps(b_ptr + ob + 16);
-                    __m256 acc3 = _mm256_loadu_ps(b_ptr + ob + 24);
-
+                for(size_t o=0; o<out_channels_; ++o) {
+                    float sum = b_ptr[o];
                     for(size_t i=0; i<in_channels_; ++i) {
-                        T val = pixel_in[i];
-                        __m256 v_val = _mm256_set1_ps(val);
-                        const T* w_i = w_base + i * out_channels_ + ob;
-
-                        acc0 = _mm256_fmadd_ps(v_val, _mm256_loadu_ps(w_i+0), acc0);
-                        acc1 = _mm256_fmadd_ps(v_val, _mm256_loadu_ps(w_i+8), acc1);
-                        acc2 = _mm256_fmadd_ps(v_val, _mm256_loadu_ps(w_i+16), acc2);
-                        acc3 = _mm256_fmadd_ps(v_val, _mm256_loadu_ps(w_i+24), acc3);
+                        sum += pixel_in[i] * w_ptr[i*out_channels_ + o];
                     }
-
-                    _mm256_storeu_ps(pixel_out + ob + 0, acc0);
-                    _mm256_storeu_ps(pixel_out + ob + 8, acc1);
-                    _mm256_storeu_ps(pixel_out + ob + 16, acc2);
-                    _mm256_storeu_ps(pixel_out + ob + 24, acc3);
-#else
-                    // Fallback Scalar for Block
-                    for(size_t k=0; k<BLOCK; ++k) pixel_out[ob+k] = b_ptr[ob+k];
-                    for(size_t i=0; i<in_channels_; ++i) {
-                        T val = pixel_in[i];
-                        const T* w_i = w_base + i * out_channels_ + ob;
-                        for(size_t k=0; k<BLOCK; ++k) pixel_out[ob+k] += val * w_i[k];
-                    }
-#endif
-                }
-
-                // Tail Loop
-                if (ob < out_channels_) {
-                    for(size_t o = ob; o < out_channels_; ++o) pixel_out[o] = b_ptr[o];
-                    for(size_t i=0; i<in_channels_; ++i) {
-                        T val = pixel_in[i];
-                        const T* w_i = w_base + i * out_channels_;
-                        for(size_t o = ob; o < out_channels_; ++o) {
-                            pixel_out[o] += val * w_i[o];
-                        }
-                    }
+                    pixel_out[o] = sum;
                 }
             }
+#endif
             return;
         }
 
