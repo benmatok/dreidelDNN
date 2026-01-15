@@ -105,7 +105,41 @@ public:
         return output;
     }
 
-    Tensor<float> backward(const Tensor<float>& grad_output) override { return grad_output; }
+    Tensor<float> backward(const Tensor<float>& grad_output) override {
+        // S5 Backward: DepthToSpace_Shuffle Backward is SpaceToDepth_Shuffle
+        // Output Grad: [N, H, W, 3] -> S4 Grad: [N, H/8, W/8, 192]
+        // But s4_out_ is persistent, we need a gradient buffer for it?
+        // Ideally we pass gradients back up.
+        // Or we use persistent gradient buffers in arena?
+        // For now, allocate on stack/heap (slow but works).
+
+        int H = 512;
+        int W = 512;
+        int C = 3;
+        int block = 8;
+
+        Tensor<float> d_s4_out({1, 64, 64, 192});
+        kernels::SpaceToDepth_Shuffle(grad_output.data(), d_s4_out.data(), H, W, C, block);
+
+        // S4 Backward: Expand (Conv1x1)
+        // d_b3_out = expand_back(d_s4_out)
+        // Note: OptimizedConv2D backward returns grad_input.
+        Tensor<float> d_b3_out = expand_->backward(d_s4_out);
+
+        // S3 Backward: Blocks
+        Tensor<float> d_b2_out = block3_->backward(d_b3_out);
+        Tensor<float> d_b1_out = block2_->backward(d_b2_out);
+        Tensor<float> d_s2_out = block1_->backward(d_b1_out);
+
+        // S2 Backward: Compress
+        Tensor<float> d_s1_out = compress_->backward(d_s2_out);
+
+        // S1 Backward: SpaceToDepth Backward is DepthToSpace
+        Tensor<float> grad_input({1, (size_t)H, (size_t)W, (size_t)C});
+        kernels::DepthToSpace_Shuffle(d_s1_out.data(), grad_input.data(), H/block, W/block, C, block);
+
+        return grad_input;
+    }
 
     std::vector<Tensor<float>*> parameters() override {
         std::vector<Tensor<float>*> p;
@@ -117,6 +151,18 @@ public:
         add(block1_); add(block2_); add(block3_);
         add(expand_);
         return p;
+    }
+
+    std::vector<Tensor<float>*> gradients() override {
+        std::vector<Tensor<float>*> g;
+        auto add = [&](auto& l) {
+            auto gg = l->gradients();
+            g.insert(g.end(), gg.begin(), gg.end());
+        };
+        add(compress_);
+        add(block1_); add(block2_); add(block3_);
+        add(expand_);
+        return g;
     }
 
     std::string name() const override { return "ZenithNano"; }
