@@ -85,7 +85,70 @@ public:
         const T* w_ptr = packed_weights_.data();
         const T* b_ptr = bias_.data();
 
-        // Optimized Loop
+        // Optimized 1x1 Path
+        if (kernel_size_ == 1 && stride_ == 1 && padding_ == 0 && groups_ == 1) {
+            size_t total_pixels = N * H * W;
+            const size_t BLOCK = 32;
+
+            #pragma omp parallel for
+            for(size_t idx = 0; idx < total_pixels; ++idx) {
+                T* pixel_out = out_ptr + idx * out_channels_;
+                const T* pixel_in = in_ptr + idx * in_channels_;
+                const T* w_base = w_ptr;
+
+                size_t ob = 0;
+
+                // Main Block Loop (32 channels at a time)
+                for(; ob + BLOCK <= out_channels_; ob += BLOCK) {
+#ifdef __AVX2__
+                    // Init with Bias
+                    __m256 acc0 = _mm256_loadu_ps(b_ptr + ob + 0);
+                    __m256 acc1 = _mm256_loadu_ps(b_ptr + ob + 8);
+                    __m256 acc2 = _mm256_loadu_ps(b_ptr + ob + 16);
+                    __m256 acc3 = _mm256_loadu_ps(b_ptr + ob + 24);
+
+                    for(size_t i=0; i<in_channels_; ++i) {
+                        T val = pixel_in[i];
+                        __m256 v_val = _mm256_set1_ps(val);
+                        const T* w_i = w_base + i * out_channels_ + ob;
+
+                        acc0 = _mm256_fmadd_ps(v_val, _mm256_loadu_ps(w_i+0), acc0);
+                        acc1 = _mm256_fmadd_ps(v_val, _mm256_loadu_ps(w_i+8), acc1);
+                        acc2 = _mm256_fmadd_ps(v_val, _mm256_loadu_ps(w_i+16), acc2);
+                        acc3 = _mm256_fmadd_ps(v_val, _mm256_loadu_ps(w_i+24), acc3);
+                    }
+
+                    _mm256_storeu_ps(pixel_out + ob + 0, acc0);
+                    _mm256_storeu_ps(pixel_out + ob + 8, acc1);
+                    _mm256_storeu_ps(pixel_out + ob + 16, acc2);
+                    _mm256_storeu_ps(pixel_out + ob + 24, acc3);
+#else
+                    // Fallback Scalar for Block
+                    for(size_t k=0; k<BLOCK; ++k) pixel_out[ob+k] = b_ptr[ob+k];
+                    for(size_t i=0; i<in_channels_; ++i) {
+                        T val = pixel_in[i];
+                        const T* w_i = w_base + i * out_channels_ + ob;
+                        for(size_t k=0; k<BLOCK; ++k) pixel_out[ob+k] += val * w_i[k];
+                    }
+#endif
+                }
+
+                // Tail Loop
+                if (ob < out_channels_) {
+                    for(size_t o = ob; o < out_channels_; ++o) pixel_out[o] = b_ptr[o];
+                    for(size_t i=0; i<in_channels_; ++i) {
+                        T val = pixel_in[i];
+                        const T* w_i = w_base + i * out_channels_;
+                        for(size_t o = ob; o < out_channels_; ++o) {
+                            pixel_out[o] += val * w_i[o];
+                        }
+                    }
+                }
+            }
+            return output;
+        }
+
+        // Optimized Loop (Generic)
         // Vectorize over Out Channels
 
         #pragma omp parallel for collapse(3)

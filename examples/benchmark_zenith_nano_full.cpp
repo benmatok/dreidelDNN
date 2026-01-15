@@ -1,0 +1,57 @@
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <memory>
+#include "dreidel/models/ZenithNano.hpp"
+#include "dreidel/core/Tensor.hpp"
+
+// Benchmark for Full ZenithNano Model
+// Target: < 3ms per image (512x512 input)
+
+int main() {
+    std::cout << "Benchmarking Full ZenithNano Model..." << std::endl;
+
+    // Initialize Model
+    dreidel::models::ZenithNano model;
+
+    // Create Input [1, 512, 512, 3]
+    dreidel::Tensor<float> input({1, 512, 512, 3});
+    input.fill(0.5f);
+
+    // Warmup
+    std::cout << "Warming up..." << std::endl;
+    for(int i=0; i<5; ++i) {
+        auto out = model.forward(input);
+        // Prevent DCE
+        volatile float x = out.data()[0];
+        (void)x;
+    }
+
+    // Benchmark
+    int iterations = 100;
+    std::cout << "Running " << iterations << " iterations..." << std::endl;
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for(int i=0; i<iterations; ++i) {
+        auto out = model.forward(input);
+        volatile float x = out.data()[0];
+        (void)x;
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed = end - start;
+    double avg_ms = elapsed.count() / iterations;
+
+    std::cout << "Average Latency: " << avg_ms << " ms/image" << std::endl;
+
+    // Check 3ms target
+    if (avg_ms <= 3.0) {
+        std::cout << "[SUCCESS] Target Met (< 3ms)" << std::endl;
+    } else {
+        std::cout << "[FAILURE] Target Not Met (> 3ms)" << std::endl;
+        std::cout << "Gap: " << avg_ms - 3.0 << " ms" << std::endl;
+    }
+
+    return 0;
+}
