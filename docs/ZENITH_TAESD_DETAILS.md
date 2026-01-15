@@ -62,3 +62,47 @@ We introduce two variants:
 *   **OptimizedConv2D**: Uses a custom weight layout `[K, K, In, Out]` to enable vectorization over output channels, bypassing the inefficient `[Out, In, K, K]` standard stride.
 *   **Persistent Scratchpads**: Intermediate buffers in `ZenithLiteBlock` are allocated once and reused, preventing memory fragmentation and allocation overhead during inference.
 *   **Separable Gating**: Spectral mixing is performed independently on Rows and Columns, reducing complexity from $O(N^2)$ to $O(N)$ (linear).
+
+## Layer Specifications
+
+### 1. Zenith-TAESD (Standard)
+
+| Stage | Layer Type | Input Res | Input Channels | Output Channels | Kernel | Stride |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Encoder** | | | | | | |
+| Stem | Conv2D | 512x512 | 3 | 64 | 3x3 | 1 |
+| Block 1 | ZenithLite | 512x512 | 64 | 64 | - | - |
+| Down 1 | Conv2D | 512x512 | 64 | 128 | 3x3 | 2 |
+| Block 2 | ZenithLite | 256x256 | 128 | 128 | - | - |
+| Down 2 | Conv2D | 256x256 | 128 | 256 | 3x3 | 2 |
+| Block 3 | ZenithLite | 128x128 | 256 | 256 | - | - |
+| Out | Conv2D | 128x128 | 256 | 4 | 3x3 | 2 |
+| **Decoder** | | | | | | |
+| In | Conv2D | 64x64 | 4 | 256 | 1x1 | 1 |
+| Block 1 | ZenithLite | 64x64 | 256 | 256 | - | - |
+| Up 1 | Upscale + Conv | 64x64 | 256 | 128 | 3x3 | 1 |
+| Block 2 | ZenithLite | 128x128 | 128 | 128 | - | - |
+| Up 2 | Upscale + Conv | 128x128 | 128 | 64 | 3x3 | 1 |
+| Block 3 | ZenithLite | 256x256 | 64 | 64 | - | - |
+| Out | Upscale + Conv | 256x256 | 64 | 3 | 3x3 | 1 |
+
+### 2. Zenith-TAESD-Lite (1x1 Only)
+
+| Stage | Layer Type | Input Res | Input Channels | Output Channels | Kernel | Stride |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Encoder** | | | | | | |
+| Stem | Conv2D | 512x512 | 3 | 64 | 1x1 | 1 |
+| Block 1 | ZenithLite | 512x512 | 64 | 64 | - | - |
+| Down 1 | Unshuffle + Conv | 512x512 | 64 | 128 | 1x1 | 1 |
+| Block 2 | ZenithLite | 256x256 | 128 | 128 | - | - |
+| Down 2 | Unshuffle + Conv | 256x256 | 128 | 256 | 1x1 | 1 |
+| Block 3 | ZenithLite | 128x128 | 256 | 256 | - | - |
+| Out | Unshuffle + Conv | 128x128 | 256 | 4 | 1x1 | 1 |
+| **Decoder** | | | | | | |
+| In | Conv + Shuffle | 64x64 | 4 | 256 | 1x1 | 1 |
+| Block 1 | ZenithLite | 64x64 | 256 | 256 | - | - |
+| Up 1 | Conv + Shuffle | 64x64 | 256 | 128 | 1x1 | 1 |
+| Block 2 | ZenithLite | 128x128 | 128 | 128 | - | - |
+| Up 2 | Conv + Shuffle | 128x128 | 128 | 64 | 1x1 | 1 |
+| Block 3 | ZenithLite | 256x256 | 64 | 64 | - | - |
+| Out | Conv2D | 512x512 | 64 | 3 | 1x1 | 1 |

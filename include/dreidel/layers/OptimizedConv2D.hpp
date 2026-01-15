@@ -9,6 +9,7 @@
 #include <immintrin.h>
 #include <iostream>
 #include <chrono>
+#include <cstdlib>
 
 namespace dreidel {
 namespace layers {
