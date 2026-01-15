@@ -2,6 +2,7 @@
 #include <vector>
 #include <chrono>
 #include <cmath>
+#include <omp.h>
 #include "dreidel/models/ZenithNano.hpp"
 #include "dreidel/core/Tensor.hpp"
 
@@ -9,6 +10,15 @@ using namespace dreidel;
 
 int main() {
     std::cout << "=== Zenith-Nano Validation ===\n" << std::endl;
+
+    #ifdef _OPENMP
+    int max_threads = omp_get_max_threads();
+    std::cout << "OpenMP Threads: " << max_threads << std::endl;
+    if (max_threads < 2) {
+        std::cout << "WARNING: Running with 1 thread. Expect slow performance." << std::endl;
+        std::cout << "Set OMP_NUM_THREADS=4 for better results." << std::endl;
+    }
+    #endif
 
     models::ZenithNano model;
 
