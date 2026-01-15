@@ -21,7 +21,8 @@ public:
           gate_h_({(size_t)res_w}),
           gate_w_({(size_t)res_h}),
           proj_conv_(channels, channels, 1, 1, 0), // 1x1 Conv
-          scratch_buffer_({1, (size_t)res_h, (size_t)res_w, (size_t)channels})
+          scratch_buffer_({1, (size_t)res_h, (size_t)res_w, (size_t)channels}),
+          scratch_x_({1, (size_t)res_h, (size_t)res_w, (size_t)channels})
     {
         // Initialize gates to 1.0 (Identity)
         gate_h_.fill(1.0f);
@@ -29,13 +30,20 @@ public:
     }
 
     Tensor<float> forward(const Tensor<float>& input) override {
-        // Input: [1, H, W, C]
-        // We modify input in place? No, Layer::forward usually returns new tensor.
-        // But for efficiency ("Zero-Copy"), we might want in-place.
-        // Let's copy first, then modify 'x'.
-        Tensor<float> x = input; // Copy
+        // Fallback to alloc version
+        Tensor<float> output({1, (size_t)h_, (size_t)w_, (size_t)channels_});
+        forward(input, output);
+        return output;
+    }
 
-        float* x_ptr = x.data();
+    void forward(const Tensor<float>& input, Tensor<float>& output) override {
+        // Zero-Copy Path
+        // 1. Copy Input to Scratch X (State)
+        const float* in_ptr = input.data();
+        float* x_ptr = scratch_x_.data();
+        size_t size = scratch_x_.size();
+        std::memcpy(x_ptr, in_ptr, size * sizeof(float));
+
         float* buf_ptr = scratch_buffer_.data();
 
         // 1. Horizontal Spectral Mix (Row-wise)
@@ -46,7 +54,6 @@ public:
 
         // Scale by 1/W
         float scale_w = 1.0f / w_;
-        size_t size = x.size();
         #pragma omp parallel for
         for(size_t i=0; i<size; ++i) x_ptr[i] *= scale_w;
 
@@ -70,30 +77,17 @@ public:
         kernels::Transpose_Block_64x64(buf_ptr, x_ptr, w_, h_, channels_);
 
         // 3. Channel Mixing (Standard GEMM) -> Residual
-        // Conv1x1(x) + input
-        // OptimizedConv2D returns new tensor.
-        Tensor<float> proj = proj_conv_.forward(x);
+        // Conv1x1(x) -> Output
+        proj_conv_.forward(scratch_x_, output);
 
-        // Residual connection: input + proj
-        // 'input' is the original input. 'proj' is the result of spectral+conv path.
-        // Wait. "Input + Output".
-        // The spectral path modifies 'x'.
-        // Is the residual over the whole block?
-        // Standard ResNet: y = Conv(x) + x.
-        // ZenithBlock Plan: "Conv1x1_AddResidual(x, proj_weight, proj_bias)".
-        // It seems the Conv1x1 is applied to the output of spectral mixing?
-        // And then added to 'x' (which 'x'? The input to the block?).
-        // Yes, "Residual Add: Input + Output" in ZenithLite.
-
+        // Residual connection: output += input
+        float* out_ptr = output.data();
         const float* in_orig = input.data();
-        float* p_ptr = proj.data();
 
         #pragma omp parallel for
         for(size_t i=0; i<size; ++i) {
-            p_ptr[i] += in_orig[i];
+            out_ptr[i] += in_orig[i];
         }
-
-        return proj;
     }
 
     Tensor<float> backward(const Tensor<float>& grad_output) override { return grad_output; }
@@ -117,8 +111,9 @@ private:
 
     OptimizedConv2D<float> proj_conv_;
 
-    // Persistent scratch buffer
+    // Persistent scratch buffers
     Tensor<float> scratch_buffer_;
+    Tensor<float> scratch_x_;
 };
 
 } // namespace layers
