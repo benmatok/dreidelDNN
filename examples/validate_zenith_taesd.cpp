@@ -181,8 +181,6 @@ int main() {
 
     // --- Zenith Benchmark ---
     std::cout << "\nBenchmarking Zenith-TAESD (512x512, " << iterations << " iters)..." << std::endl;
-    layers::ZenithLiteBlock<float>::reset_timers();
-    layers::OptimizedConv2D<float>::reset_timers();
 
     auto start_z = std::chrono::high_resolution_clock::now();
     for(int i=0; i<iterations; ++i) {
@@ -192,14 +190,9 @@ int main() {
     double elapsed_z = std::chrono::duration<double, std::milli>(end_z - start_z).count() / iterations;
 
     std::cout << "Zenith Avg Latency: " << elapsed_z << " ms" << std::endl;
-    layers::ZenithLiteBlock<float>::print_timers();
-    std::cout << "Zenith Conv2D Total: ";
-    layers::OptimizedConv2D<float>::print_timers();
 
     // --- Zenith Lite Benchmark ---
     std::cout << "\nBenchmarking Zenith-TAESD-Lite (512x512, " << iterations << " iters)..." << std::endl;
-    layers::ZenithLiteBlock<float>::reset_timers();
-    layers::OptimizedConv2D<float>::reset_timers();
 
     auto start_l = std::chrono::high_resolution_clock::now();
     for(int i=0; i<iterations; ++i) {
@@ -209,12 +202,9 @@ int main() {
     double elapsed_l = std::chrono::duration<double, std::milli>(end_l - start_l).count() / iterations;
 
     std::cout << "Zenith-Lite Avg Latency: " << elapsed_l << " ms" << std::endl;
-    std::cout << "Zenith-Lite Conv2D Total: ";
-    layers::OptimizedConv2D<float>::print_timers();
 
     // --- Zenith Spectral Benchmark ---
     std::cout << "\nBenchmarking Zenith-TAESD-Spectral (512x512, " << iterations << " iters)..." << std::endl;
-    layers::ZenithLiteBlock<float>::reset_timers();
 
     auto start_s = std::chrono::high_resolution_clock::now();
     for(int i=0; i<iterations; ++i) {
@@ -227,7 +217,6 @@ int main() {
 
     // --- Baseline Benchmark ---
     std::cout << "\nBenchmarking Standard-TAESD (512x512, " << iterations << " iters)..." << std::endl;
-    layers::OptimizedConv2D<float>::reset_timers();
 
     auto start_b = std::chrono::high_resolution_clock::now();
     for(int i=0; i<iterations; ++i) {
@@ -237,8 +226,6 @@ int main() {
     double elapsed_b = std::chrono::duration<double, std::milli>(end_b - start_b).count() / iterations;
 
     std::cout << "Baseline Avg Latency: " << elapsed_b << " ms" << std::endl;
-    std::cout << "Baseline Conv2D Total: ";
-    layers::OptimizedConv2D<float>::print_timers();
 
     std::cout << "\n=== Comparison ===" << std::endl;
     std::cout << "Speedup (Zenith vs Baseline): " << elapsed_b / elapsed_z << "x" << std::endl;

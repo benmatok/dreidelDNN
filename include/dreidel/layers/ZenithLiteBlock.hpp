@@ -23,42 +23,6 @@ namespace layers {
 template <typename T>
 class ZenithLiteBlock : public Layer<T> {
 public:
-    // Timers
-    static inline double time_compress = 0;
-    static inline double time_row_mix = 0;
-    static inline double time_col_transpose = 0;
-    static inline double time_col_mix = 0;
-    static inline double time_col_transpose_back = 0;
-    static inline double time_expand = 0;
-    static inline double time_residual = 0;
-    static inline long long count_ops = 0;
-
-    static void reset_timers() {
-        time_compress = 0;
-        time_row_mix = 0;
-        time_col_transpose = 0;
-        time_col_mix = 0;
-        time_col_transpose_back = 0;
-        time_expand = 0;
-        time_residual = 0;
-        count_ops = 0;
-    }
-
-    static void print_timers() {
-        std::cout << "ZenithLiteBlock Timers (ms):" << std::endl;
-        std::cout << "  Compress:    " << time_compress * 1000.0 << std::endl;
-        std::cout << "  Row Mix:     " << time_row_mix * 1000.0 << std::endl;
-        std::cout << "  Col Transp:  " << time_col_transpose * 1000.0 << std::endl;
-        std::cout << "  Col Mix:     " << time_col_mix * 1000.0 << std::endl;
-        std::cout << "  Col TrBack:  " << time_col_transpose_back * 1000.0 << std::endl;
-        std::cout << "  Expand:      " << time_expand * 1000.0 << std::endl;
-        std::cout << "  Residual:    " << time_residual * 1000.0 << std::endl;
-        double total = time_compress + time_row_mix + time_col_transpose + time_col_mix + time_col_transpose_back + time_expand + time_residual;
-        std::cout << "  TOTAL:       " << total * 1000.0 << std::endl;
-        std::cout << "  Data Flow (Transp/Res): " << (time_col_transpose + time_col_transpose_back + time_residual) * 1000.0 << " (" << (time_col_transpose + time_col_transpose_back + time_residual)/total*100.0 << "%)" << std::endl;
-        std::cout << "  Compute (Conv/Mix):     " << (time_compress + time_row_mix + time_col_mix + time_expand) * 1000.0 << " (" << (time_compress + time_row_mix + time_col_mix + time_expand)/total*100.0 << "%)" << std::endl;
-    }
-
     ZenithLiteBlock(size_t channels, size_t height, size_t width,
                     size_t compress_factor = 4, bool use_residual = true)
         : channels_(channels), height_(height), width_(width),
@@ -124,8 +88,6 @@ public:
             compressed_buf_.resize(required_size);
         }
 
-        auto t0 = std::chrono::high_resolution_clock::now();
-
         // Call Optimized Group Conv
         hal::x86::group_conv_1x1_avx2(
             input.data(),
@@ -137,8 +99,6 @@ public:
             inner_channels_,
             groups_
         );
-        auto t1 = std::chrono::high_resolution_clock::now();
-        time_compress += std::chrono::duration<double>(t1 - t0).count();
 
         // Phase 2: Row Spectral Mixer (Horizontal)
         // Operate on W dimension.
@@ -177,8 +137,6 @@ public:
                 hal::x86::fwht_1d_vectorized_avx2(row_ptr, width_, inner_channels_);
             }
         }
-        auto t2 = std::chrono::high_resolution_clock::now();
-        time_row_mix += std::chrono::duration<double>(t2 - t1).count();
 
         // Phase 3: Col Spectral Mixer (Vertical)
         // Lazy Resize Transpose Buffer
@@ -207,8 +165,6 @@ public:
                 }
             }
         }
-        auto t3 = std::chrono::high_resolution_clock::now();
-        time_col_transpose += std::chrono::duration<double>(t3 - t2).count();
 
         // Now apply Col Mixer (on H dimension, which is now dense-spatial)
         std::vector<T> scaled_gate_v(height_);
@@ -225,8 +181,6 @@ public:
                  hal::x86::fwht_1d_vectorized_avx2(col_ptr, height_, inner_channels_);
             }
         }
-        auto t4 = std::chrono::high_resolution_clock::now();
-        time_col_mix += std::chrono::duration<double>(t4 - t3).count();
 
         // Transpose back: [N, W, H, C] -> [N, H, W, C]
         #pragma omp parallel for collapse(2)
@@ -246,8 +200,6 @@ public:
                 }
             }
         }
-        auto t5 = std::chrono::high_resolution_clock::now();
-        time_col_transpose_back += std::chrono::duration<double>(t5 - t4).count();
 
         // Phase 4: Channel Expand
         hal::x86::group_conv_1x1_avx2(
@@ -260,8 +212,6 @@ public:
             channels_,
             groups_
         );
-        auto t6 = std::chrono::high_resolution_clock::now();
-        time_expand += std::chrono::duration<double>(t6 - t5).count();
 
         // Phase 5: Residual Add
         if (use_residual_) {
@@ -276,8 +226,6 @@ public:
                  out_d[i] += in_d[i];
              }
         }
-        auto t7 = std::chrono::high_resolution_clock::now();
-        time_residual += std::chrono::duration<double>(t7 - t6).count();
 
         return output;
     }
