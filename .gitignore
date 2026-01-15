@@ -24,4 +24,7 @@ tests/verify_spectral
 test_outputs.txt
 test_results.txt
 build/
-build/
+# ZenithNano Training
+train_zenith_nano_real
+*.bin
+lpips_loss.txt

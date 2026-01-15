@@ -111,12 +111,12 @@ int main() {
     size_t real_epochs = 1000000;
 
     // Model (Generator)
-    models::ZenithNano model;
+    models::ZenithNano model(batch_size);
     optim::SimpleAdam<float> optimizer(lr);
     optimizer.add_parameters(model.parameters(), model.gradients());
 
     // Discriminator
-    models::ZenithDiscriminator discriminator;
+    models::ZenithDiscriminator discriminator(batch_size);
     optim::SimpleAdam<float> opt_d(lr);
     opt_d.add_parameters(discriminator.parameters(), discriminator.gradients());
 
@@ -179,37 +179,6 @@ int main() {
         io::CheckpointManager::save("checkpoint_pretrain_G.bin", model.parameters());
     } else {
         std::cout << "Skipping Pretraining (Checkpoint Loaded)" << std::endl;
-    }
-        generate_wavelet_batch(input);
-
-        Tensor<float> output = model.forward(input);
-
-        // Loss (MAE)
-        float loss = 0;
-        size_t size = output.size();
-        const float* out_ptr = output.data();
-        const float* tgt_ptr = input.data();
-        Tensor<float> grad_output(output.shape());
-        float* go_ptr = grad_output.data();
-
-        #pragma omp parallel for reduction(+:loss)
-        for(size_t i=0; i<size; ++i) {
-            float diff = out_ptr[i] - tgt_ptr[i];
-            loss += std::abs(diff);
-            float sign = (diff > 0) ? 1.0f : ((diff < 0) ? -1.0f : 0.0f);
-            go_ptr[i] = sign / size;
-        }
-        loss /= size;
-
-        optimizer.zero_grad();
-        model.backward(grad_output);
-        optimizer.step();
-
-        if (epoch % 1000 == 0 || epoch == pretrain_epochs - 1) {
-            auto now = std::chrono::high_resolution_clock::now();
-            double elapsed = std::chrono::duration<double>(now - start_time).count();
-            std::cout << "Pretrain Epoch " << epoch << " | Time: " << std::fixed << std::setprecision(1) << elapsed << "s | Loss: " << std::setprecision(6) << loss << std::endl;
-        }
     }
 
     // ---------------------------------------------------------
