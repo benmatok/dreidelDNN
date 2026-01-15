@@ -13,8 +13,10 @@
 #include "../include/dreidel/models/ZenithNano.hpp"
 #include "../include/dreidel/models/ZenithDiscriminator.hpp"
 #include "../include/dreidel/optim/SimpleAdam.hpp"
+#include "../include/dreidel/io/Checkpoint.hpp"
 #include <fstream>
 #include <cstdio>
+#include <filesystem>
 
 using namespace dreidel;
 
@@ -106,7 +108,7 @@ int main() {
     size_t pretrain_epochs = 10000;
 
     // Phase 2: Real Data
-    size_t real_epochs = 50; // "Shortly for validation"
+    size_t real_epochs = 1000000;
 
     // Model (Generator)
     models::ZenithNano model;
@@ -118,15 +120,66 @@ int main() {
     optim::SimpleAdam<float> opt_d(lr);
     opt_d.add_parameters(discriminator.parameters(), discriminator.gradients());
 
+    // Checkpoints
+    std::string ckpt_g = "checkpoint_G.bin";
+    std::string ckpt_d = "checkpoint_D.bin";
+    bool loaded = false;
+
+    if (io::CheckpointManager::load(ckpt_g, model.parameters())) {
+        std::cout << "Loaded Generator Checkpoint: " << ckpt_g << std::endl;
+        loaded = true;
+    }
+    if (io::CheckpointManager::load(ckpt_d, discriminator.parameters())) {
+        std::cout << "Loaded Discriminator Checkpoint: " << ckpt_d << std::endl;
+    }
+
     Tensor<float> input({batch_size, H, W, 3});
 
     // ---------------------------------------------------------
     // PHASE 1: Wavelet Pretraining
     // ---------------------------------------------------------
-    std::cout << "\n--- Phase 1: Wavelet Pretraining (" << pretrain_epochs << " epochs) ---" << std::endl;
-    auto start_time = std::chrono::high_resolution_clock::now();
+    if (!loaded) {
+        std::cout << "\n--- Phase 1: Wavelet Pretraining (" << pretrain_epochs << " epochs) ---" << std::endl;
+        auto start_time = std::chrono::high_resolution_clock::now();
 
-    for(size_t epoch = 0; epoch < pretrain_epochs; ++epoch) {
+        for(size_t epoch = 0; epoch < pretrain_epochs; ++epoch) {
+            generate_wavelet_batch(input);
+
+            Tensor<float> output = model.forward(input);
+
+            // Loss (MAE)
+            float loss = 0;
+            size_t size = output.size();
+            const float* out_ptr = output.data();
+            const float* tgt_ptr = input.data();
+            Tensor<float> grad_output(output.shape());
+            float* go_ptr = grad_output.data();
+
+            #pragma omp parallel for reduction(+:loss)
+            for(size_t i=0; i<size; ++i) {
+                float diff = out_ptr[i] - tgt_ptr[i];
+                loss += std::abs(diff);
+                float sign = (diff > 0) ? 1.0f : ((diff < 0) ? -1.0f : 0.0f);
+                go_ptr[i] = sign / size;
+            }
+            loss /= size;
+
+            optimizer.zero_grad();
+            model.backward(grad_output);
+            optimizer.step();
+
+            if (epoch % 1000 == 0 || epoch == pretrain_epochs - 1) {
+                auto now = std::chrono::high_resolution_clock::now();
+                double elapsed = std::chrono::duration<double>(now - start_time).count();
+                std::cout << "Pretrain Epoch " << epoch << " | Time: " << std::fixed << std::setprecision(1) << elapsed << "s | Loss: " << std::setprecision(6) << loss << std::endl;
+            }
+        }
+
+        // Save after pretraining
+        io::CheckpointManager::save("checkpoint_pretrain_G.bin", model.parameters());
+    } else {
+        std::cout << "Skipping Pretraining (Checkpoint Loaded)" << std::endl;
+    }
         generate_wavelet_batch(input);
 
         Tensor<float> output = model.forward(input);
@@ -345,14 +398,22 @@ int main() {
         model.backward(total_grad);
         optimizer.step();
 
-        std::cout << "Epoch " << epoch << " | L1: " << loss_l1
-                  << " | LPIPS: " << lpips_val
-                  << " | D_Real: " << loss_d_real
-                  << " | D_Fake: " << loss_d_fake
-                  << " | G_GAN: " << loss_g_gan << std::endl;
+        if (epoch % 10 == 0) {
+            std::cout << "Epoch " << epoch << " | L1: " << loss_l1
+                    << " | LPIPS: " << lpips_val
+                    << " | D_Real: " << loss_d_real
+                    << " | D_Fake: " << loss_d_fake
+                    << " | G_GAN: " << loss_g_gan << std::endl;
+        }
 
-        // Validation every 10 epochs
-        if ((epoch + 1) % 10 == 0) {
+        // Checkpointing every 1000 epochs
+        if ((epoch + 1) % 1000 == 0) {
+            io::CheckpointManager::save(ckpt_g, model.parameters());
+            io::CheckpointManager::save(ckpt_d, discriminator.parameters());
+        }
+
+        // Validation every 100 epochs
+        if ((epoch + 1) % 100 == 0) {
             std::cout << "Validating..." << std::endl;
             if (load_real_batch(input, "val_batch.bin")) {
                  Tensor<float> val_out = model.forward(input);
@@ -368,6 +429,10 @@ int main() {
             }
         }
     }
+
+    // Final Save
+    io::CheckpointManager::save(ckpt_g, model.parameters());
+    io::CheckpointManager::save(ckpt_d, discriminator.parameters());
 
     std::cout << "Training Complete." << std::endl;
     return 0;
