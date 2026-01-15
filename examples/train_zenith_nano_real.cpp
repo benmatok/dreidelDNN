@@ -11,9 +11,29 @@
 
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/models/ZenithNano.hpp"
+#include "../include/dreidel/models/ZenithDiscriminator.hpp"
 #include "../include/dreidel/optim/SimpleAdam.hpp"
+#include <fstream>
+#include <cstdio>
 
 using namespace dreidel;
+
+// Helper to save tensor for Python LPIPS
+void save_tensor_binary(const Tensor<float>& t, const std::string& path) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(t.data()), t.size() * sizeof(float));
+}
+
+// Helper to load gradient from Python LPIPS
+void load_tensor_binary(Tensor<float>& t, const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (f.is_open()) {
+        f.read(reinterpret_cast<char*>(t.data()), t.size() * sizeof(float));
+    } else {
+        std::cerr << "Failed to load gradient " << path << std::endl;
+        t.fill(0);
+    }
+}
 
 // Reusing wavelet generation from train_zenith_nano.cpp
 void generate_wavelet_batch(Tensor<float>& data) {
@@ -88,10 +108,15 @@ int main() {
     // Phase 2: Real Data
     size_t real_epochs = 50; // "Shortly for validation"
 
-    // Model
+    // Model (Generator)
     models::ZenithNano model;
     optim::SimpleAdam<float> optimizer(lr);
     optimizer.add_parameters(model.parameters(), model.gradients());
+
+    // Discriminator
+    models::ZenithDiscriminator discriminator;
+    optim::SimpleAdam<float> opt_d(lr);
+    opt_d.add_parameters(discriminator.parameters(), discriminator.gradients());
 
     Tensor<float> input({batch_size, H, W, 3});
 
@@ -168,28 +193,163 @@ int main() {
 
         Tensor<float> output = model.forward(input);
 
-        // Loss (MAE)
-        float loss = 0;
-        size_t size = output.size();
+        // ---------------------------------------------------------
+        // GAN + LPIPS + L1 Step
+        // ---------------------------------------------------------
+
+        // 1. Compute LPIPS Gradients (via Python)
+        save_tensor_binary(output, "pred.bin");
+        save_tensor_binary(input, "target.bin");
+
+        std::string lpips_cmd = "python3 tools/compute_lpips.py --pred pred.bin --target target.bin --grad grad_lpips.bin --shape "
+                                + std::to_string(batch_size) + " " + std::to_string(H) + " " + std::to_string(W) + " 3 > lpips_loss.txt";
+        int ret_lpips = std::system(lpips_cmd.c_str());
+
+        float lpips_val = 0.0f;
+        if (ret_lpips == 0) {
+            std::ifstream f("lpips_loss.txt");
+            f >> lpips_val;
+        } else {
+             std::cerr << "LPIPS calculation failed." << std::endl;
+        }
+
+        Tensor<float> grad_lpips(output.shape());
+        load_tensor_binary(grad_lpips, "grad_lpips.bin");
+
+        // 2. Discriminator Update
+        opt_d.zero_grad();
+
+        // D(Real)
+        Tensor<float> d_real = discriminator.forward(input); // Logits
+        // Loss D_Real = (D(x) - 1)^2 (LSGAN)
+        // dLoss/dD = 2*(D(x) - 1)
+        Tensor<float> grad_d_real(d_real.shape());
+        float loss_d_real = 0.0f;
+
+        {
+            float* g_ptr = grad_d_real.data();
+            const float* d_ptr = d_real.data();
+            size_t sz = d_real.size();
+            #pragma omp parallel for reduction(+:loss_d_real)
+            for(size_t i=0; i<sz; ++i) {
+                float val = d_ptr[i];
+                float diff = val - 1.0f;
+                loss_d_real += diff * diff;
+                g_ptr[i] = 2.0f * diff / sz; // Mean reduction
+            }
+            loss_d_real /= sz;
+        }
+        discriminator.backward(grad_d_real); // Accumulate grads for real
+
+        // D(Fake)
+        // Detach output (no backprop to Generator here)
+        Tensor<float> d_fake = discriminator.forward(output);
+        // Loss D_Fake = (D(G(z)))^2
+        // dLoss/dD = 2*D(G(z))
+        Tensor<float> grad_d_fake(d_fake.shape());
+        float loss_d_fake = 0.0f;
+
+        {
+            float* g_ptr = grad_d_fake.data();
+            const float* d_ptr = d_fake.data();
+            size_t sz = d_fake.size();
+            #pragma omp parallel for reduction(+:loss_d_fake)
+            for(size_t i=0; i<sz; ++i) {
+                float val = d_ptr[i];
+                loss_d_fake += val * val;
+                g_ptr[i] = 2.0f * val / sz;
+            }
+            loss_d_fake /= sz;
+        }
+        discriminator.backward(grad_d_fake); // Accumulate grads for fake
+
+        opt_d.step(); // Update Discriminator
+
+        // 3. Generator Update
+        optimizer.zero_grad();
+
+        // Re-forward D(Fake) for Generator loss?
+        // Technically D weights changed, but usually we can reuse or just re-run.
+        // Let's re-run D(Fake) with updated D? No, standard is simultaneous or alternating steps.
+        // If alternating, we use the D state at this step.
+        // We need gradients through D to G.
+
+        // We need to re-forward D on output (with gradient tape for input of D)
+        // dreidel::Tensor doesn't keep a tape. We need to call backward on D again
+        // but this time propagate to input (which is output of G).
+
+        // Wait, dreidel models (ZenithDiscriminator) accumulate gradients in their parameters.
+        // If we call backward again, we corrupt D gradients?
+        // We already stepped opt_d. So D gradients are zeroed effectively (or we should zero them if we don't want to update D again).
+        // Yes, opt_d.zero_grad() was called before D update. Now we want G update.
+        // D parameters are updated.
+        // We don't want to update D parameters now. We just want dLoss/dInput.
+        // But `discriminator.backward()` computes param grads AND input grads.
+        // That's fine, we just ignore D param grads (don't call opt_d.step()).
+
+        // Clear D grads just in case (though unused)
+        // Actually, we don't have a manual zero_grad on model, only via optimizer.
+        // But we won't step optimizer, so it's fine.
+
+        // Forward D(G(z))
+        Tensor<float> d_fake_g = discriminator.forward(output);
+
+        // Loss G_GAN = (D(G(z)) - 1)^2 (Try to fool D to think it's real)
+        Tensor<float> grad_gan_loss(d_fake_g.shape());
+        float loss_g_gan = 0.0f;
+
+        {
+            float* g_ptr = grad_gan_loss.data();
+            const float* d_ptr = d_fake_g.data();
+            size_t sz = d_fake_g.size();
+            #pragma omp parallel for reduction(+:loss_g_gan)
+            for(size_t i=0; i<sz; ++i) {
+                float val = d_ptr[i];
+                float diff = val - 1.0f;
+                loss_g_gan += diff * diff;
+                g_ptr[i] = 2.0f * diff / sz;
+            }
+            loss_g_gan /= sz;
+        }
+
+        // Backprop through D to get grad w.r.t output (G output)
+        Tensor<float> grad_from_d = discriminator.backward(grad_gan_loss);
+
+        // Total Generator Gradient = L1_grad + LPIPS_grad + GAN_grad
+        // Weights: L1=1.0, LPIPS=1.0, GAN=0.1 (Example)
+        float w_l1 = 1.0f;
+        float w_lpips = 1.0f;
+        float w_gan = 0.1f;
+
+        Tensor<float> total_grad(output.shape());
+        float* tot_ptr = total_grad.data();
+        const float* lpips_ptr = grad_lpips.data();
+        const float* gan_ptr = grad_from_d.data();
         const float* out_ptr = output.data();
         const float* tgt_ptr = input.data();
-        Tensor<float> grad_output(output.shape());
-        float* go_ptr = grad_output.data();
+        size_t size = output.size();
 
-        #pragma omp parallel for reduction(+:loss)
+        float loss_l1 = 0;
+
+        #pragma omp parallel for reduction(+:loss_l1)
         for(size_t i=0; i<size; ++i) {
-            float diff = out_ptr[i] - tgt_ptr[i];
-            loss += std::abs(diff);
-            float sign = (diff > 0) ? 1.0f : ((diff < 0) ? -1.0f : 0.0f);
-            go_ptr[i] = sign / size;
-        }
-        loss /= size;
+            float l1_diff = out_ptr[i] - tgt_ptr[i];
+            loss_l1 += std::abs(l1_diff);
+            float l1_grad = (l1_diff > 0) ? 1.0f : ((l1_diff < 0) ? -1.0f : 0.0f);
+            l1_grad /= size;
 
-        optimizer.zero_grad();
-        model.backward(grad_output);
+            tot_ptr[i] = w_l1 * l1_grad + w_lpips * lpips_ptr[i] + w_gan * gan_ptr[i];
+        }
+        loss_l1 /= size;
+
+        model.backward(total_grad);
         optimizer.step();
 
-        std::cout << "Real Data Epoch " << epoch << " | Loss: " << loss << std::endl;
+        std::cout << "Epoch " << epoch << " | L1: " << loss_l1
+                  << " | LPIPS: " << lpips_val
+                  << " | D_Real: " << loss_d_real
+                  << " | D_Fake: " << loss_d_fake
+                  << " | G_GAN: " << loss_g_gan << std::endl;
 
         // Validation every 10 epochs
         if ((epoch + 1) % 10 == 0) {
