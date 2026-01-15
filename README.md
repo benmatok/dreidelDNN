@@ -46,6 +46,27 @@ int main() {
 }
 ```
 
+### Training on Real Data
+
+To train ZenithNano using the hybrid strategy (Wavelet Pretraining + Real Data Finetuning):
+
+1.  **Install Python Dependencies**:
+    The training script uses a Python helper tool to fetch real images.
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+2.  **Compile the Training Example**:
+    ```bash
+    g++ -O3 -fopenmp -mavx2 -mfma examples/train_zenith_nano_real.cpp -o train_zenith_nano_real
+    ```
+
+3.  **Run Training**:
+    ```bash
+    ./train_zenith_nano_real
+    ```
+    This will start 10,000 epochs of pretraining followed by finetuning on images downloaded from `picsum.photos`.
+
 ## 📚 Documentation & Tutorials
 
 *   **[Introduction to Zenith Nano](tutorials/zenith_nano/01_introduction.md)**
