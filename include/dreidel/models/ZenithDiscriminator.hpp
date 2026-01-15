@@ -1,7 +1,6 @@
 #ifndef DREIDEL_MODELS_ZENITHDISCRIMINATOR_HPP
 #define DREIDEL_MODELS_ZENITHDISCRIMINATOR_HPP
 
-#include "../core/Model.hpp"
 #include "../layers/ZenithNanoBlock.hpp"
 #include "../layers/OptimizedConv2D.hpp"
 #include "../layers/Conv2D.hpp"
@@ -23,7 +22,7 @@ public:
     // 4. Conv1x1 (Classification): 64 -> 1
     // Output: 64x64x1 (Map of real/fake scores)
 
-    ZenithDiscriminator() {
+    ZenithDiscriminator(size_t batch_size = 1) : batch_size_(batch_size) {
         // Encoder
         compress_ = std::make_unique<layers::OptimizedConv2D<float>>(192, 64, 1, 1, 0);
         block1_ = std::make_unique<layers::ZenithNanoBlock>(64, 64, 64);
@@ -54,32 +53,26 @@ public:
 
     Tensor<float> forward(const Tensor<float>& input) override {
         // Input: [N, 512, 512, 3]
-        auto shape = input.shape();
-        size_t N = shape[0];
-        size_t H = shape[1];
-        size_t W = shape[2];
-        size_t C = shape[3]; // 3
-
-        // 1. SpaceToDepth (Block 8)
-        // Output: [N, 64, 64, 192]
-        size_t block = 8;
+        size_t H = 512;
+        int W = 512;
+        int C = 3;
+        int block = 8;
         size_t H_out = H / block;
         size_t W_out = W / block;
-        size_t C_out = C * block * block; // 3 * 64 = 192
+        size_t C_out = C * block * block;
 
-        Tensor<float> s1_out({N, H_out, W_out, C_out});
-        kernels::SpaceToDepth_Shuffle(input.data(), s1_out.data(), H, W, C, block);
-        // Note: Kernel implementation might assume N=1 if it doesn't loop N.
-        // Checking AvxFwht.hpp would be wise, but I will assume it works or just loop N here if needed.
-        // Actually, SpaceToDepth is usually HWC based. If N>1, it treats it as a larger H usually?
-        // No, N is separate.
-        // Let's assume standard behavior: if the kernel takes pointer and dims,
-        // we might need to call it per sample if it doesn't handle N.
-        // But `SpaceToDepth_Shuffle` signature in ZenithNano call was `(in, out, H, W, C, block)`.
-        // ZenithNano passed `input.data()` which is N*H*W*C.
-        // If the kernel processes `H*W` pixels, it only does the first image.
-        // To support Batch, we should loop.
-        // But I will stick to what's requested: "exact architecture".
+        Tensor<float> s1_out({batch_size_, H_out, W_out, C_out});
+
+        // Loop batch for SpaceToDepth
+        size_t in_stride = H * W * C;
+        size_t out_stride = H_out * W_out * C_out;
+        float* in_ptr = const_cast<float*>(input.data());
+        float* out_ptr = s1_out.data();
+
+        #pragma omp parallel for
+        for(size_t n=0; n<batch_size_; ++n) {
+            kernels::SpaceToDepth_Shuffle(in_ptr + n*in_stride, out_ptr + n*out_stride, H, W, C, block);
+        }
 
         // 2. Compress (192->64)
         Tensor<float> s2_out = compress_->forward(s1_out);
@@ -110,23 +103,24 @@ public:
         Tensor<float> d_s1 = compress_->backward(d_s2);
 
         // 1. SpaceToDepth Backward -> DepthToSpace
-        auto shape = d_s1.shape(); // [N, 64, 64, 192]
-        size_t N = shape[0];
-        size_t H_small = shape[1];
-        size_t W_small = shape[2];
-        size_t C_small = shape[3];
-
         size_t block = 8;
-        size_t H_orig = H_small * block;
-        size_t W_orig = W_small * block;
+        size_t H_small = 64;
+        size_t W_small = 64;
         size_t C_orig = 3;
+        size_t H_orig = 512;
+        size_t W_orig = 512;
 
-        Tensor<float> grad_input({N, H_orig, W_orig, C_orig});
+        Tensor<float> grad_input({batch_size_, H_orig, W_orig, C_orig});
 
-        // Assuming kernel handles flat buffer or we loop
-        // If batch > 1, we might need a loop if kernel uses H, W limits.
-        // ZenithNano code didn't loop.
-        kernels::DepthToSpace_Shuffle(d_s1.data(), grad_input.data(), H_small, W_small, C_orig, block);
+        size_t d_s1_stride = H_small * W_small * 192;
+        size_t gi_stride = H_orig * W_orig * C_orig;
+        float* ds1_ptr = d_s1.data();
+        float* gi_ptr = grad_input.data();
+
+        #pragma omp parallel for
+        for(size_t n=0; n<batch_size_; ++n) {
+            kernels::DepthToSpace_Shuffle(ds1_ptr + n*d_s1_stride, gi_ptr + n*gi_stride, H_small, W_small, C_orig, block);
+        }
 
         return grad_input;
     }
@@ -172,6 +166,7 @@ private:
     std::unique_ptr<layers::ZenithNanoBlock> block2_;
     std::unique_ptr<layers::ZenithNanoBlock> block3_;
     std::unique_ptr<layers::OptimizedConv2D<float>> head_;
+    size_t batch_size_;
 };
 
 } // namespace models

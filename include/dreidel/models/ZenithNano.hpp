@@ -21,12 +21,12 @@ public:
     // S4: Conv1x1 64->192.
     // S5: DepthToSpace(8) -> 512x512x3.
 
-    ZenithNano() {
+    ZenithNano(size_t batch_size = 1) : batch_size_(batch_size) {
         // Implement Arena Allocator to avoid 4K Aliasing
-        size_t sz_s1 = 64 * 64 * 192;
-        size_t sz_s2 = 64 * 64 * 64;
-        size_t sz_b = 64 * 64 * 64;
-        size_t sz_s4 = 64 * 64 * 192;
+        size_t sz_s1 = batch_size * 64 * 64 * 192;
+        size_t sz_s2 = batch_size * 64 * 64 * 64;
+        size_t sz_b = batch_size * 64 * 64 * 64;
+        size_t sz_s4 = batch_size * 64 * 64 * 192;
 
         // Offset 64 floats (256 bytes) to break 4K alignment
         // If block sizes are multiples of 4K, adding 256 bytes ensures offsets differ.
@@ -45,12 +45,12 @@ public:
         float* base = arena_.data();
 
         // Initialize Views
-        s1_out_ = Tensor<float>({1, 64, 64, 192}, base + off_s1);
-        s2_out_ = Tensor<float>({1, 64, 64, 64}, base + off_s2);
-        b1_out_ = Tensor<float>({1, 64, 64, 64}, base + off_b1);
-        b2_out_ = Tensor<float>({1, 64, 64, 64}, base + off_b2);
-        b3_out_ = Tensor<float>({1, 64, 64, 64}, base + off_b3);
-        s4_out_ = Tensor<float>({1, 64, 64, 192}, base + off_s4);
+        s1_out_ = Tensor<float>({batch_size, 64, 64, 192}, base + off_s1);
+        s2_out_ = Tensor<float>({batch_size, 64, 64, 64}, base + off_s2);
+        b1_out_ = Tensor<float>({batch_size, 64, 64, 64}, base + off_b1);
+        b2_out_ = Tensor<float>({batch_size, 64, 64, 64}, base + off_b2);
+        b3_out_ = Tensor<float>({batch_size, 64, 64, 64}, base + off_b3);
+        s4_out_ = Tensor<float>({batch_size, 64, 64, 192}, base + off_s4);
 
         // Check 4K Aliasing (Verify fix)
         auto check = [](const char* name, const Tensor<float>& t) {
@@ -78,14 +78,25 @@ public:
 
     Tensor<float> forward(const Tensor<float>& input) override {
         // S1: SpaceToDepth (Zero-Copy View / Shuffle)
-        // Input: [1, 512, 512, 3]
+        // Input: [N, 512, 512, 3]
         int H = 512;
         int W = 512;
         int C = 3;
         int block = 8;
 
-        // Use persistent buffer s1_out_
-        kernels::SpaceToDepth_Shuffle(input.data(), s1_out_.data(), H, W, C, block);
+        // SpaceToDepth_Shuffle implementation typically assumes H*W buffer.
+        // We need to loop over batch.
+        // Assuming kernels take raw pointers and assume contiguous single image.
+        size_t in_stride = H * W * C;
+        size_t out_stride = (H/block) * (W/block) * (C*block*block);
+
+        float* in_ptr = const_cast<float*>(input.data());
+        float* out_ptr = s1_out_.data();
+
+        #pragma omp parallel for
+        for(size_t n=0; n<batch_size_; ++n) {
+            kernels::SpaceToDepth_Shuffle(in_ptr + n*in_stride, out_ptr + n*out_stride, H, W, C, block);
+        }
 
         // S2: Compress
         compress_->forward(s1_out_, s2_out_);
@@ -99,27 +110,40 @@ public:
         expand_->forward(b3_out_, s4_out_);
 
         // S5: DepthToSpace
-        Tensor<float> output({1, (size_t)H, (size_t)W, (size_t)C});
-        kernels::DepthToSpace_Shuffle(s4_out_.data(), output.data(), H/block, W/block, C, block); // C here is target output channels (3)
+        Tensor<float> output({batch_size_, (size_t)H, (size_t)W, (size_t)C});
+        float* s4_ptr = s4_out_.data();
+        float* final_ptr = output.data();
+        size_t s4_stride = out_stride;
+        size_t final_stride = in_stride;
+
+        #pragma omp parallel for
+        for(size_t n=0; n<batch_size_; ++n) {
+            kernels::DepthToSpace_Shuffle(s4_ptr + n*s4_stride, final_ptr + n*final_stride, H/block, W/block, C, block);
+        }
 
         return output;
     }
 
     Tensor<float> backward(const Tensor<float>& grad_output) override {
-        // S5 Backward: DepthToSpace_Shuffle Backward is SpaceToDepth_Shuffle
-        // Output Grad: [N, H, W, 3] -> S4 Grad: [N, H/8, W/8, 192]
-        // But s4_out_ is persistent, we need a gradient buffer for it?
-        // Ideally we pass gradients back up.
-        // Or we use persistent gradient buffers in arena?
-        // For now, allocate on stack/heap (slow but works).
-
+        // S5 Backward
         int H = 512;
         int W = 512;
         int C = 3;
         int block = 8;
 
-        Tensor<float> d_s4_out({1, 64, 64, 192});
-        kernels::SpaceToDepth_Shuffle(grad_output.data(), d_s4_out.data(), H, W, C, block);
+        Tensor<float> d_s4_out({batch_size_, 64, 64, 192});
+
+        // Loop for SpaceToDepth on grad_output
+        size_t go_stride = H * W * C;
+        size_t ds4_stride = (H/block) * (W/block) * (C*block*block);
+
+        const float* go_ptr = grad_output.data();
+        float* ds4_ptr = d_s4_out.data();
+
+        #pragma omp parallel for
+        for(size_t n=0; n<batch_size_; ++n) {
+            kernels::SpaceToDepth_Shuffle(go_ptr + n*go_stride, ds4_ptr + n*ds4_stride, H, W, C, block);
+        }
 
         // S4 Backward: Expand (Conv1x1)
         // d_b3_out = expand_back(d_s4_out)
@@ -135,8 +159,17 @@ public:
         Tensor<float> d_s1_out = compress_->backward(d_s2_out);
 
         // S1 Backward: SpaceToDepth Backward is DepthToSpace
-        Tensor<float> grad_input({1, (size_t)H, (size_t)W, (size_t)C});
-        kernels::DepthToSpace_Shuffle(d_s1_out.data(), grad_input.data(), H/block, W/block, C, block);
+        Tensor<float> grad_input({batch_size_, (size_t)H, (size_t)W, (size_t)C});
+
+        size_t ds1_stride = ds4_stride;
+        size_t gi_stride = go_stride;
+        float* ds1_ptr = d_s1_out.data();
+        float* gi_ptr = grad_input.data();
+
+        #pragma omp parallel for
+        for(size_t n=0; n<batch_size_; ++n) {
+            kernels::DepthToSpace_Shuffle(ds1_ptr + n*ds1_stride, gi_ptr + n*gi_stride, H/block, W/block, C, block);
+        }
 
         return grad_input;
     }
@@ -191,6 +224,7 @@ private:
     Tensor<float> b3_out_;
     Tensor<float> s4_out_;
 
+    size_t batch_size_;
     // Arena
     std::vector<float, core::AlignedAllocator<float>> arena_;
 };
