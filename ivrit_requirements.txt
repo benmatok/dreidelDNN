@@ -1,7 +1,0 @@
-transformers
-torchaudio
-librosa
-torch
-numpy
-scipy
-accelerate
