@@ -14,6 +14,15 @@ int main() {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
+    #ifdef _OPENMP
+    int max_threads = omp_get_max_threads();
+    std::cout << "OpenMP Threads: " << max_threads << std::endl;
+    if (max_threads < 2) {
+        std::cout << "WARNING: Running with 1 thread. Expect slow performance." << std::endl;
+        std::cout << "Set OMP_NUM_THREADS=4 for better results." << std::endl;
+    }
+    #endif
+
     std::cout << "Benchmarking Full ZenithNano Model..." << std::endl;
 
     // Initialize Model
