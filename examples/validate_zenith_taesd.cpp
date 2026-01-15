@@ -11,6 +11,7 @@
 #include "dreidel/layers/Upscale2D.hpp"
 #include "dreidel/layers/ZenithLiteBlock.hpp"
 #include "dreidel/models/ZenithTAESD_Lite.hpp"
+#include "dreidel/models/ZenithTAESD_Spectral.hpp"
 
 using namespace dreidel;
 
@@ -168,6 +169,7 @@ int main() {
     size_t C = 3;
     models::ZenithTAESD<float> model_zenith(C, 4, 64, H, W);
     models::ZenithTAESD_Lite<float> model_lite(C, 4, 64, H, W);
+    models::ZenithTAESD_Spectral<float> model_spectral(C, 4, 64, H, W);
     StandardTAESD<float> model_baseline(C, 4, 64, H, W);
 
     std::cout << "Models instantiated." << std::endl;
@@ -210,6 +212,19 @@ int main() {
     std::cout << "Zenith-Lite Conv2D Total: ";
     layers::OptimizedConv2D<float>::print_timers();
 
+    // --- Zenith Spectral Benchmark ---
+    std::cout << "\nBenchmarking Zenith-TAESD-Spectral (512x512, " << iterations << " iters)..." << std::endl;
+    layers::ZenithLiteBlock<float>::reset_timers();
+
+    auto start_s = std::chrono::high_resolution_clock::now();
+    for(int i=0; i<iterations; ++i) {
+        model_spectral.forward(input);
+    }
+    auto end_s = std::chrono::high_resolution_clock::now();
+    double elapsed_s = std::chrono::duration<double, std::milli>(end_s - start_s).count() / iterations;
+
+    std::cout << "Zenith-Spectral Avg Latency: " << elapsed_s << " ms" << std::endl;
+
     // --- Baseline Benchmark ---
     std::cout << "\nBenchmarking Standard-TAESD (512x512, " << iterations << " iters)..." << std::endl;
     layers::OptimizedConv2D<float>::reset_timers();
@@ -229,6 +244,7 @@ int main() {
     std::cout << "Speedup (Zenith vs Baseline): " << elapsed_b / elapsed_z << "x" << std::endl;
     std::cout << "Speedup (Zenith-Lite vs Baseline): " << elapsed_b / elapsed_l << "x" << std::endl;
     std::cout << "Speedup (Zenith-Lite vs Zenith): " << elapsed_z / elapsed_l << "x" << std::endl;
+    std::cout << "Speedup (Zenith-Spectral vs Baseline): " << elapsed_b / elapsed_s << "x" << std::endl;
 
     // FLOPs Estimation
     // Zenith: ZenithLite blocks (minimal) + Conv2D layers.
@@ -317,6 +333,7 @@ int main() {
     std::cout << "Estimated FLOPs per Image (Zenith-Lite): " << flops_lite / 1e9 << " GFLOPs" << std::endl;
     std::cout << "Zenith Actual Performance: " << (flops / 1e9) / (elapsed_z / 1000.0) << " GFLOPs/s" << std::endl;
     std::cout << "Zenith-Lite Actual Performance: " << (flops_lite / 1e9) / (elapsed_l / 1000.0) << " GFLOPs/s" << std::endl;
+    std::cout << "Zenith-Spectral Actual Performance: " << (flops_lite / 1e9) / (elapsed_s / 1000.0) << " GFLOPs/s (Approx)" << std::endl;
     std::cout << "Baseline Actual Performance: " << (flops / 1e9) / (elapsed_b / 1000.0) << " GFLOPs/s" << std::endl;
     std::cout << "Target Performance (CPU AVX2): >50 GFLOPs/s" << std::endl;
 
