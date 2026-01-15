@@ -83,7 +83,20 @@ public:
         return output;
     }
 
+    // Store input for backward pass
+    Tensor<T> saved_input_;
+    Tensor<T> grad_weights_;
+    Tensor<T> grad_bias_;
+
     void forward(const Tensor<T>& input, Tensor<T>& output) override {
+        // Save input for backward (Deep copy usually needed if input changes,
+        // but here we might get away with shallow if input persists,
+        // but for safety in training loop we deep copy)
+        // However, standard backprop keeps reference.
+        // Let's assume input lifetime is managed by caller or we copy.
+        // For simple training loop, copy is safer.
+        saved_input_ = input; // Deep copy
+
         auto shape = input.shape();
         size_t N = shape[0];
         size_t H = shape[1];
@@ -219,8 +232,128 @@ public:
         }
     }
 
-    Tensor<T> backward(const Tensor<T>& grad_output) override { return grad_output; } // Stub
+    Tensor<T> backward(const Tensor<T>& grad_output) override {
+        // Only 1x1 stride 1 supported for now (ZenithNano)
+        if (kernel_size_ != 1 || stride_ != 1 || padding_ != 0) {
+            std::cerr << "OptimizedConv2D::backward only supports 1x1 stride 1 for now." << std::endl;
+            return Tensor<T>();
+        }
+
+        // 1. Compute grad_weights: input.T * grad_output
+        // Input: [N, H, W, Cin], GradOut: [N, H, W, Cout]
+        // Flatten: [Pixels, Cin], [Pixels, Cout]
+        // GradW: [Cin, Cout] = Input.T * GradOut
+
+        size_t N = saved_input_.shape()[0];
+        size_t H = saved_input_.shape()[1];
+        size_t W = saved_input_.shape()[2];
+        size_t Cin = in_channels_;
+        size_t Cout = out_channels_;
+        size_t Pixels = N * H * W;
+
+        // Initialize grads
+        if (grad_weights_.size() == 0) grad_weights_ = Tensor<T>(packed_weights_.shape());
+        if (grad_bias_.size() == 0) grad_bias_ = Tensor<T>(bias_.shape());
+        grad_weights_.fill(0);
+        grad_bias_.fill(0);
+
+        const T* in_ptr = saved_input_.data();
+        const T* go_ptr = grad_output.data();
+        T* gw_ptr = grad_weights_.data(); // [1, 1, Cin, Cout] packed as [1, 1, Cin, Cout] for 1x1
+        T* gb_ptr = grad_bias_.data();
+
+        // Compute Gradients
+        // Parallel over pixels, reduce to GW/GB
+        // Since atomic add floats is tricky/slow, we can tile or reduce.
+        // For simplicity, simple reduction or serial accumulation.
+        // Better: Tiled GEMM.
+        // Loop over Pixels: GW += in * go
+
+        // Let's do simple parallel over Cin, Cout? No, pixels dominate.
+        // To allow OMP, we need private reduction buffers or atomic.
+        // Given complexity, let's do a naive OMP parallel over Cin (outer loop of weights).
+
+        #pragma omp parallel for
+        for(size_t i=0; i<Cin; ++i) {
+             for(size_t o=0; o<Cout; ++o) {
+                 float sum = 0.0f;
+                 // Vectorize pixel loop
+                 size_t p=0;
+                 #ifdef __AVX2__
+                 __m256 v_sum = _mm256_setzero_ps();
+                 for(; p+8<=Pixels; p+=8) {
+                     __m256 v_in = _mm256_loadu_ps(in_ptr + p*Cin + i * 1); // Stride Cin? No.
+                     // Access: in_ptr[p*Cin + i]. Stride is Cin. Not contiguous.
+                     // Gather needed.
+                     __m256i v_idx_in = _mm256_set_epi32((p+7)*Cin+i, (p+6)*Cin+i, (p+5)*Cin+i, (p+4)*Cin+i,
+                                                        (p+3)*Cin+i, (p+2)*Cin+i, (p+1)*Cin+i, (p+0)*Cin+i);
+                     __m256 v_val_in = _mm256_i32gather_ps(in_ptr, v_idx_in, 4);
+
+                     __m256i v_idx_go = _mm256_set_epi32((p+7)*Cout+o, (p+6)*Cout+o, (p+5)*Cout+o, (p+4)*Cout+o,
+                                                        (p+3)*Cout+o, (p+2)*Cout+o, (p+1)*Cout+o, (p+0)*Cout+o);
+                     __m256 v_val_go = _mm256_i32gather_ps(go_ptr, v_idx_go, 4);
+
+                     v_sum = _mm256_fmadd_ps(v_val_in, v_val_go, v_sum);
+                 }
+                 // Horizontal sum v_sum
+                 float tmp[8]; _mm256_storeu_ps(tmp, v_sum);
+                 sum += tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
+                 #endif
+
+                 for(; p<Pixels; ++p) {
+                     sum += in_ptr[p*Cin + i] * go_ptr[p*Cout + o];
+                 }
+                 // Store weight grad
+                 // packed_weights layout for 1x1 is [1, 1, Cin, Cout] -> [Cin, Cout]
+                 gw_ptr[i*Cout + o] = sum;
+             }
+        }
+
+        // Bias Grad: Sum over N,H,W
+        #pragma omp parallel for
+        for(size_t o=0; o<Cout; ++o) {
+            float sum = 0.0f;
+            for(size_t p=0; p<Pixels; ++p) {
+                sum += go_ptr[p*Cout + o];
+            }
+            gb_ptr[o] = sum;
+        }
+
+        // 2. Compute grad_input: grad_output * weights
+        // [Pixels, Cout] * [Cout, Cin] -> [Pixels, Cin]
+        // This is like a forward pass with transposed weights.
+        Tensor<T> grad_input(saved_input_.shape());
+        T* gi_ptr = grad_input.data();
+        const T* w_ptr = packed_weights_.data(); // [Cin, Cout]
+
+        #pragma omp parallel for
+        for(size_t p=0; p<Pixels; ++p) {
+            for(size_t i=0; i<Cin; ++i) {
+                float sum = 0.0f;
+                size_t o=0;
+                #ifdef __AVX2__
+                __m256 v_sum = _mm256_setzero_ps();
+                for(; o+8<=Cout; o+=8) {
+                    __m256 v_go = _mm256_loadu_ps(go_ptr + p*Cout + o);
+                    __m256 v_w = _mm256_loadu_ps(w_ptr + i*Cout + o); // packed is [Cin, Cout]
+                    v_sum = _mm256_fmadd_ps(v_go, v_w, v_sum);
+                }
+                float tmp[8]; _mm256_storeu_ps(tmp, v_sum);
+                sum += tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
+                #endif
+                for(; o<Cout; ++o) {
+                    sum += go_ptr[p*Cout + o] * w_ptr[i*Cout + o];
+                }
+                gi_ptr[p*Cin + i] = sum;
+            }
+        }
+
+        return grad_input;
+    }
+
     std::vector<Tensor<T>*> parameters() override { return {&packed_weights_, &bias_}; }
+    std::vector<Tensor<T>*> gradients() override { return {&grad_weights_, &grad_bias_}; }
+
     std::string name() const override { return "OptimizedConv2D"; }
 
     // Accessors for Fused Kernels
