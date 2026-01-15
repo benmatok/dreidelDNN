@@ -18,6 +18,7 @@ int main() {
 
     // Initialize Model
     dreidel::models::ZenithNano model;
+    model.set_training(false); // Inference Mode
 
     // Create Input [1, 512, 512, 3]
     dreidel::Tensor<float> input({1, 512, 512, 3});

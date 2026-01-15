@@ -246,6 +246,11 @@ public:
 
     std::string name() const override { return "ZenithNanoBlock"; }
 
+    void set_training(bool training) override {
+        Layer::set_training(training);
+        proj_conv_.set_training(training);
+    }
+
 private:
     int channels_;
     int h_;

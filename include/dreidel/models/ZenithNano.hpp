@@ -165,6 +165,15 @@ public:
         return g;
     }
 
+    void set_training(bool training) override {
+        Layer::set_training(training);
+        compress_->set_training(training);
+        block1_->set_training(training);
+        block2_->set_training(training);
+        block3_->set_training(training);
+        expand_->set_training(training);
+    }
+
     std::string name() const override { return "ZenithNano"; }
 
 private:

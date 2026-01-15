@@ -37,7 +37,10 @@ int main() {
 
     // 2. Setup Models
     models::ZenithNano model_fp32;
+    model_fp32.set_training(false);
+
     models::ZenithNanoInfer model_fp16;
+    model_fp16.set_training(false);
 
     // Transfer weights (Initialize FP32 randomly first if needed, but they are random by default or zero?)
     // Layer parameters are usually initialized.
