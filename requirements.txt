@@ -1,0 +1,8 @@
+numpy
+requests
+Pillow
+torch
+torchvision
+lpips
+transformers
+scipy
