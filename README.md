@@ -17,8 +17,9 @@
 
 ```bash
 git clone https://github.com/benmatok/dreidelDNN.git
-export CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH:$(pwd)/dreidelDNN/include
 ```
+
+When compiling, use the `-I include` flag to include the headers.
 
 ### Inference Example
 
@@ -51,14 +52,16 @@ int main() {
 To train ZenithNano using the hybrid strategy (Wavelet Pretraining + Real Data Finetuning):
 
 1.  **Install Python Dependencies**:
-    The training script uses a Python helper tool to fetch real images.
+    The training script uses a Python helper tool to fetch real images. It is recommended to use a virtual environment.
     ```bash
+    python3 -m venv venv
+    source venv/bin/activate
     pip install -r requirements.txt
     ```
 
 2.  **Compile the Training Example**:
     ```bash
-    g++ -O3 -fopenmp -mavx2 -mfma examples/train_zenith_nano_real.cpp -o train_zenith_nano_real
+    g++ -O3 -fopenmp -mavx2 -mfma -I include examples/train_zenith_nano_real.cpp -o train_zenith_nano_real
     ```
 
 3.  **Run Training**:
