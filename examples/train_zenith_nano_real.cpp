@@ -100,7 +100,7 @@ int main() {
     std::cout << "=== Training ZenithNano: Wavelet Pretraining -> Real Data Finetuning ===" << std::endl;
 
     // Config
-    size_t batch_size = 4;
+    size_t batch_size = 1;
     size_t H = 512, W = 512;
     float lr = 1e-4f;
 
