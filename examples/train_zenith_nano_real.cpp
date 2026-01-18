@@ -219,24 +219,27 @@ int main() {
         // GAN + LPIPS + L1 Step
         // ---------------------------------------------------------
 
-        // 1. Compute LPIPS Gradients (via Python)
-        save_tensor_binary(output, "pred.bin");
-        save_tensor_binary(input, "target.bin");
-
-        std::string lpips_cmd = "python3 tools/compute_lpips.py --pred pred.bin --target target.bin --grad grad_lpips.bin --shape "
-                                + std::to_string(batch_size) + " " + std::to_string(H) + " " + std::to_string(W) + " 3 > lpips_loss.txt";
-        int ret_lpips = std::system(lpips_cmd.c_str());
-
+        // 1. Compute LPIPS Gradients (via Python) - Only if enabled
         float lpips_val = 0.0f;
-        if (ret_lpips == 0) {
-            std::ifstream f("lpips_loss.txt");
-            f >> lpips_val;
-        } else {
-             std::cerr << "LPIPS calculation failed." << std::endl;
-        }
-
         Tensor<float> grad_lpips(output.shape());
-        load_tensor_binary(grad_lpips, "grad_lpips.bin");
+        grad_lpips.fill(0.0f);
+
+        if (w_lpips > 0.0f) {
+            save_tensor_binary(output, "pred.bin");
+            save_tensor_binary(input, "target.bin");
+
+            std::string lpips_cmd = "python3 tools/compute_lpips.py --pred pred.bin --target target.bin --grad grad_lpips.bin --shape "
+                                    + std::to_string(batch_size) + " " + std::to_string(H) + " " + std::to_string(W) + " 3 > lpips_loss.txt";
+            int ret_lpips = std::system(lpips_cmd.c_str());
+
+            if (ret_lpips == 0) {
+                std::ifstream f("lpips_loss.txt");
+                f >> lpips_val;
+                load_tensor_binary(grad_lpips, "grad_lpips.bin");
+            } else {
+                 std::cerr << "LPIPS calculation failed. Ensure torch/lpips are installed or set w_lpips=0." << std::endl;
+            }
+        }
 
         // 2. Discriminator Update
         opt_d.zero_grad();
