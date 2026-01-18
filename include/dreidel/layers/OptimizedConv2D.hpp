@@ -89,6 +89,7 @@ public:
     Tensor<T> grad_bias_;
 
     void forward(const Tensor<T>& input, Tensor<T>& output) override {
+        // std::cout << "DEBUG: OptimizedConv2D::forward Entry" << std::endl;
         // Save input for backward (Deep copy usually needed if input changes,
         // but here we might get away with shallow if input persists,
         // but for safety in training loop we deep copy)
@@ -116,7 +117,7 @@ public:
         if (kernel_size_ == 1 && stride_ == 1 && padding_ == 0 && groups_ == 1) {
             size_t total_pixels = N * H * W;
 
-#ifdef __AVX2__
+#if 0 // def __AVX2__ (Temporarily disabled due to instability in some environments)
             // Block 4 pixels, 16 output channels
             const size_t PIXEL_BLOCK = 4;
             const size_t OUT_BLOCK = 16;
