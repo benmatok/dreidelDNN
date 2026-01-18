@@ -16,7 +16,7 @@
 ### Installation
 
 ```bash
-git clone https://github.com/yourusername/dreidelDNN.git
+git clone https://github.com/benmatok/dreidelDNN.git
 export CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH:$(pwd)/dreidelDNN/include
 ```
 
