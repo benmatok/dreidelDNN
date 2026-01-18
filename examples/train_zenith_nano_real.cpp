@@ -219,6 +219,14 @@ int main() {
         // GAN + LPIPS + L1 Step
         // ---------------------------------------------------------
 
+        // Total Generator Gradient = L1_grad + LPIPS_grad + GAN_grad
+        // Weights: L1=1.0, LPIPS=1.0, GAN=0.1 (Example)
+        // NOTE: LPIPS requires PyTorch and is disabled by default to avoid heavy dependencies.
+        // Set w_lpips > 0.0f and ensure requirements are installed to use it.
+        float w_l1 = 1.0f;
+        float w_lpips = 0.0f;
+        float w_gan = 0.1f;
+
         // 1. Compute LPIPS Gradients (via Python) - Only if enabled
         float lpips_val = 0.0f;
         Tensor<float> grad_lpips(output.shape());
@@ -339,14 +347,6 @@ int main() {
 
         // Backprop through D to get grad w.r.t output (G output)
         Tensor<float> grad_from_d = discriminator.backward(grad_gan_loss);
-
-        // Total Generator Gradient = L1_grad + LPIPS_grad + GAN_grad
-        // Weights: L1=1.0, LPIPS=1.0, GAN=0.1 (Example)
-        // NOTE: LPIPS requires PyTorch and is disabled by default to avoid heavy dependencies.
-        // Set w_lpips > 0.0f and ensure requirements are installed to use it.
-        float w_l1 = 1.0f;
-        float w_lpips = 0.0f;
-        float w_gan = 0.1f;
 
         Tensor<float> total_grad(output.shape());
         float* tot_ptr = total_grad.data();
