@@ -84,9 +84,10 @@ void generate_wavelet_batch(Tensor<float>& data) {
 
     // Clamp to [0, 1] to match real data distribution
     size_t sz = data.size();
+    float* d_ptr = data.data();
     #pragma omp parallel for
     for(size_t i=0; i<sz; ++i) {
-        if(ptr[i] > 1.0f) ptr[i] = 1.0f;
+        if(d_ptr[i] > 1.0f) d_ptr[i] = 1.0f;
     }
 }
 
