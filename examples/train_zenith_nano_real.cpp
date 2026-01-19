@@ -8,6 +8,9 @@
 #include <fstream>
 #include <string>
 #include <cstdlib>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 #include "../include/dreidel/core/Tensor.hpp"
 #include "../include/dreidel/models/ZenithNano.hpp"
@@ -78,6 +81,13 @@ void generate_wavelet_batch(Tensor<float>& data) {
             }
         }
     }
+
+    // Clamp to [0, 1] to match real data distribution
+    size_t sz = data.size();
+    #pragma omp parallel for
+    for(size_t i=0; i<sz; ++i) {
+        if(ptr[i] > 1.0f) ptr[i] = 1.0f;
+    }
 }
 
 // Function to load real data batch from file
@@ -95,6 +105,132 @@ bool load_real_batch(Tensor<float>& data, const std::string& filepath) {
     }
     return true;
 }
+
+// Augmentation: Horizontal Flip
+void augment_batch(Tensor<float>& batch) {
+    size_t N = batch.shape()[0];
+    size_t H = batch.shape()[1];
+    size_t W = batch.shape()[2];
+    size_t C = batch.shape()[3];
+
+    static std::mt19937 gen(std::random_device{}());
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    // For each image in batch
+    for(size_t n=0; n<N; ++n) {
+        if(dist(gen) > 0.5f) {
+            // Flip
+             #pragma omp parallel for
+             for(size_t y=0; y<H; ++y) {
+                 for(size_t x=0; x<W/2; ++x) {
+                     for(size_t c=0; c<C; ++c) {
+                         size_t idx1 = ((n*H + y)*W + x)*C + c;
+                         size_t idx2 = ((n*H + y)*W + (W - 1 - x))*C + c;
+                         std::swap(batch.data()[idx1], batch.data()[idx2]);
+                     }
+                 }
+             }
+        }
+    }
+}
+
+// Threaded Data Buffer
+class AsyncBuffer {
+public:
+    AsyncBuffer(size_t capacity, size_t batch_size)
+        : capacity_(capacity), batch_size_(batch_size), running_(true)
+    {
+        // Initialize buffer with empty tensors
+        for(size_t i=0; i<capacity_; ++i) {
+             // 512x512x3
+             buffer_.emplace_back(std::vector<size_t>{batch_size_, 512, 512, 3});
+             buffer_.back().fill(0.0f);
+             valid_.push_back(false);
+        }
+    }
+
+    ~AsyncBuffer() {
+        stop();
+    }
+
+    void start(const std::string& script_cmd) {
+        worker_ = std::thread([this, script_cmd](){
+             while(running_) {
+                 // Download to temp file
+                 std::string temp_file = "temp_load.bin";
+                 // Using a random temp file or just one? One is fine if only 1 producer.
+
+                 // Call Python script
+                 std::string cmd = script_cmd + " --output " + temp_file + " > /dev/null 2>&1";
+                 int ret = std::system(cmd.c_str());
+
+                 if(ret != 0) {
+                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                     continue;
+                 }
+
+                 Tensor<float> t({batch_size_, 512, 512, 3});
+                 if(!load_real_batch(t, temp_file)) continue;
+
+                 // Update buffer
+                 {
+                     std::lock_guard<std::mutex> lock(mtx_);
+                     // Use simple thread-safe random logic or just round robin?
+                     // Random replacement is requested.
+                     // Use a simple static thread_local generator
+                     static thread_local std::mt19937 gen(std::random_device{}());
+                     std::uniform_int_distribution<int> dist(0, capacity_ - 1);
+                     int idx = dist(gen);
+
+                     buffer_[idx].copy_from(t); // Deep copy
+                     valid_[idx] = true;
+
+                     // Optional: Print status periodically?
+                 }
+             }
+        });
+    }
+
+    void stop() {
+        running_ = false;
+        if(worker_.joinable()) worker_.join();
+    }
+
+    // Copy a random valid batch to out
+    bool get_batch(Tensor<float>& out) {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        // Find valid indices
+        std::vector<int> indices;
+        for(size_t i=0; i<capacity_; ++i) {
+            if(valid_[i]) indices.push_back(i);
+        }
+
+        if(indices.empty()) return false;
+
+        static thread_local std::mt19937 gen(std::random_device{}());
+        std::uniform_int_distribution<int> dist(0, indices.size() - 1);
+        int idx = indices[dist(gen)];
+
+        out.copy_from(buffer_[idx]);
+        return true;
+    }
+
+    bool is_ready() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for(bool v : valid_) if(v) return true;
+        return false;
+    }
+
+private:
+    size_t capacity_;
+    size_t batch_size_;
+    std::vector<Tensor<float>> buffer_;
+    std::vector<bool> valid_;
+    std::mutex mtx_;
+    std::atomic<bool> running_;
+    std::thread worker_;
+};
 
 int main() {
     std::cout << "=== Training ZenithNano: Wavelet Pretraining -> Real Data Finetuning ===" << std::endl;
@@ -195,23 +331,29 @@ int main() {
         return 1;
     }
 
+    // Start Data Producer
+    std::cout << "Starting Data Producer Thread..." << std::endl;
+    AsyncBuffer data_buffer(50, batch_size); // 50 batches buffer
+    std::string train_cmd = "python3 tools/data_loader.py --batch-size " + std::to_string(batch_size);
+    data_buffer.start(train_cmd);
+
+    // Wait for buffer to have at least one batch
+    std::cout << "Waiting for data buffer..." << std::endl;
+    while(!data_buffer.is_ready()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
     // Training loop
     for(size_t epoch = 0; epoch < real_epochs; ++epoch) {
-        // Fetch new batch
-        std::string train_cmd = "python3 tools/data_loader.py --batch-size " + std::to_string(batch_size) + " --output train_batch.bin";
-        // To be less verbose, redirect stdout/stderr or just let it print
-        // user wants to see "download small set for validation and train on new batches each time"
-        // Let's print fetching status
-        std::cout << "Fetching real batch " << epoch + 1 << "/" << real_epochs << "..." << std::endl;
-        ret = std::system(train_cmd.c_str());
-        if (ret != 0) {
-             std::cerr << "Failed to download training batch. Skipping." << std::endl;
+        // Fetch from buffer
+        if (!data_buffer.get_batch(input)) {
+             // Should not happen if we waited
+             std::this_thread::sleep_for(std::chrono::milliseconds(10));
              continue;
         }
 
-        if (!load_real_batch(input, "train_batch.bin")) {
-            continue;
-        }
+        // Augment
+        augment_batch(input);
 
         Tensor<float> output = model.forward(input);
 
@@ -301,29 +443,6 @@ int main() {
         // 3. Generator Update
         optimizer.zero_grad();
 
-        // Re-forward D(Fake) for Generator loss?
-        // Technically D weights changed, but usually we can reuse or just re-run.
-        // Let's re-run D(Fake) with updated D? No, standard is simultaneous or alternating steps.
-        // If alternating, we use the D state at this step.
-        // We need gradients through D to G.
-
-        // We need to re-forward D on output (with gradient tape for input of D)
-        // dreidel::Tensor doesn't keep a tape. We need to call backward on D again
-        // but this time propagate to input (which is output of G).
-
-        // Wait, dreidel models (ZenithDiscriminator) accumulate gradients in their parameters.
-        // If we call backward again, we corrupt D gradients?
-        // We already stepped opt_d. So D gradients are zeroed effectively (or we should zero them if we don't want to update D again).
-        // Yes, opt_d.zero_grad() was called before D update. Now we want G update.
-        // D parameters are updated.
-        // We don't want to update D parameters now. We just want dLoss/dInput.
-        // But `discriminator.backward()` computes param grads AND input grads.
-        // That's fine, we just ignore D param grads (don't call opt_d.step()).
-
-        // Clear D grads just in case (though unused)
-        // Actually, we don't have a manual zero_grad on model, only via optimizer.
-        // But we won't step optimizer, so it's fine.
-
         // Forward D(G(z))
         Tensor<float> d_fake_g = discriminator.forward(output);
 
@@ -388,7 +507,7 @@ int main() {
 
         // Validation every 100 epochs
         if ((epoch + 1) % 100 == 0) {
-            std::cout << "Validating..." << std::endl;
+            // std::cout << "Validating..." << std::endl;
             if (load_real_batch(input, "val_batch.bin")) {
                  Tensor<float> val_out = model.forward(input);
                  float val_loss = 0;
@@ -403,6 +522,9 @@ int main() {
             }
         }
     }
+
+    // Stop Producer
+    data_buffer.stop();
 
     // Final Save
     io::CheckpointManager::save(ckpt_g, model.parameters());

@@ -4,6 +4,7 @@ import io
 import struct
 import random
 import os
+import numpy as np
 from PIL import Image
 
 def download_image(url, size=(512, 512)):
@@ -24,58 +25,29 @@ def download_image(url, size=(512, 512)):
 
 def save_batch(images, output_file):
     # Format: N H W C (float32)
-    # Just write raw bytes
-    # Normalize to 0-1
-    with open(output_file, 'wb') as f:
-        for img in images:
-            # Get data as float list or bytes
-            # PIL to bytes is uint8
-            # Convert to float
-            pixels = list(img.getdata()) # List of (r,g,b)
-            # Flatten and normalize
-            # Efficient way:
-            # We can use struct to pack, but that's slow for 512x512x3 (~786k floats)
-            # Better to use array or just bytes if C++ handles it?
-            # C++ expects float.
-            # Let's use bytearray and struct.pack_into or just write raw bytes manually?
-            # Actually, standard way is to write binary.
-            # Python float is double, struct 'f' is float.
 
-            # Optimization: create a bytearray
-            # But let's keep it simple first.
-            # 512*512*3 = 786432 floats. 3MB.
+    if not images:
+        return
 
-            # To make it faster, use a simple loop or list comp
-            # floats = [val / 255.0 for pixel in pixels for val in pixel]
-            # buff = struct.pack(f'{len(floats)}f', *floats)
-            # f.write(buff)
+    try:
+        # Convert list of PIL images to a single numpy array
+        # PIL images are (W, H) -> np.array is (H, W, 3)
+        # We want (N, H, W, 3)
 
-            # Even faster:
-            # Use int.to_bytes? No, we need floats.
-            # If we didn't have numpy... which we don't (I didn't install it).
-            # Okay, let's just do the list comp. It might be slow.
-            # 786k items.
-            pass
+        # Ensure all images are RGB and same size (already handled in download)
+        data = np.stack([np.array(img, dtype=np.float32) for img in images])
 
-            # Re-implementation without numpy:
-            # Write raw uint8 and let C++ convert?
-            # No, C++ expects float.
-            # Let's write the float conversion here.
+        # Normalize to [0, 1]
+        data /= 255.0
 
-            data = []
-            for pixel in pixels:
-                data.append(pixel[0] / 255.0)
-                data.append(pixel[1] / 255.0)
-                data.append(pixel[2] / 255.0)
+        # Ensure contiguous and correct type
+        data = np.ascontiguousarray(data, dtype=np.float32)
 
-            # Pack is slow for large lists.
-            # struct.pack('f'*len(data), *data)
-            # Try chunking.
+        # Save raw binary
+        data.tofile(output_file)
 
-            chunk_size = 1024
-            for i in range(0, len(data), chunk_size):
-                chunk = data[i:i+chunk_size]
-                f.write(struct.pack(f'{len(chunk)}f', *chunk))
+    except Exception as e:
+        print(f"Error saving batch: {e}")
 
 def main():
     parser = argparse.ArgumentParser()
