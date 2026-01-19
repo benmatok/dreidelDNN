@@ -7,7 +7,7 @@ import os
 import numpy as np
 from PIL import Image
 
-def download_image(url, size=(512, 512)):
+def download_image(url, size=(1024, 1024)):
     try:
         response = requests.get(url, timeout=5)
         response.raise_for_status()
@@ -23,6 +23,16 @@ def download_image(url, size=(512, 512)):
         print(f"Error downloading {url}: {e}")
         return None
 
+def random_crop(img, crop_size=(512, 512)):
+    w, h = img.size
+    cw, ch = crop_size
+    if w < cw or h < ch:
+        return img.resize(crop_size)
+
+    x = random.randint(0, w - cw)
+    y = random.randint(0, h - ch)
+    return img.crop((x, y, x + cw, y + ch))
+
 def save_batch(images, output_file):
     # Format: N H W C (float32)
 
@@ -34,7 +44,7 @@ def save_batch(images, output_file):
         # PIL images are (W, H) -> np.array is (H, W, 3)
         # We want (N, H, W, 3)
 
-        # Ensure all images are RGB and same size (already handled in download)
+        # Ensure all images are RGB and same size
         data = np.stack([np.array(img, dtype=np.float32) for img in images])
 
         # Normalize to [0, 1]
@@ -60,31 +70,45 @@ def main():
     random.seed(args.seed)
 
     images = []
-    attempts = 0
-    max_attempts = args.batch_size * 2
 
-    while len(images) < args.batch_size and attempts < max_attempts:
-        attempts += 1
-        if args.validation:
-            # Deterministic URLs for validation
-            # Use picsum id
-            # We need args.batch_size distinct images
-            # Use seed + index
+    # Validation mode: Deterministic single images (still 512x512)
+    # But to be consistent, we could download 1024 and crop center?
+    # Let's keep validation simple: distinct images.
+
+    if args.validation:
+        attempts = 0
+        max_attempts = args.batch_size * 2
+        while len(images) < args.batch_size and attempts < max_attempts:
+            attempts += 1
             img_id = args.seed + len(images)
             url = f"https://picsum.photos/id/{img_id}/512/512"
-        else:
-            # Random images
-            # adding random query param to avoid cache
-            url = f"https://picsum.photos/512/512?random={random.randint(0, 1000000)}"
+            print(f"Downloading {url}...")
+            img = download_image(url, size=(512, 512))
+            if img:
+                images.append(img)
+    else:
+        # Training mode: Download 1024x1024 images and random crop
+        # Strategy: Download enough large images to fill batch size with crops.
+        # To be efficient and "generate many from one", we can take multiple crops from one image.
+        # Let's say we take up to 4 crops from one image.
 
-        print(f"Downloading {url}...")
-        img = download_image(url)
-        if img:
-            images.append(img)
+        while len(images) < args.batch_size:
+            url = f"https://picsum.photos/1024/1024?random={random.randint(0, 1000000)}"
+            print(f"Downloading {url}...")
+            large_img = download_image(url, size=(1024, 1024))
+
+            if large_img:
+                # How many crops needed?
+                needed = args.batch_size - len(images)
+                # Take min(needed, 4) crops from this image
+                to_take = min(needed, 4)
+
+                for _ in range(to_take):
+                    images.append(random_crop(large_img))
 
     if len(images) < args.batch_size:
         print("Failed to download enough images")
-        # Fill with black or duplicates to avoid crash?
+        # Fill with duplicates
         while len(images) < args.batch_size and len(images) > 0:
             images.append(images[0])
 
