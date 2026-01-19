@@ -259,7 +259,7 @@ private:
     std::thread worker_;
 };
 
-int main() {
+int main(int argc, char** argv) {
     std::cout << "=== Training ZenithNano: Wavelet Pretraining -> Real Data Finetuning ===" << std::endl;
 
     // Config
@@ -272,6 +272,15 @@ int main() {
 
     // Phase 2: Real Data
     size_t real_epochs = 1000000;
+
+    // Parse CLI args
+    for(int i=1; i<argc; ++i) {
+        std::string arg = argv[i];
+        if(arg == "--skip-pretrain") {
+            pretrain_epochs = 0;
+            std::cout << "Config: Skipping Pretraining phase." << std::endl;
+        }
+    }
 
     // Model (Generator)
     models::ZenithNano model(batch_size);
