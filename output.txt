@@ -1,0 +1,10 @@
+=== Training ZenithNano: Wavelet Pretraining -> Real Data Finetuning ===
+s1_out: 0x7fc72aa00040 (Offset 4K: 64)
+s2_out: 0x7fc72ad00140 (Offset 4K: 320)
+b1_out: 0x7fc72ae00240 (Offset 4K: 576)
+b2_out: 0x7fc72af00340 (Offset 4K: 832)
+b3_out: 0x7fc72b000440 (Offset 4K: 1088)
+s4_out: 0x7fc72b100540 (Offset 4K: 1344)
+
+--- Phase 1: Wavelet Pretraining (10000 epochs) ---
+Pretrain Epoch 0 | Time: 0.6s | Loss: 0.297343

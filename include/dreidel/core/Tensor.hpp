@@ -106,6 +106,14 @@ public:
     T* data() { return data_ptr_; }
     const T* data() const { return data_ptr_; }
 
+    // Deep copy from another tensor
+    void copy_from(const Tensor<T, B>& other) {
+        if (size_ != other.size()) {
+             throw std::invalid_argument("Tensor size mismatch in copy_from");
+        }
+        std::memcpy(data_ptr_, other.data(), size_ * sizeof(T));
+    }
+
     // Element access (simple flat index for now)
     T& operator[](size_t index) { return data_ptr_[index]; }
     const T& operator[](size_t index) const { return data_ptr_[index]; }
