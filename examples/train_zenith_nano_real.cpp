@@ -106,7 +106,7 @@ bool load_real_batch(Tensor<float>& data, const std::string& filepath) {
     return true;
 }
 
-// Augmentation: Horizontal Flip
+// Augmentation: Horizontal Flip + Histogram Stretch
 void augment_batch(Tensor<float>& batch) {
     size_t N = batch.shape()[0];
     size_t H = batch.shape()[1];
@@ -118,8 +118,8 @@ void augment_batch(Tensor<float>& batch) {
 
     // For each image in batch
     for(size_t n=0; n<N; ++n) {
+        // 1. Horizontal Flip
         if(dist(gen) > 0.5f) {
-            // Flip
              #pragma omp parallel for
              for(size_t y=0; y<H; ++y) {
                  for(size_t x=0; x<W/2; ++x) {
@@ -130,6 +130,29 @@ void augment_batch(Tensor<float>& batch) {
                      }
                  }
              }
+        }
+
+        // 2. Histogram Stretch (Contrast)
+        // Find min and max for this image
+        float min_val = 1.0f;
+        float max_val = 0.0f;
+        size_t offset = n * H * W * C;
+        float* img_ptr = batch.data() + offset;
+        size_t img_size = H * W * C;
+
+        for(size_t i=0; i<img_size; ++i) {
+            float val = img_ptr[i];
+            if(val < min_val) min_val = val;
+            if(val > max_val) max_val = val;
+        }
+
+        // If range is decent, stretch to [0, 1]
+        if(max_val > min_val + 0.01f) {
+            float range = max_val - min_val;
+            #pragma omp parallel for
+            for(size_t i=0; i<img_size; ++i) {
+                img_ptr[i] = (img_ptr[i] - min_val) / range;
+            }
         }
     }
 }
@@ -163,6 +186,10 @@ public:
                  // Call Python script
                  std::string cmd = script_cmd + " --output " + temp_file + " > /dev/null 2>&1";
                  int ret = std::system(cmd.c_str());
+
+                 // Rate limit: Enforce a delay to respect "50 requests / 90 seconds"
+                 // 90s / 50 requests = 1.8s per request. We use 2.0s to be safe.
+                 std::this_thread::sleep_for(std::chrono::seconds(2));
 
                  if(ret != 0) {
                      std::this_thread::sleep_for(std::chrono::milliseconds(100));
